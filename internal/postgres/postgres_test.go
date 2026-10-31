@@ -31,7 +31,7 @@ func loadFixtures(t *testing.T) mml.Source {
 		}
 		files = append(files, postgres.File{Path: p, Src: src})
 	}
-	return postgres.Load(files)
+	return postgres.Load(files, nil)
 }
 
 func entity(t *testing.T, src mml.Source, name string) mml.Entity {
@@ -75,6 +75,33 @@ func TestLoadReplaysMigrations(t *testing.T) {
 		"primary key is not nullable": {false, lines.Fields[0].Nullable},
 		"entity position at name":     {3, orders.Pos.Line},
 		"parse error becomes problem": {1, len(src.Problems)},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			equals(t, tc.exp, tc.act)
+		})
+	}
+}
+
+func TestLoadSnippets(t *testing.T) {
+	t.Parallel()
+	at := mml.Position{File: "store/store.go", Line: 35, Col: 30}
+	src := postgres.Load(nil, []postgres.Snippet{
+		{
+			SQL:    "SELECT o.id FROM orders o JOIN order_lines l ON l.order_id = o.order_id",
+			Pos:    at,
+			Strict: true,
+		},
+		{SQL: "not sql at all", Pos: at, Strict: false},
+		{SQL: "SELEC broken", Pos: at, Strict: true},
+	})
+	cases := map[string]struct{ exp, act any }{
+		"one query from the valid snippet": {1, len(src.Queries)},
+		"query at the call site":           {at, src.Queries[0].Pos},
+		"join at the call site":            {at, src.Queries[0].Joins[0].Pos},
+		"strict parse failure reported":    {1, len(src.Problems)},
+		"problem at the call site":         {at, src.Problems[0].Pos},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

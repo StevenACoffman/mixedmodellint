@@ -49,7 +49,7 @@ func Run(fsys fs.FS, opts Options) (mml.Report, error) {
 		return mml.Report{}, &mml.Error{Op: op, Err: err}
 	}
 	input := mml.Input{Sources: []mml.Source{
-		postgres.Load(in.sql),
+		postgres.Load(in.sql, nil),
 		goast.Load(in.gosrc),
 		jsonschema.Load(in.schemas),
 	}}

@@ -37,19 +37,35 @@ type stmtCtx struct {
 	start int
 	// directives are the "-- mml:" comments directly above the statement.
 	directives mml.Annotations
+	// at, when set, is where every position in the statement points: the Go
+	// call site of a snippet, since offsets inside SQL folded from Go
+	// constants do not map back to one place in the Go source.
+	at *mml.Position
 }
 
-// Load parses every file in order and returns the entities left after all
-// DDL has been applied, the query corpus, and a Problem for each statement
-// that did not parse.
+// Snippet is SQL found in Go code, at the call site Pos. Strict is true when
+// it was passed to a known SQL API, so SQL that does not parse is reported;
+// otherwise the argument may not be SQL at all and a parse failure is ignored.
+type Snippet struct {
+	SQL    string
+	Pos    mml.Position
+	Strict bool
+}
+
+// Load parses every file in order, then every snippet of SQL found in Go, and
+// returns the entities left after all DDL has been applied, the query corpus,
+// and a Problem for each file or strict snippet that did not parse.
 //
 // Requires: files are in migration order (the shell sorts them by path).
 // Ensures:  a file that fails to parse contributes a Problem and nothing else;
 // the other files are still loaded.
-func Load(files []File) mml.Source {
+func Load(files []File, snippets []Snippet) mml.Source {
 	l := &loader{tables: map[string]*mml.Entity{}}
 	for i := range files {
 		l.loadFile(&files[i])
+	}
+	for i := range snippets {
+		l.loadSnippet(&snippets[i])
 	}
 	for _, key := range l.order {
 		if e, ok := l.tables[key]; ok {
@@ -57,6 +73,30 @@ func Load(files []File) mml.Source {
 		}
 	}
 	return l.out
+}
+
+// loadSnippet parses SQL found in Go. Its statements are loaded like a
+// file's, with every position at the call site.
+func (l *loader) loadSnippet(sn *Snippet) {
+	tree, err := pgquery.Parse(sn.SQL)
+	if err != nil {
+		if sn.Strict {
+			l.out.Problems = append(l.out.Problems, mml.Problem{
+				Message: "SQL passed from Go does not parse: " + err.Error(), Pos: sn.Pos,
+			})
+		}
+		return
+	}
+	f := &File{Path: sn.Pos.File, Src: []byte(sn.SQL)}
+	for _, raw := range tree.GetStmts() {
+		ctx := &stmtCtx{
+			file:       f,
+			start:      int(raw.GetStmtLocation()),
+			directives: mml.Annotations{},
+			at:         &sn.Pos,
+		}
+		l.loadStmt(ctx, raw.GetStmt())
+	}
 }
 
 func (l *loader) loadFile(f *File) {
@@ -263,6 +303,9 @@ func tableKey(rv *pg.RangeVar) string {
 }
 
 func (c *stmtCtx) pos(offset int) mml.Position {
+	if c.at != nil {
+		return *c.at
+	}
 	if offset < 0 {
 		offset = c.start
 	}
