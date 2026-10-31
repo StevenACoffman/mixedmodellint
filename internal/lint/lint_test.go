@@ -2,7 +2,6 @@ package lint_test
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -15,7 +14,7 @@ import (
 // fire where.
 func TestGrainQueries(t *testing.T) {
 	t.Parallel()
-	report, err := lint.Run(os.DirFS(filepath.Join("testdata", "grain")), lint.Options{})
+	report, err := lint.Run(t.Context(), filepath.Join("testdata", "grain"), lint.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,6 +24,7 @@ func TestGrainQueries(t *testing.T) {
 		got = append(got, fmt.Sprintf("%s:%d %s", f.Pos.File, f.Pos.Line, f.Design))
 	}
 	want := []string{
+		"app/app.go:15 7.2-A",
 		"queries/fanout.sql:2 7.2-A",
 		"queries/loads.sql:2 7.3-A",
 		"queries/loads.sql:6 7.1-C",

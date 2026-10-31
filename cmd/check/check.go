@@ -73,7 +73,7 @@ current findings is its purpose.`,
 	return &cfg
 }
 
-func (cfg *Config) exec(_ context.Context, args []string) error {
+func (cfg *Config) exec(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		return &root.UsageError{
 			Err: fmt.Errorf("check: unexpected argument %q (use --dir)", args[0]),
@@ -92,7 +92,7 @@ func (cfg *Config) exec(_ context.Context, args []string) error {
 		}
 		opts.Baseline = bytes.NewReader(data)
 	}
-	report, err := lint.Run(os.DirFS(cfg.Dir), opts)
+	report, err := lint.Run(ctx, cfg.Dir, opts)
 	if err != nil {
 		return fmt.Errorf("check: %w", err)
 	}

@@ -4,7 +4,7 @@
 // and the renderers.
 //
 // The package never touches the filesystem, the clock or a parser. Adapters
-// (internal/postgres, internal/goast, internal/jsonschema, internal/sidecar)
+// (internal/postgres, internal/gopackages, internal/jsonschema, internal/sidecar)
 // turn bytes into the values defined here, and internal/lint composes them.
 // The design rationale for every check lives in rule_plan.md, and each design
 // in this package carries the ID it has there, such as "7.1-B".

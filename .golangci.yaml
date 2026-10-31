@@ -310,10 +310,10 @@ linters:
         #
         # internal/mixedmodellint is the domain: the pure core. It holds the IR,
         # annotation parsing, linking, every rule design, waivers, the baseline
-        # and the text and JSON renderers. Its only import outside the standard library is
-        # github.com/jinzhu/inflection, a pure text algorithm with no I/O; every
-        # library that does I/O or carries a heavy dependency tree is denied
-        # below and lives in an adapter named after it.
+        # and the text and JSON renderers. Its only import outside the standard
+        # library is github.com/jinzhu/inflection, a pure text algorithm with no
+        # I/O; every library that does I/O or carries a heavy dependency tree is
+        # denied below and lives in an adapter named after it.
         domain-is-pure:
           # "!$test" excludes _test.go: the external test package
           # (mixedmodellint_test) may import whatever a test needs. The rule
@@ -330,7 +330,7 @@ linters:
             desc: "the domain must not read the clock; inject times as values — summary_rules §11"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/postgres"
             desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
-          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/goast"
+          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/gopackages"
             desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/jsonschema"
             desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
@@ -352,8 +352,10 @@ linters:
             desc: "SARIF output is the internal/sarif adapter's job — summary_rules §1"
           - pkg: "github.com/atombender/go-jsonschema"
             desc: "reading JSON Schema is the internal/jsonschema adapter's job — summary_rules §1"
+          - pkg: "golang.org/x/tools"
+            desc: "loading Go packages is the internal/gopackages adapter's job — summary_rules §1"
         # The layers are: internal/mixedmodellint (domain) <- internal/postgres,
-        # internal/goast, internal/jsonschema and internal/sidecar (adapters, one
+        # internal/gopackages, internal/jsonschema and internal/sidecar (adapters, one
         # per external dependency) <- internal/lint (the composition shell) <-
         # cmd/*. Each layer may import the ones beneath it and never its own
         # siblings. internal/lint is excluded because composing the adapters is
@@ -362,14 +364,14 @@ linters:
           files:
           - "!$test"
           - "**/internal/postgres/**"
-          - "**/internal/goast/**"
+          - "**/internal/gopackages/**"
           - "**/internal/jsonschema/**"
           - "**/internal/sidecar/**"
           - "**/internal/sarif/**"
           deny:
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/postgres"
             desc: "adapters import internal/mixedmodellint only, never each other; internal/lint composes them — summary_rules §1"
-          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/goast"
+          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/gopackages"
             desc: "adapters import internal/mixedmodellint only, never each other; internal/lint composes them — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/jsonschema"
             desc: "adapters import internal/mixedmodellint only, never each other; internal/lint composes them — summary_rules §1"
@@ -380,7 +382,7 @@ linters:
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/lint"
             desc: "internal/lint is the shell above the adapters; it imports them, never the reverse — summary_rules §1"
           - pkg: "os"
-            desc: "adapters parse bytes handed to them; the shell reads files — summary_rules §5"
+            desc: "adapters parse bytes handed to them; the shell reads files — summary_rules §5. internal/gopackages runs go list through go/packages, which needs a directory, but it still never opens a file itself"
         # Commands dispatch; they do not compose adapters (summary_rules §18,
         # principle 8). cmd/check reaches the adapters only through internal/lint.
         commands-use-the-shell:
@@ -390,7 +392,7 @@ linters:
           deny:
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/postgres"
             desc: "commands call internal/lint, which composes the adapters — summary_rules §18"
-          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/goast"
+          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/gopackages"
             desc: "commands call internal/lint, which composes the adapters — summary_rules §18"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/jsonschema"
             desc: "commands call internal/lint, which composes the adapters — summary_rules §18"
