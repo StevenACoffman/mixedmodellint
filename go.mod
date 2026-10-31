@@ -4,6 +4,7 @@ go 1.27.2
 
 require (
 	github.com/goccy/go-yaml v1.19.2
+	github.com/jinzhu/inflection v1.0.0
 	github.com/peterbourgon/ff/v4 v4.0.0-beta.1
 	github.com/pganalyze/pg_query_go/v6 v6.2.5
 	github.com/wasilibs/go-pgquery v0.0.0-20261027025405-3048dd293555

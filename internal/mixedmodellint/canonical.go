@@ -3,6 +3,8 @@ package mixedmodellint
 import (
 	"strings"
 	"unicode"
+
+	"github.com/jinzhu/inflection"
 )
 
 // Canonical folds an entity or field name to the form used for cross-source
@@ -92,27 +94,14 @@ func dropAffixes(words []string) []string {
 	return kept
 }
 
-// singular returns the singular of an English plural noun by suffix rules
-// that are right for table names: orders→order, categories→category,
-// addresses→address, boxes→box. Words that already look singular (status,
-// analysis, address) are returned unchanged, which is what makes Canonical
-// idempotent.
+// singular returns the singular of an English noun, using inflection's
+// rule tables, which also know irregular plurals (people, indices, children).
+// A word that would singularize to nothing ("s") is kept as it is, so a name
+// never loses a word. The tables are global in inflection; this package only
+// reads them and never calls its Add or Set functions.
 func singular(w string) string {
-	switch {
-	case len(w) <= 3:
-		return w
-	case strings.HasSuffix(w, "ies"):
-		return strings.TrimSuffix(w, "ies") + "y"
-	case strings.HasSuffix(w, "sses"), strings.HasSuffix(w, "shes"), strings.HasSuffix(w, "uses"),
-		strings.HasSuffix(w, "ches"), strings.HasSuffix(w, "xes"),
-		strings.HasSuffix(w, "zzes"):
-		return strings.TrimSuffix(w, "es")
-	case strings.HasSuffix(w, "ss"), strings.HasSuffix(w, "us"),
-		strings.HasSuffix(w, "is"):
-		return w
-	case strings.HasSuffix(w, "s"):
-		return strings.TrimSuffix(w, "s")
-	default:
-		return w
+	if s := inflection.Singular(w); s != "" {
+		return s
 	}
+	return w
 }

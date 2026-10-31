@@ -310,7 +310,10 @@ linters:
         #
         # internal/mixedmodellint is the domain: the pure core. It holds the IR,
         # annotation parsing, linking, every rule design, waivers, the baseline
-        # and the renderers, and it reaches nothing outside the standard library.
+        # and the renderers. Its only import outside the standard library is
+        # github.com/jinzhu/inflection, a pure text algorithm with no I/O; every
+        # library that does I/O or carries a heavy dependency tree is denied
+        # below and lives in an adapter named after it.
         domain-is-pure:
           # "!$test" excludes _test.go: the external test package
           # (mixedmodellint_test) may import whatever a test needs. The rule
