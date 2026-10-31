@@ -206,4 +206,4 @@ dist/
 # 
 *.binpb
 # rapid writes a reproducer here when a property test fails
-testdata/rapid/
+**/testdata/rapid/
