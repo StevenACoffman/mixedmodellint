@@ -44,14 +44,6 @@ func (n *node) get(key string) *node {
 	return nil
 }
 
-func (n *node) str() string {
-	if n == nil {
-		return ""
-	}
-	s, _ := n.value.(string)
-	return s
-}
-
 // parseTree decodes src into a node tree with byte offsets.
 func parseTree(src []byte) (*node, error) {
 	dec := json.NewDecoder(bytes.NewReader(src))

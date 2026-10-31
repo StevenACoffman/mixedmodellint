@@ -3,6 +3,7 @@ module github.com/StevenACoffman/mixedmodellint
 go 1.27.2
 
 require (
+	github.com/atombender/go-jsonschema v0.24.1
 	github.com/goccy/go-yaml v1.19.2
 	github.com/jinzhu/inflection v1.0.0
 	github.com/owenrumney/go-sarif/v3 v3.3.2
@@ -14,6 +15,7 @@ require (
 )
 
 require (
+	dario.cat/mergo v1.0.2 // indirect
 	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/wasilibs/wazero-helpers v0.0.0-20250123031827-cd30c44769bb // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20180127040702-4e3ac2762d5f // indirect

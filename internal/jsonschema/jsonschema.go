@@ -1,15 +1,24 @@
-// Package jsonschema loads JSON Schema documents into the mixedmodellint IR,
-// using only encoding/json. The root schema and each $defs or definitions
-// entry that describes an object become entities; x-mml-* keywords become
-// annotations. $ref is resolved by name only: "#/$defs/Line" and
+// Package jsonschema loads JSON Schema documents into the mixedmodellint IR.
+// It wraps github.com/atombender/go-jsonschema/pkg/schemas, which interprets
+// the schema: types, required, $ref, items, formats, enums, $defs and the
+// legacy definitions keyword, boolean schemas. That library keeps neither
+// source positions nor x-* extension keywords, so a small offset-tracking
+// reader (tree.go) supplies the two things it drops: where each property is,
+// and the x-mml-* annotations.
+//
+// The root schema and each $defs or definitions entry that describes an
+// object become entities. $ref is resolved by name only: "#/$defs/Line" and
 // "line.schema.json" both refer to the entity named Line.
 package jsonschema
 
 import (
+	"bytes"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/atombender/go-jsonschema/pkg/schemas"
 
 	mml "github.com/StevenACoffman/mixedmodellint/internal/mixedmodellint"
 )
@@ -47,58 +56,65 @@ func Load(files []File) mml.Source {
 	for i := range files {
 		f := &files[i]
 		root, err := parseTree(f.Src)
-		if err != nil {
-			out.Problems = append(out.Problems, mml.Problem{
-				Message: "JSON does not parse: " + err.Error(),
-				Pos:     mml.Position{File: f.Path, Line: 1},
-			})
-			continue
+		if err == nil {
+			var sch *schemas.Schema
+			if sch, err = schemas.FromJSONReader(bytes.NewReader(f.Src)); err == nil {
+				d := &doc{path: f.Path, lines: lineStarts(f.Src)}
+				out.Entities = append(out.Entities, entities(d, root, sch)...)
+				continue
+			}
 		}
-		d := &doc{path: f.Path, lines: lineStarts(f.Src)}
-		out.Entities = append(out.Entities, entities(d, root)...)
+		out.Problems = append(out.Problems, mml.Problem{
+			Message: "JSON Schema does not parse: " + err.Error(),
+			Pos:     mml.Position{File: f.Path, Line: 1},
+		})
 	}
 	return out
 }
 
-func entities(d *doc, root *node) []mml.Entity {
+// entities returns the root schema and each object definition as entities.
+// The schema gives meaning; the tree gives source order and positions.
+func entities(d *doc, root *node, sch *schemas.Schema) []mml.Entity {
 	var out []mml.Entity
-	if isObjectSchema(root) {
-		name := root.get("title").str()
+	if rootType := (*schemas.Type)(sch.ObjectAsType); isObject(rootType) {
+		name := rootType.Title
 		if name == "" {
 			name = baseName(d.path)
 		}
-		out = append(out, entity(d, "json:"+d.path+"#", name, root, root.off))
+		out = append(out, entity(d, "json:"+d.path+"#", name, rootType, root, root.off))
 	}
 	for _, section := range []string{"$defs", "definitions"} {
-		defs := root.get(section)
-		if defs == nil {
-			continue
-		}
-		for _, m := range defs.members {
-			if isObjectSchema(m.val) {
+		for _, m := range root.get(section).membersOrNil() {
+			if t := sch.Definitions[m.key]; isObject(t) {
 				id := "json:" + d.path + "#/" + section + "/" + m.key
-				out = append(out, entity(d, id, m.key, m.val, m.keyOff))
+				out = append(out, entity(d, id, m.key, t, m.val, m.keyOff))
 			}
 		}
 	}
 	return out
 }
 
-func isObjectSchema(n *node) bool {
-	if n == nil || !n.isObj {
-		return false
-	}
-	return n.get("type").str() == "object" || n.get("properties") != nil
+// isObject reports whether t describes an object. go-jsonschema infers
+// "object" from properties for nested schemas but not for the root, so a
+// schema with properties counts either way.
+func isObject(t *schemas.Type) bool {
+	return t != nil && (slices.Contains(t.Type, "object") || len(t.Properties) > 0)
 }
 
-func entity(d *doc, id, name string, n *node, off int) mml.Entity {
+// entity builds one entity from schema t, whose source is node at off.
+// Properties are taken in source order from the tree, since the schema holds
+// them in a map.
+func entity(d *doc, id, name string, t *schemas.Type, n *node, off int) mml.Entity {
 	e := mml.Entity{
 		ID: id, Kind: mml.KindSchema, Source: mml.SourceJSONSchema, Name: name,
-		Doc: n.get("description").str(), Pos: d.pos(off), Annotations: annotations(d, n),
+		Doc: t.Description, Pos: d.pos(off), Annotations: annotations(d, n),
 	}
-	required := stringValues(n.get("required"))
 	for _, m := range n.get("properties").membersOrNil() {
-		f, ref := field(d, m, slices.Contains(required, m.key))
+		p := t.Properties[m.key]
+		if p == nil {
+			continue
+		}
+		f, ref := field(d, m, p, slices.Contains(t.Required, m.key))
 		e.Fields = append(e.Fields, f)
 		if ref != "" {
 			e.Refs = append(e.Refs, mml.Ref{Fields: []string{f.Name}, Target: ref, Pos: f.Pos})
@@ -110,33 +126,48 @@ func entity(d *doc, id, name string, n *node, off int) mml.Entity {
 	return e
 }
 
-func field(d *doc, m member, required bool) (mml.Field, string) {
-	p := m.val
-	types := typeList(p.get("type"))
+// field converts property p, declared at member m, and returns the entity
+// its $ref (or its items' $ref) names, if any.
+func field(d *doc, m member, p *schemas.Type, required bool) (mml.Field, string) {
 	f := mml.Field{
 		Name:        m.key,
-		Doc:         p.get("description").str(),
-		Nullable:    !required || slices.Contains(types, "null"),
-		Enum:        stringValues(p.get("enum")),
+		Doc:         p.Description,
+		Nullable:    !required || slices.Contains(p.Type, "null"),
+		Enum:        anyStrings(p.Enum),
 		Pos:         d.pos(m.keyOff),
-		Annotations: annotations(d, p),
+		Annotations: annotations(d, m.val),
 	}
-	ref := refName(p.get("$ref").str())
-	nonNull := slices.DeleteFunc(slices.Clone(types), func(t string) bool { return t == "null" })
+	ref := refName(p.Ref)
+	nonNull := slices.DeleteFunc(
+		slices.Clone([]string(p.Type)),
+		func(t string) bool { return t == "null" },
+	)
 	switch {
 	case ref != "":
 		f.Type, f.RawType = mml.TypeObject, "$ref:"+ref
 	case len(nonNull) == 1 && nonNull[0] == "array":
 		f.Type, f.RawType = mml.TypeArray, "array"
-		ref = refName(p.get("items").get("$ref").str())
+		if p.Items != nil {
+			ref = refName(p.Items.Ref)
+		}
 	case len(nonNull) == 1:
-		f.Type = scalarType(nonNull[0], p.get("format").str())
-		f.RawType = nonNull[0]
-		if format := p.get("format").str(); format != "" {
-			f.RawType += " (format " + format + ")"
+		f.Type, f.RawType = scalarType(nonNull[0], p.Format), nonNull[0]
+		if p.Format != "" {
+			f.RawType += " (format " + p.Format + ")"
 		}
 	}
 	return f, ref
+}
+
+// anyStrings returns the string members of an enum.
+func anyStrings(values []any) []string {
+	var out []string
+	for _, v := range values {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func scalarType(t, format string) mml.LogicalType {
@@ -211,16 +242,6 @@ func (n *node) membersOrNil() []member {
 		return nil
 	}
 	return n.members
-}
-
-func typeList(n *node) []string {
-	if n == nil {
-		return nil
-	}
-	if n.isArr {
-		return stringValues(n)
-	}
-	return []string{n.str()}
 }
 
 func stringValues(n *node) []string {

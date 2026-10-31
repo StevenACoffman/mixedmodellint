@@ -350,6 +350,8 @@ linters:
             desc: "reading mml.yaml is the sidecar adapter's job — summary_rules §1"
           - pkg: "github.com/owenrumney/go-sarif"
             desc: "SARIF output is the internal/sarif adapter's job — summary_rules §1"
+          - pkg: "github.com/atombender/go-jsonschema"
+            desc: "reading JSON Schema is the internal/jsonschema adapter's job — summary_rules §1"
         # The layers are: internal/mixedmodellint (domain) <- internal/postgres,
         # internal/goast, internal/jsonschema and internal/sidecar (adapters, one
         # per external dependency) <- internal/lint (the composition shell) <-

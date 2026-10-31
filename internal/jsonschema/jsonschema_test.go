@@ -73,3 +73,49 @@ func TestIsSchema(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadSchemaForms(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		src          string
+		wantEntities []string
+		wantProblems int
+	}{
+		"legacy definitions keyword": {
+			src: `{"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+				"properties": {"id": {"type": "integer"}},
+				"definitions": {"Item": {"type": "object", "properties": {"sku": {"type": "string"}}}}}`,
+			wantEntities: []string{"thing", "Item"},
+		},
+		"object inferred from properties": {
+			src:          `{"$schema": "x", "properties": {"id": {"type": "integer"}}}`,
+			wantEntities: []string{"thing"},
+		},
+		"non-object root is not an entity": {
+			src:          `{"$schema": "x", "type": "string"}`,
+			wantEntities: nil,
+		},
+		"boolean property schema": {
+			src:          `{"$schema": "x", "type": "object", "properties": {"anything": true}}`,
+			wantEntities: []string{"thing"},
+		},
+		"invalid JSON is a problem": {
+			src:          `{"$schema": "x", "type": `,
+			wantProblems: 1,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			out := jsonschema.Load(
+				[]jsonschema.File{{Path: "thing.schema.json", Src: []byte(tc.src)}},
+			)
+			var names []string
+			for i := range out.Entities {
+				names = append(names, out.Entities[i].Name)
+			}
+			equals(t, tc.wantEntities, names)
+			equals(t, tc.wantProblems, len(out.Problems))
+		})
+	}
+}
