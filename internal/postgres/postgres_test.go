@@ -110,3 +110,119 @@ func TestLoadSnippets(t *testing.T) {
 		})
 	}
 }
+
+func TestAssignments(t *testing.T) {
+	t.Parallel()
+	goPos := mml.Position{File: "store/store.go", Line: 20, Col: 9}
+	fee := []mml.Origin{{From: mml.FieldRef{Entity: "Order", Field: "shipping_fee"}, Pos: goPos}}
+	copied := func(entity, field string) []mml.Origin {
+		return []mml.Origin{{From: mml.FieldRef{Entity: entity, Field: field}}}
+	}
+	cases := map[string]struct {
+		sql  string
+		args [][]mml.Origin
+		want []mml.Assignment
+	}{
+		"insert select copies a joined column": {
+			sql: "INSERT INTO order_lines (order_id, order_fee) " +
+				"SELECT o.order_id, o.shipping_fee FROM orders o JOIN carts c ON c.id = o.cart_id",
+			want: []mml.Assignment{
+				{Column: "order_id", Origins: copied("orders", "order_id")},
+				{Column: "order_fee", Origins: copied("orders", "shipping_fee")},
+			},
+		},
+		"unqualified column with one relation": {
+			sql: "INSERT INTO daily (day) SELECT placed_at::date FROM orders",
+			want: []mml.Assignment{
+				{
+					Column: "day",
+					Origins: []mml.Origin{
+						{From: mml.FieldRef{Entity: "orders", Field: "placed_at"}, Truncate: "day"},
+					},
+				},
+			},
+		},
+		"update from copies the parent": {
+			sql: "UPDATE order_lines l SET order_fee = o.shipping_fee, qty = 1 " +
+				"FROM orders o WHERE o.order_id = l.order_id",
+			want: []mml.Assignment{
+				{Column: "order_fee", Origins: copied("orders", "shipping_fee")},
+				{Column: "qty"},
+			},
+		},
+		"bind parameters take the Go origins": {
+			sql:  "INSERT INTO order_lines (order_fee, qty) VALUES ($1, $2)",
+			args: [][]mml.Origin{fee},
+			want: []mml.Assignment{{Column: "order_fee", Origins: fee}, {Column: "qty"}},
+		},
+		"date_trunc and precision casts truncate": {
+			sql: "INSERT INTO events (a, b, c, d) VALUES " +
+				"(date_trunc('minute', now()), now()::timestamptz(0), now()::timestamp(3), now()::timestamptz)",
+			want: []mml.Assignment{
+				{Column: "a", Origins: []mml.Origin{{Truncate: "minute"}}},
+				{Column: "b", Origins: []mml.Origin{{Truncate: "second"}}},
+				{Column: "c", Origins: []mml.Origin{{Truncate: "millisecond"}}},
+				{Column: "d"},
+			},
+		},
+		"rows of VALUES merge": {
+			sql: "INSERT INTO events (a) VALUES (date_trunc('hour', now())), (date_trunc('day', now()))",
+			want: []mml.Assignment{
+				{Column: "a", Origins: []mml.Origin{{Truncate: "hour"}, {Truncate: "day"}}},
+			},
+		},
+		"column of a CTE is not a stored field": {
+			sql:  "WITH x AS (SELECT 1 AS v) INSERT INTO t (v) SELECT x.v FROM x",
+			want: []mml.Assignment{{Column: "v"}},
+		},
+		"no column list": {sql: "INSERT INTO t VALUES (1)"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			at := mml.Position{File: "q.go", Line: 1}
+			src := postgres.Load(
+				nil,
+				[]postgres.Snippet{{SQL: tc.sql, Pos: at, Strict: true, Args: tc.args}},
+			)
+			equals(t, 0, len(src.Problems))
+			got := src.Queries[len(src.Queries)-1].Assignments
+			for i := range tc.want {
+				tc.want[i].Pos = at
+			}
+			equals(t, tc.want, got)
+		})
+	}
+}
+
+func TestSQLCQueriesMerge(t *testing.T) {
+	t.Parallel()
+	file := postgres.File{Path: "query.sql", Src: []byte(
+		"-- name: GetOrder :one\nSELECT * FROM orders WHERE order_id = @order_id;\n\n" +
+			"-- name: CreateLine :exec\nINSERT INTO order_lines (order_id, order_fee)\n" +
+			"VALUES (@order_id, sqlc.arg(order_fee));\n",
+	)}
+	goPos := mml.Position{File: "db/query.sql.go", Line: 40}
+	fee := []mml.Origin{{From: mml.FieldRef{Entity: "Order", Field: "shipping_fee"}, Pos: goPos}}
+	src := postgres.Load([]postgres.File{file}, []postgres.Snippet{
+		{
+			SQL: "-- name: CreateLine :exec\nINSERT INTO order_lines (order_id, order_fee)\n" +
+				"VALUES ($1, $2)\n",
+			Pos: goPos, Strict: true, Args: [][]mml.Origin{nil, fee},
+		},
+		{SQL: "-- name: Other :exec\nDELETE FROM orders", Pos: goPos, Strict: true},
+	})
+	write := src.Queries[1]
+	cases := map[string]struct{ exp, act any }{
+		"generated copy merged, unnamed kept": {3, len(src.Queries)},
+		"merged query stays in the .sql file": {"query.sql", write.Pos.File},
+		"merged query takes the Go origins":   {fee, write.Assignments[1].Origins},
+		"unbound parameter stays unknown":     {[]mml.Origin(nil), write.Assignments[0].Origins},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			equals(t, tc.exp, tc.act)
+		})
+	}
+}

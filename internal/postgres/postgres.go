@@ -26,6 +26,9 @@ type loader struct {
 	order  []string // table keys in creation order
 	tables map[string]*mml.Entity
 	out    mml.Source
+	// named indexes, by sqlc query name, the writing Query each named
+	// statement in a .sql file produced (see mergeNamed).
+	named map[string]int
 }
 
 // stmtCtx is one statement being loaded: its file, the file's line index, and
@@ -41,15 +44,21 @@ type stmtCtx struct {
 	// call site of a snippet, since offsets inside SQL folded from Go
 	// constants do not map back to one place in the Go source.
 	at *mml.Position
+	// args are the origins of the Go values bound to $1, $2, ... of a
+	// snippet. Origins keep their own Go positions, unlike everything at.
+	args [][]mml.Origin
 }
 
 // Snippet is SQL found in Go code, at the call site Pos. Strict is true when
 // it was passed to a known SQL API, so SQL that does not parse is reported;
 // otherwise the argument may not be SQL at all and a parse failure is ignored.
+// Args holds, for each bind parameter $n at index n-1, the origins of the Go
+// value passed for it.
 type Snippet struct {
 	SQL    string
 	Pos    mml.Position
 	Strict bool
+	Args   [][]mml.Origin
 }
 
 // Load parses every file in order, then every snippet of SQL found in Go, and
@@ -60,7 +69,7 @@ type Snippet struct {
 // Ensures:  a file that fails to parse contributes a Problem and nothing else;
 // the other files are still loaded.
 func Load(files []File, snippets []Snippet) mml.Source {
-	l := &loader{tables: map[string]*mml.Entity{}}
+	l := &loader{tables: map[string]*mml.Entity{}, named: map[string]int{}}
 	for i := range files {
 		l.loadFile(&files[i])
 	}
@@ -94,9 +103,67 @@ func (l *loader) loadSnippet(sn *Snippet) {
 			start:      int(raw.GetStmtLocation()),
 			directives: mml.Annotations{},
 			at:         &sn.Pos,
+			args:       sn.Args,
 		}
+		before := len(l.out.Queries)
 		l.loadStmt(ctx, raw.GetStmt())
+		l.mergeNamed(sqlcName(stmtText(sn.SQL, raw)), before)
 	}
+}
+
+// mergeNamed folds a snippet's statement into the .sql file statement sqlc
+// generated it from, when both carry the same "-- name:" header. sqlc keeps
+// queries in .sql files and copies each into a Go constant, so without this
+// every query would be read twice and every finding about it reported twice.
+// The file's Query stays, positioned in the file; the snippet adds the
+// origins of the Go values bound to its parameters. before is the number of
+// queries before the snippet's statement was loaded.
+func (l *loader) mergeNamed(name string, before int) {
+	i, ok := l.named[name]
+	if !ok || len(l.out.Queries) == before {
+		return
+	}
+	fileQ, goQ := &l.out.Queries[i], l.out.Queries[len(l.out.Queries)-1]
+	if fileQ.Kind != goQ.Kind || !strings.EqualFold(fileQ.Target, goQ.Target) {
+		return // the same name for a different statement: keep both
+	}
+	for _, ga := range goQ.Assignments {
+		for j := range fileQ.Assignments {
+			if strings.EqualFold(fileQ.Assignments[j].Column, ga.Column) {
+				fileQ.Assignments[j].Origins = append(fileQ.Assignments[j].Origins, ga.Origins...)
+			}
+		}
+	}
+	l.out.Queries = l.out.Queries[:before]
+}
+
+// sqlcName returns the query name in a "-- name: CreateOrder :exec" comment
+// that leads a statement, or "" when the statement has none.
+func sqlcName(text string) string {
+	for line := range strings.Lines(text) {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, "-- name:")
+		switch {
+		case ok:
+			if f := strings.Fields(rest); len(f) > 0 {
+				return f[0]
+			}
+			return ""
+		case line == "" || strings.HasPrefix(line, "--"):
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+// stmtText is the source of one parsed statement, leading comments included.
+func stmtText(src string, raw *pg.RawStmt) string {
+	start, n := int(raw.GetStmtLocation()), int(raw.GetStmtLen())
+	if n == 0 || start+n > len(src) {
+		return src[start:]
+	}
+	return src[start : start+n]
 }
 
 func (l *loader) loadFile(f *File) {
@@ -117,7 +184,14 @@ func (l *loader) loadFile(f *File) {
 			int(raw.GetStmtLen()),
 		)
 		ctx := &stmtCtx{file: f, lines: lines, start: start, directives: anns}
+		before := len(l.out.Queries)
 		l.loadStmt(ctx, raw.GetStmt())
+		if name := sqlcName(
+			stmtText(string(f.Src), raw),
+		); name != "" &&
+			len(l.out.Queries) > before {
+			l.named[name] = len(l.out.Queries) - 1
+		}
 	}
 }
 

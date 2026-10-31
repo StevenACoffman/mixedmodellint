@@ -96,9 +96,11 @@ func columnRefs(nodes []*pg.Node, scope string) []mml.ColumnRef {
 	return out
 }
 
-func defaultRelation(q *mml.Query) string {
-	if len(q.Relations) == 1 {
-		return q.Relations[0].Alias
+// defaultRelation is the alias an unqualified column belongs to: the only
+// relation in scope, or none.
+func defaultRelation(rels []mml.Relation) string {
+	if len(rels) == 1 {
+		return rels[0].Alias
 	}
 	return ""
 }

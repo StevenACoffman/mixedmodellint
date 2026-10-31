@@ -63,7 +63,7 @@ func (b *queryBuilder) selectStmt(s *pg.SelectStmt, kind mml.QueryKind, target s
 	for _, f := range s.GetFromClause() {
 		b.fromItem(&q, f)
 	}
-	scope := defaultRelation(&q)
+	scope := defaultRelation(q.Relations)
 	for _, t := range s.GetTargetList() {
 		b.expr(&q, scope, t)
 	}
@@ -309,7 +309,8 @@ func (b *queryBuilder) insert(is *pg.InsertStmt) {
 	}
 	b.with(is.GetWithClause())
 	before := len(b.out)
-	if sel := is.GetSelectStmt().GetSelectStmt(); sel != nil && len(sel.GetValuesLists()) == 0 {
+	sel := is.GetSelectStmt().GetSelectStmt()
+	if sel != nil && len(sel.GetValuesLists()) == 0 {
 		b.selectStmt(sel, mml.QueryInsert, target)
 	}
 	if len(b.out) == before {
@@ -322,12 +323,53 @@ func (b *queryBuilder) insert(is *pg.InsertStmt) {
 	if is.GetOnConflictClause() != nil && key == nil {
 		w.ConflictKey = []string{} // ON CONFLICT ON CONSTRAINT name: keyed, columns unknown
 	}
+	w.Assignments = b.insertAssignments(w, is, sel)
 }
 
+// insertAssignments returns the columns an INSERT sets. Without a column list
+// the columns are the table's in DDL order, which the statement alone does
+// not say, so there are none; a UNION body has several target lists and is
+// skipped too.
+func (b *queryBuilder) insertAssignments(
+	w *mml.Query, is *pg.InsertStmt, sel *pg.SelectStmt,
+) []mml.Assignment {
+	cols := make([]string, 0, len(is.GetCols()))
+	for _, c := range is.GetCols() {
+		cols = append(cols, c.GetResTarget().GetName())
+	}
+	a := &assigner{args: b.ctx.args, pos: w.Pos}
+	switch {
+	case len(cols) == 0 || sel == nil:
+		return nil
+	case len(sel.GetValuesLists()) > 0:
+		return a.valuesAssignments(cols, sel.GetValuesLists())
+	case sel.GetLarg() != nil:
+		return nil
+	default:
+		a.relations = w.Relations
+		return a.selectAssignments(cols, sel.GetTargetList())
+	}
+}
+
+// update adds an UPDATE. Its FROM items are only scope for the SET list: the
+// statement reads them, but its Query is the write, so they are not added as
+// its relations.
 func (b *queryBuilder) update(us *pg.UpdateStmt) {
+	target := us.GetRelation()
+	alias := target.GetAlias().GetAliasname()
+	if alias == "" {
+		alias = target.GetRelname()
+	}
 	b.with(us.GetWithClause())
+	scope := mml.Query{Relations: []mml.Relation{{Name: tableKey(target), Alias: alias}}}
+	for _, f := range us.GetFromClause() {
+		b.fromItem(&scope, f)
+	}
+	pos := b.ctx.pos(b.ctx.start)
+	a := &assigner{relations: scope.Relations, args: b.ctx.args, pos: pos}
 	b.out = append(b.out, mml.Query{
-		Pos: b.ctx.pos(b.ctx.start), Kind: mml.QueryUpdate, Target: tableKey(us.GetRelation()),
+		Pos: pos, Kind: mml.QueryUpdate, Target: tableKey(target),
+		Assignments: a.setAssignments(us.GetTargetList()),
 	})
 }
 
