@@ -53,13 +53,7 @@ func buildQueries(ctx *stmtCtx, n *pg.Node) []mml.Query {
 // SELECT is the body of an INSERT or a view, so the last Query added is the
 // writing one.
 func (b *queryBuilder) selectStmt(s *pg.SelectStmt, kind mml.QueryKind, target string) {
-	for _, c := range s.GetWithClause().GetCtes() {
-		cte := c.GetCommonTableExpr()
-		b.ctes[strings.ToLower(cte.GetCtename())] = true
-		if sub := cte.GetCtequery().GetSelectStmt(); sub != nil {
-			b.selectStmt(sub, mml.QuerySelect, "")
-		}
-	}
+	b.with(s.GetWithClause())
 	if s.GetLarg() != nil || s.GetRarg() != nil {
 		b.selectStmt(s.GetLarg(), kind, target)
 		b.selectStmt(s.GetRarg(), kind, target)
@@ -87,6 +81,19 @@ func (b *queryBuilder) selectStmt(s *pg.SelectStmt, kind mml.QueryKind, target s
 	}
 	b.dedups(&q, s, scope)
 	b.out = append(b.out, q)
+}
+
+// with adds the queries of a WITH clause's CTEs and records their names, so
+// a FROM item naming one is derived rather than a stored table. INSERT and
+// UPDATE carry their own WITH clause, outside the SELECT.
+func (b *queryBuilder) with(wc *pg.WithClause) {
+	for _, c := range wc.GetCtes() {
+		cte := c.GetCommonTableExpr()
+		b.ctes[strings.ToLower(cte.GetCtename())] = true
+		if sub := cte.GetCtequery().GetSelectStmt(); sub != nil {
+			b.selectStmt(sub, mml.QuerySelect, "")
+		}
+	}
 }
 
 // fromItem adds one FROM item: a table, a CTE or subquery (derived), or a
@@ -300,6 +307,7 @@ func (b *queryBuilder) insert(is *pg.InsertStmt) {
 	for _, ie := range is.GetOnConflictClause().GetInfer().GetIndexElems() {
 		key = append(key, ie.GetIndexElem().GetName())
 	}
+	b.with(is.GetWithClause())
 	before := len(b.out)
 	if sel := is.GetSelectStmt().GetSelectStmt(); sel != nil && len(sel.GetValuesLists()) == 0 {
 		b.selectStmt(sel, mml.QueryInsert, target)
@@ -317,6 +325,7 @@ func (b *queryBuilder) insert(is *pg.InsertStmt) {
 }
 
 func (b *queryBuilder) update(us *pg.UpdateStmt) {
+	b.with(us.GetWithClause())
 	b.out = append(b.out, mml.Query{
 		Pos: b.ctx.pos(b.ctx.start), Kind: mml.QueryUpdate, Target: tableKey(us.GetRelation()),
 	})
