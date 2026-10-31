@@ -113,7 +113,7 @@ func loadGo(
 		for _, sn := range res.Snippets {
 			snippets = append(
 				snippets,
-				postgres.Snippet{SQL: sn.SQL, Pos: sn.Pos, Strict: sn.Strict},
+				postgres.Snippet{SQL: sn.SQL, Pos: sn.Pos, Strict: sn.Strict, Args: sn.Args},
 			)
 		}
 	}

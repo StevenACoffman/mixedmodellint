@@ -9,7 +9,8 @@ CREATE TABLE orders (
     order_id    BIGINT PRIMARY KEY,
     customer_id BIGINT NOT NULL REFERENCES customers (customer_id),
     placed_at   TIMESTAMPTZ NOT NULL,
-    total_usd   NUMERIC(12, 2) NOT NULL
+    total_usd   NUMERIC(12, 2) NOT NULL,
+    shipping_fee NUMERIC(10, 2) NOT NULL
 );
 
 -- mml:grain one row per page view

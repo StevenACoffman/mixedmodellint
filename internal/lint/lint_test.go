@@ -25,11 +25,14 @@ func TestGrainQueries(t *testing.T) {
 	}
 	want := []string{
 		"app/app.go:15 7.2-A",
+		"app/lines.go:47 7.4-D",
+		"app/views.go:14 9.8-B",
 		"queries/fanout.sql:2 7.2-A",
 		"queries/loads.sql:2 7.3-A",
 		"queries/loads.sql:6 7.1-C",
 		"queries/reads.sql:2 7.3-D",
 		"queries/reads.sql:10 7.5-D",
+		"queries/views.sql:2 7.5-D",
 	}
 	if !slices.Equal(want, got) {
 		t.Fatalf("findings:\n got  %q\n want %q", got, want)
