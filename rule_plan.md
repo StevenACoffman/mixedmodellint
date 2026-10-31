@@ -1,0 +1,3216 @@
+# Rule Plan: Deterministic Static Analysis for `revised_data_model_rules.md`
+
+This plan describes how `mixedmodellint` can check every rule in
+[`revised_data_model_rules.md`](revised_data_model_rules.md) in CI with no LLM. Each check
+reads Go code, SQL DDL, and JSON Schema; reports a measured result; and gives
+a concrete suggestion for fixing it. Every rule gets **at least two designs
+that are very different from each other**. "Very different" means the designs
+use different kinds of evidence (see [Design families](#4-design-families)),
+not two thresholds on the same heuristic.
+
+Rule references (`§8.4`) point to the numbering in
+`revised_data_model_rules.md`, which supersedes `data_model_rules.md`. The
+revision adds §1.13, §1.14, §2.9, §3.6, §4.11, §10.9 and §10.10. It moves
+hard-coded source names from §3.5 to §3.6 and synthetic-data marking from
+§10.1 to §10.9. It also downgrades §8.7 and §10.1 to SHOULD.
+
+The ruleset's Limitations note that the source book's own DDL declares time
+columns as `TIMESTAMP` without a time zone, and that its `cart_payload`
+unpacking query fails on current PostgreSQL. Fixtures and suggestions in this
+plan therefore never copy the book's DDL. They use `timestamptz`, per §9.2.
+
+## 1. What counts as an "entity"
+
+All three source kinds are turned into one intermediate representation (IR),
+so each check is written once and runs on all of them.
+
+| Source                                     | Entity                                                                                                                                                 | Fields                                                                          | Keys / refs                                                                                  | Docs                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| **Go** (`go/packages` + `go/types`)        | A named struct type that has persistence or serialization tags (`db`, `gorm`, `bun`, `sql`, `bson`, `json`, `avro`, `parquet`), or one named in config | Exported fields, following embedded structs; the tag name wins over the Go name | `gorm:"primaryKey"`, `db:"id"` plus `//mml:pk`, struct-typed or `[]T` fields, `XxxID` fields | Doc comment                                                        |
+| **SQL DDL** (migrations replayed in order) | `CREATE TABLE` after every `ALTER` has been applied; views are kept as *query* entities                                                                | Columns                                                                         | `PRIMARY KEY`, `UNIQUE`, `REFERENCES`, `CHECK`, indexes                                      | `COMMENT ON`, plus the `--` comment block just above the statement |
+| **JSON Schema**                            | The root schema, plus each `$defs` / `definitions` entry with `"type": "object"`                                                                       | `properties` (`required` sets presence; `type: [..., "null"]` sets nullability) | `$ref` edges, `x-mml-key`, `format: uuid`                                                    | `title`, `description`                                             |
+
+Parser choices: for SQL, use `pg_query_go` (cgo, exact PostgreSQL grammar) and
+put it behind a `Dialect` interface so a pure-Go parser (for example the
+Vitess `sqlparser` for MySQL) can replace it. The pg_query parse tree does not
+keep comments. To read `-- mml:` annotations, the loader runs
+`pg_query.Scan`, which returns `SQL_COMMENT` and `C_COMMENT` tokens with
+byte offsets, and attaches each comment block to the next statement's
+`stmt_location`. For JSON Schema, load drafts 4, 6, 7, 2019-09 and 2020-12 with
+`santhosh-tekuri/jsonschema/v6` to resolve `$ref`s. Keep the raw decoded
+document as well, because unknown `x-mml-*` keywords are annotations that the
+compiled schema does not expose. In Go, an `//mml:` line in a doc comment is a
+Go directive (the `//word:` form with no space), so `go/doc` leaves it out of
+the rendered documentation. The loader reads it from `ast.CommentGroup.List`
+instead of from `Text()`, which drops directives.
+
+```go
+type Entity struct {
+    ID          string            // "sql:public.orders", "go:example.com/x/model.Order", "json:schemas/order.json#"
+    Kind        SourceKind        // Go | SQL | JSONSchema
+    Name        string            // as written
+    Canonical   string            // snake_case, singularized; used for cross-source linking
+    Pos         Position          // file:line:col for SARIF
+    Doc         string
+    Annotations Annotations       // merged from inline directives + sidecar (see §2)
+    Fields      []Field
+    PrimaryKey  []string
+    Uniques     [][]string
+    Refs        []Ref             // FK, $ref, struct-typed field, or name-inferred (Ref.Inferred=true)
+    Checks      []Check           // CHECK exprs, JSON enum/const/pattern, Go validate tags
+}
+
+type Field struct {
+    Name        string
+    Type        LogicalType       // string, int, decimal, float, bool, date, timestamptz,
+                                  // timestamp_naive, time, interval, uuid, bytes, json,
+                                  // array<T>, object, ref<Entity>
+    RawType     string            // VARCHAR(10), *time.Time, {"type":"string","format":"date-time"}
+    Nullable    bool              // SQL: !NOT NULL; Go: pointer, sql.Null*, pgtype.* (Valid flag); JSON: "null" in type / nullable: true (OpenAPI 3.0)
+    Optional    bool              // may be absent: JSON: not in "required"; Go: `json:",omitempty"`/`omitzero`. Not the same as Nullable.
+    Enum        []string
+    Default     string
+    Doc         string
+    Annotations Annotations
+    Pos         Position
+}
+```
+
+Besides entities, the linter loads four other bodies of evidence (corpora).
+Some designs depend on them:
+
+- **Query corpus:** `.sql` query files (sqlc `queries/`, dbt `models/`, views),
+  and SQL string literals in Go found by constant-folding the arguments to
+  `database/sql`, `pgx`, `sqlx`, `gorm.Raw`, and `squirrel`. These are parsed
+  into ASTs and resolved against the entity catalog.
+- **Code corpus:** Go function bodies, used for write-path, validation, and
+  time-handling analysis through `go/ssa` / `golang.org/x/tools/go/analysis`.
+- **Repo artifacts:** `CODEOWNERS`, `mml.yaml` (the sidecar catalog),
+  `glossary.yaml`, `docs/adr/*.md`, dbt `schema.yml`, `semantic_layer/*.yml`,
+  and `CHANGELOG`/`DEPRECATIONS`.
+- **History:** the base-branch IR next to the head-branch IR (CI runs both and
+  diffs them), plus `git log` on schema files.
+
+**Cross-source linking.** The Go struct `Order`, the table `orders`, and
+`schemas/order.json` are linked into one *logical entity* when their
+`Canonical` names match after case folding, singularization, and removal of
+configured affixes (`_tbl`, `DTO`, `Model`). An explicit `//mml:entity order`,
+`-- mml:entity order`, or `"x-mml-entity": "order"` overrides the match. Many
+rules check consistency inside one logical entity.
+
+## 2. Annotation contract (one vocabulary, three syntaxes, plus a sidecar)
+
+Many rules cannot be checked until something is declared, such as a grain,
+an owner, or what a `NULL` means. The linter defines one key vocabulary and
+reads it from whichever syntax fits the source:
+
+| Syntax      | Entity-level                                                                                                                 | Field-level                                                      |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Go          | doc-comment directive `//mml:grain one row per order line`                                                                   | struct tag `mml:"null=not_applicable;unit=USD;measure=additive"` |
+| SQL         | `COMMENT ON TABLE orders IS '... @grain: one row per order ...'`, or a `-- mml:grain ...` line directly above `CREATE TABLE` | `COMMENT ON COLUMN` with `@key: value` lines                     |
+| JSON Schema | `"x-mml-grain": "one row per order"`                                                                                         | `"x-mml-null": "not_applicable"` inside the property             |
+| Sidecar     | `mml.yaml` → `entities.<id>.grain`                                                                                           | `entities.<id>.fields.<name>.null`                               |
+
+Inline annotations and the sidecar are merged. If they disagree, the linter
+reports an `mml/annotation-conflict` finding.
+
+Annotation values are plain strings, so `x-mml-grain: "one row per order"`
+in JSON and `@grain: one row per order` in SQL carry the same thing. A value of
+`TODO`, or an empty value, counts as missing. A key this table does not list
+produces an `mml/unknown-key` note, so a typo cannot pass silently.
+
+**Core keys**, used by many rules:
+
+| Key                        | Values                                                                                                                          | Meaning                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `entity`                   | logical name                                                                                                                    | Overrides cross-source linking                                                |
+| `definition`               | text                                                                                                                            | Plain-language definition (§1.2)                                              |
+| `owner`, `escalation`      | team or CODEOWNERS principal                                                                                                    | Who owns the entity and who settles disputes (§1.2)                           |
+| `synonyms`                 | list                                                                                                                            | Mapped alternative terms (§2.1)                                               |
+| `grain`                    | `one row per …`                                                                                                                 | Grain statement (§7.1)                                                        |
+| `layer`                    | `oltp\|event\|staging\|core\|analytical\|obt\|feature\|reference\|unstructured\|rag\|training\|presentation\|scratch\|external` | Architectural layer                                                           |
+| `lifecycle`                | `scratch\|recurring\|published`                                                                                                 | Hardening stage (§1.7)                                                        |
+| `source`                   | `owned\|legacy\|third_party`                                                                                                    | Ownership of the schema (§3.5)                                                |
+| `role`                     | `identity_map\|file\|version\|blob_store\|calendar\|pipeline_run\|quality_result\|access_log\|schema_version`                   | Operational role of an entity                                                 |
+| `measure`                  | `additive\|semi_additive\|non_additive\|nominal`, plus `numerator=`, `denominator=`, `over=`                                    | Measure class (§8.3, §8.4, §8.8)                                              |
+| `null`                     | `missing\|unknown\|not_applicable\|zero\|open\|forbidden`                                                                       | What `NULL` means (§5.3); `open` marks an open-ended end time (§9.3)          |
+| `unit`, `currency`         | UCUM unit, ISO 4217 code                                                                                                        | Units of a measure (§2.5)                                                     |
+| `time`                     | `event\|ingested\|processed\|valid_from\|valid_to\|txn_from\|txn_to\|business\|system`                                          | Kind of timestamp (§9.1, §10.1)                                               |
+| `tz`                       | IANA zone or a column name                                                                                                      | Zone for local time (§9.2)                                                    |
+| `inferred`                 | `confidence=`, `threshold=`, `review_queue=`                                                                                    | Probabilistic relationship (§6.7)                                             |
+| `deviation`                | ADR path or URL                                                                                                                 | Recorded physical-vs-logical deviation (§1.9)                                 |
+| `waive`                    | rule ID plus required `reason=`                                                                                                 | Suppression                                                                   |
+| `value-object`             | flag                                                                                                                            | Exempts embedded value types such as `Money` or `Address` from identity rules |
+| `pk`, `key`, `natural_key` | flag or field list                                                                                                              | Declares the primary, logical or natural key where the source cannot          |
+
+**Rule-specific keys** (defined in the rule that uses them):
+
+| Rules | Keys                                                                                                                                                                                                                                                                              |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| §1    | `card` (cardinality `0..1\|1..1\|0..N\|1..N`), `process`, `freshness`, `format`, `format_reason`, `change_policy`, `out_of_scope`, `ownership` (`liability`), `ai_systems_reason`; artifacts `model/ownership/<owner>.yaml`, `model/requirements/<unit>.yaml`                     |
+| §2    | `producers`, `status` (validation status), `standard`, `agent_exposed`, `agent_ops`, `transitions`, `translates`, `mapping`, `taxonomy`, `contract` (`x-mml-contract`: `producer`, `consumers`), `term`, `version`, `renamed_from` (§2.9)                                         |
+| §3    | `history_of`, `history_in`, `denormalized_for`, `captured_at_transaction`, `upstream`, `master`, `required`, `enforced_in`, `history` (`required\|latest_only`, §3.1), `reviewed_version` (§3.5); `denormalized_for` takes `access_pattern:\|latency_sla:\|other:<reason>` (§3.2) |
+| §4    | `resolution`, `resolution_owner`, `sources`, `refers`, `derived_from`, `location`, `denormalized_from`, `split_reason`, `pattern` (`<name>=adopted\|adapted\|rejected\|none-applicable` plus `reason=`), `pattern_adr` (§4.11), `removal_candidate` (§4.9)                        |
+| §5    | `null_when`                                                                                                                                                                                                                                                                       |
+| §6    | `consumers`, `consequential`, `validates`, `max-items`, `ref`                                                                                                                                                                                                                     |
+| §7    | `load` (`incremental\|full`), `rollups`, `window` (streaming window, for example `tumbling(5m)`), `schema`, `recoverable_from`, `recoverable_until` (§7.5)                                                                                                                        |
+| §8    | `counts`, `active`, `period` (reporting time range, for example `trailing_30d\|all_time`), `count_source`, `m2m`, `approx_error`, `reaggregate`, `dimensions`, `lateness`, `late_policy`, `breakdowns`, `scale`, `pooling`, `key_metric`, `reconciles_with`, `tolerance`          |
+| §9    | `encoding` (`unix_s\|unix_ms\|unix_us`), `end` (`exclusive\|inclusive`), `interval`, `lifespan`, `audit` (`bitemporal`), `precision` (`ms\|us\|ns`)                                                                                                                               |
+| §10   | `synthetic` (`possible\|never`), `core`, `extension`, `dedup`, `derived`, `aspects`, `label`, `observation_time`, `actor`, `monitored_by`, `meta` (`business\|system`, §10.1), `quality` (§10.9), `graph` (`node\|edge\|ontology`, §10.10); `synthetic` also takes `only`         |
+
+Project-wide settings, such as `exemptions`, `core_layers`, `owner_aliases`,
+`source_systems`, `sources.host_patterns` and `severity_overrides`, live in
+`mml.yaml` under `config:`. Each rule section names the settings it reads.
+
+## 3. Findings, severity, and suppression
+
+- **Severity** follows the rule's strength: `[MUST]` → `error` (fails CI),
+  `[SHOULD]` → `warning`, `[CONSIDER]` → `note`. A design marked
+  **heuristic** below starts one level lower until the team promotes it in
+  config.
+- **Finding** = `{rule: "§5.1", design: "5.1-A", entity, field?, pos,
+  measured: "...", threshold: "...", suggestion: "...", fix?: SARIF fix}`.
+  The `measured` text always shows the observed value, for example `column
+  "user" is a reserved word in PostgreSQL 17` or `column "date" is reserved in
+  SQL:2016 and is a bare type word`. It never says only "violates rule".
+- **Output:** text, JSON, and SARIF 2.1.0 (GitHub code scanning annotations on
+  the PR diff). Where a suggestion can be applied mechanically, it includes a
+  `fix` with replacement text.
+- **Suppression:** `//mml:waive §5.1 reason="vendor table"` (or the same key
+  in SQL, JSON, or the sidecar). A waiver without a reason is itself a
+  finding. A **baseline file** (`mml-baseline.json`, holding finding
+  fingerprints) lets an existing codebase adopt the linter and then fail only
+  on new violations.
+- **Diff mode:** `--base <ref>` reports only findings on entities that changed
+  in the PR, and turns on the History-family designs.
+
+## 4. Design families
+
+Each design belongs to one evidence family. When a design is labeled with two
+codes, such as `S+L`, the first code is its **primary** family and the second
+names a supporting input. For example, a structural check might use a word
+list to classify column names. A rule's designs must have at least two
+**different primary** families, so that one shared blind spot cannot defeat
+all of them.
+
+| Code  | Family         | Evidence                                                                                                                        | Typical strength / weakness                                                |
+| ----- | -------------- | ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| **S** | Structural     | Shape of a single entity in the IR (types, nullability, keys, counts)                                                           | Exact and fast; blind to meaning                                           |
+| **L** | Lexical        | Names and descriptions checked against lexicons (reserved words, abbreviation lists, the project glossary, a stemmer/tokenizer) | Catches naming and meaning drift; language-dependent                       |
+| **G** | Graph          | The cross-entity relationship graph (FKs, `$ref`s, inferred refs, cross-source links)                                           | Sees system-wide patterns; needs good linking                              |
+| **C** | Contract       | Requires an explicit annotation, then checks it is present and well formed and that it **agrees with the structure**            | Turns judgment into a checkable declaration; can be gamed with boilerplate |
+| **Q** | Query / usage  | ASTs of queries and Go call sites that read or write the entity                                                                 | Measures real behavior; only as complete as the corpus                     |
+| **H** | History / diff | Base-vs-head IR diff, migration sequence, git metadata                                                                          | Catches breaking change and drift; needs a base ref                        |
+| **A** | Artifact       | Cross-references to repo files (CODEOWNERS, glossary, ADRs, dbt tests, semantic layer)                                          | Checks that process evidence exists; cannot judge its quality              |
+
+**METHOD rules** (`[METHOD]`) are mostly about human process. Static analysis
+cannot check whether a conversation happened. It can check that **evidence**
+of the process exists, is linked to the entity, and agrees with the code.
+Designs for these rules are labeled **proxy** and say so in their
+`measured` text.
+
+## 5. Per-rule template
+
+Every rule below uses this layout:
+
+> **Applies to:** Go ✔/◐/✘ · SQL ✔/◐/✘ · JSON ✔/◐/✘, each with how the rule
+> maps onto that entity kind (✔ direct, ◐ partial or through annotations,
+> ✘ not meaningful).
+> **Checkability:** `direct` (the structure itself shows a violation),
+> `declared` (needs an annotation before it can be checked), or `proxy`
+> (only evidence of a process can be checked).
+>
+> #### Design A — name (family, deterministic | heuristic)
+>
+> - *Measure:* the exact computation.
+> - *Fails when:* the deterministic condition.
+> - *Suggestion:* the message template, with `{placeholders}`.
+> - *Limits:* false positives and negatives, plus config knobs.
+>
+> #### Design B — ... (different primary family)
+>
+> **Recommendation:** which design to build first, and why.
+>
+> **Residual limit:** for a rule whose checking was limited (proxy, declared,
+> heuristic, or history-bound), what remains impossible after M1–M5. The line
+> is omitted when nothing remains.
+
+## 6. Mechanisms that reduce limited checkability
+
+Some rules can be checked only through *proxy* evidence or *declared* values,
+or only by heuristics or with git history. Five shared mechanisms make those
+rules more checkable, each in a different way. Rule sections cite them as
+M1–M5. None of them uses an LLM, and every one is deterministic.
+
+**M1 — Fingerprint binding (stops stale and boilerplate declarations).**
+Each entity's shape is reduced to a *structural fingerprint*: a SHA-256 over
+the sorted `(field name, LogicalType, nullable, key role)` tuples and the
+outbound refs. Each process record (a definition, an ownership record, a
+requirements record, a pattern evaluation, an ADR, a contract) and each
+entity-level annotation can carry `fp=<first 12 hex chars>` for the entity
+shape it was written against. `mixedmodellint annotate` writes the value.
+When the entity's shape changes, the stored `fp` no longer matches, and the
+finding `mml/stale-declaration` asks for the declaration to be reviewed.
+After review, `annotate --refresh` rewrites the value, and the diff of that
+line shows a reviewer touched it. The mechanism does not judge content. It
+guarantees a declaration was looked at since the last structural change, so
+a record copied once can't silently satisfy a rule forever.
+
+**M2 — Inference cross-check (turns `declared` into `declared + direct`).**
+Wherever the structure implies a value, the linter infers it and compares it
+with the declaration. Examples:
+
+- the grain inferred from the PK and UNIQUE constraints (`one row per
+  {pk entity names}`)
+- the measure class inferred from the type and from lexicon prefill
+- the history need inferred from lineage
+- the junction status inferred from the key shape
+
+A declaration that contradicts the inference is an error, such as a grain of
+"one row per order" on a table keyed `(order_id, line_no)`. A declaration
+that merely restates the inference passes. `annotate` prefills the inferred
+value, so a team fills in only what structure cannot say. Declarations stop
+being free text that only has to be present.
+
+**M3 — Committed schema lock (history without git).** `mixedmodellint lock`
+writes `mml.lock.json`: the normalized IR (entities, fields, keys, refs and
+fingerprints), sorted so it diffs well. It also stores the committed seed rows of
+`layer=reference` entities, so that a change to reference values, such as
+renamed `region` codes (§1.12), shows up as a reviewed diff too. `check` compares the current IR with
+the lock in the working tree. A difference with no updated lock is
+`mml/lock-stale`. An updated lock shows every structural change as a reviewed
+diff in the PR. The H-family designs can read *lock vs current* instead of
+*base vs HEAD*, so they work in shallow clones and pre-commit hooks, and they
+move from Phase 3 into the MVP. Git history is still needed for authorship and
+timing ("written before" questions).
+
+**M4 — Result ingestion (turns data-dependent `proxy` into `direct`).**
+Some violations exist only in the data: a Simpson reversal, a failed
+reconciliation, drift, an orphan node, a duplicate key on a non-enforcing
+warehouse. Static analysis cannot see them. But CI already runs data tests,
+so `check --results <file>` ingests their machine-readable output:
+
+- dbt `target/run_results.json`
+- JUnit XML from SQL test runners
+- Great Expectations validation-result JSON
+- SHACL validation reports (`sh:ValidationReport` in Turtle or JSON-LD)
+
+Each result is mapped to the rule and entity that `scaffold` recorded when it
+generated the test (a `meta: {mml_rule: "§8.9", mml_entity: "..."}` block).
+A failed test becomes a finding with the observed values. A test that was
+generated but did not run is `mml/test-not-run`. The data itself is never
+read. The linter only interprets test outcomes, which keeps it deterministic
+and LLM-free.
+
+**M5 — Two-signal promotion (contains heuristics).** A heuristic signal on
+its own reports at `note` and offers an `annotate` stub. It reports at full
+severity only when a second, independent signal from a different family
+agrees. For example, a lexical match on `_tags` plus a structural array of
+FKs, or a name match plus a query-corpus usage pattern. Each signal is
+deterministic, and only its *interpretation* is a guess. Requiring agreement
+from two families bounds false positives without hiding the hint.
+
+The **residual limit** of each rule is what remains impossible after these
+mechanisms are applied. Each rule section names it in a final
+**Residual limit:** line.
+
+## Contents
+
+- §1 — Modeling Process and Levels
+- §2 — Shared Meaning, Taxonomies and Semantics
+- §3 — Process, Normalization and Layers
+- §4 — Identity and Entity Boundaries
+- §5 — Attributes and Naming
+- §6 — Relationships
+- §7 — Grain
+- §8 — Counting and Aggregation
+- §9 — Time
+- §10 — Metadata, Semi-/Unstructured Data and ML/AI Artifacts
+- Summary Matrix
+- Build Roadmap
+
+## §1 — Modeling Process and Levels
+
+### §1.1 — Answer conceptual, logical, physical before DDL `[MUST][METHOD]`
+
+**Applies to:** Go ◐ (a persisted struct must link to a logical entity) · SQL ✔ (each `CreateStmt`) · JSON ◐ (a top-level object definition must link to a logical entity)
+**Checkability:** `declared` for the levels, `direct` for new-entity detection (M3) and for cardinality, which is inferred from keys (M2), `proxy` for whether the questions were really thought through.
+
+#### Design A — Three-level linkage contract (C, deterministic)
+
+- *Measure:* For each logical entity (a cross-source-linked group), compute a 3-bit score `C L P`. **C** (conceptual) is set when `definition` is present. **L** (logical) is set when `PrimaryKey` is non-empty and every `Ref` has a cardinality. M2 infers it from structure: an FK column that is also `UNIQUE` or the whole PK is `1:1`, any other FK is `N:1`, a JSON array of `$ref` is `1:N`. A declared `card` (`mml:"card=1:N"`, `-- mml:card`, `x-mml-cardinality`) is needed only where nothing can be inferred, such as a Go `XxxID` field with no linked FK. A declared value that contradicts the inferred one is an error. **P** (physical) is set when at least one SQL, Go or JSON member exists. Conceptual is *required* (no exemption allowed) when any of these trigger conditions holds: (a) the entity's fields are read by queries or code owned by ≥2 distinct CODEOWNERS principals; (b) its glossary term has `alternatives[]` (a disputed term, §1.2-B); (c) its `mml.yaml` domain sets `complex: true`.
+- *Fails when:* `P=1` and `L=0`; or `P=1` and `C=0` while a trigger condition holds; or `P=1` and `C=0` with no exemption; or a declared `card` contradicts the inferred cardinality; or the `definition` carries an `fp=` that no longer matches the entity (M1 `mml/stale-declaration`). Entities with `lifecycle=scratch` (exploration) are skipped. `source ∈ {legacy, third_party}` entities are routed to §3.5. Two exemptions are accepted, each with a required `reason`: `exemptions.levels: [{entity, skip: conceptual}]` (a narrow, uncontested domain) and `{entity, skip: logical, merged_with: physical}` (logical and physical merged on one platform; the reason must name the lock-in accepted).
+- *Suggestion:* "`{entity}` is physically implemented at {pos} but has no {missing_levels}. Add `//mml:definition <plain-language meaning>` and declare cardinality on refs {refs_without_card}. If the domain is narrow and uncontested, record `exemptions.levels: [{entity: {entity}, skip: conceptual, reason: ...}]` in `mml.yaml` instead. This is not allowed here because {trigger}."
+- *Limits:* Boilerplate definitions pass, so pair this with §1.2-A's quality floor. M1 makes a boilerplate definition go stale when the entity's shape changes, but it cannot make the first version thoughtful. The ≥2-principal trigger needs the Phase 2 query/code corpus. Without it, only triggers (b) and (c) fire. Brownfield adoption needs the baseline file.
+
+#### Design B — New-table-in-diff gate (H, deterministic)
+
+- *Measure:* Collect the *added* entities: those in the current IR that are absent from `mml.lock.json` (M3), meaning a new `CreateStmt` in migrations, a new persisted struct, or a new `$defs` object. When `--base` is given, the base-vs-HEAD diff is used instead. The two agree whenever the lock was committed on the base branch.
+- *Fails when:* an added entity with `source=owned` and `lifecycle ≠ scratch` lacks a logical-model record. A logical-model record is either an entry in `model/logical/*.yaml` (or `mml.yaml entities.<id>.logical`) or an ADR in `docs/adr/*.md` that names the entity's `Canonical`. An `exemptions.levels` entry (see A) also satisfies the gate. The record must also agree with the new entity. Every logical attribute must have a physical column or a §1.9 deviation entry, and the logical keys must equal the physical PK, so a record copied from another entity fails.
+- *Suggestion:* "This PR creates `{entity}` ({pos}) without a logical-model entry. Run `mixedmodellint annotate --rule §1.1 {entity}` to write a stub `model/logical/{canonical}.yaml` with attributes, keys and cardinality, then fill it in. Alternatively, reference `{canonical}` in an ADR in this PR."
+- *Limits:* Only gates new entities. Existing debt is handled by Design A and the baseline. It checks that a record exists and agrees with the DDL, not that it was written before it; a PR can add both together, which the rule allows for minor features. In lock mode, the gate also runs in pre-commit hooks and shallow CI clones. A PR that adds an entity and forgets `mixedmodellint lock` gets `mml/lock-stale` as well.
+
+#### Design C — Brownfield reverse-engineering artifact (A + S, deterministic)
+
+- *Measure:* For owned entities (`source=owned`) whose fingerprint differs from the one in `mml.lock.json` (M3: an `AlterTableStmt`, a changed struct, a changed schema), look for `model/reverse/{canonical}.yaml`. Check that its `fp` (the M1 fingerprint) matches the **locked** fingerprint. In other words, the snapshot describes the schema as it was before this change.
+- *Fails when:* the snapshot is missing, or its fingerprint is stale. Legacy and third-party entities are excluded (§3.5 applies instead).
+- *Suggestion:* "You are altering `{entity}`, and its reverse-engineered model is {missing|stale}. Run `mixedmodellint extract --entity {id} --from-lock --format logical-yaml > model/reverse/{canonical}.yaml`, which reads the pre-change shape from the lock, and review the inferred keys and cardinality before changing the table."
+- *Limits:* The snapshot is generated mechanically, so the linter cannot verify that anyone reviewed it. The check fires on every alteration of an owned entity; teams with deep domain knowledge can set `rules.1_1.c.min_entity_age` to skip entities created recently.
+
+**Recommendation:** Build B first. It is cheap, gates only new work, and gives high signal on PRs. With the lock (M3) it is an MVP check that needs no git history. Then use A as the steady-state score.
+
+**Residual limit:** whether anyone actually thought through what is being modeled before writing DDL. The linter can only show that the three levels are written down, agree with each other, and are fresh. It also cannot tell whether a skipped conceptual level was really a narrow, uncontested domain.
+
+### §1.2 — Accepted definition, owner and dispute authority `[MUST][METHOD]`
+
+**Applies to:** Go ✔ (doc comment and directive) · SQL ✔ (`COMMENT ON TABLE`) · JSON ✔ (`description`, `x-mml-owner`)
+**Checkability:** `declared` for the definition, `direct` for consistency of `owner` and `escalation` with CODEOWNERS, the glossary and the org hierarchy (M2), and for freshness (M1).
+
+#### Design A — Definition/owner/escalation contract (C, deterministic)
+
+- *Measure:* Scope: every *core* logical entity. By default that is every entity except those with `lifecycle=scratch` or `source=third_party`. When `mml.yaml: core_layers` is set, it is only entities in those layers. For each one, check that `definition`, `owner` and `escalation` are present. `owner` and `escalation` must match `^(team|group|role):[a-z0-9-]+$` or be a CODEOWNERS principal (`@org/team` or `@user`). The definition must pass a quality floor: ≥8 words, and ≥4 content tokens remain after removing stopwords and the entity's own name tokens. Definitions matching `(?i)^(todo|tbd|n/?a|the \w+ (table|struct|schema))\b` fail the floor.
+- *Fails when:* any of the three keys is missing or malformed; the definition is below the floor; `escalation` equals `owner`, since then nobody outside the owner can settle disputes; or the definition's `fp=` is stale (M1). Whether the named `owner` has a documented scope of authority is checked by §1.13, not here.
+- *Suggestion:* "`{entity}` has no {missing}. Add `//mml:definition ...`, `//mml:owner team:<x>` and `//mml:escalation role:<y>`. In SQL, use `COMMENT ON TABLE {name} IS '@definition: ... @owner: ... @escalation: ...'`. `annotate` prefills `owner` from CODEOWNERS (M2)." For staleness: "`{entity}` changed shape since its definition was written ({changes}). Re-read the definition, then run `mixedmodellint annotate --refresh {entity}`."
+- *Limits:* The linter cannot verify that stakeholders accepted the definition. The word-count floor is a proxy for substance and can be beaten with padding. Tune it with `rules.1_2.a.min_words` and `min_content_tokens`.
+
+#### Design B — Glossary cross-reference with conflict register (A, deterministic)
+
+- *Measure:* Load `glossary.yaml` (`terms[].{name, definition, owner, escalation, synonyms[], alternatives[]: {definition, proposed_by, effect}, decision: {by, date, chosen} | {split: [{term, entity}...]}}`). Match each logical entity to a term by canonical name or synonym. The rule allows a conflict to end in one of two ways. Either the choice is escalated and recorded (`decision.chosen`), or the alternatives turn out to name genuinely different concepts, each modeled under its own name (`decision.split`, §2.1).
+- *Fails when:* (1) a core entity has no glossary term; (2) the entity's inline `definition` differs from the glossary text after normalizing whitespace and case (drift); (3) the term has ≥2 `alternatives` but no `decision`, so an unresolved dispute is being modeled anyway; (4) a term decided with `decision.chosen` has an alternative with no `effect`, which is the rule's "effect on the numbers" (for example `effect: "count 41,200 vs 12,900"`); (5) `decision.by` is listed in `mml.yaml: data_team_principals`, meaning the data team picked the winner; (6) a `decision.split` names an entity that does not exist in the IR, or two split terms resolve to the same entity, so the concepts were split on paper but are still modeled as one; (7) the escalation does not have authority over both parties. When `mml.yaml: org` gives a reporting hierarchy (`{principal: parent}`), `decision.by` (or the entity's `escalation`) must be a common ancestor of every `alternatives[].proposed_by`. Without a hierarchy, it must at least be none of the proposing principals.
+- *Suggestion:* "Term '{term}' has {n} competing definitions with {no recorded decision|decision by data-team principal {by}}. Either record each alternative's effect on the numbers, escalate to `{escalation}`, and write `decision.by`/`date` in `glossary.yaml` before modeling `{entity}`; or, if the definitions describe different things, record `decision.split` and model each as its own entity (for example `registered_account` and `purchasing_customer`, §2.1)." For (6): "Split term '{term}' maps to `{entity}`, which {does not exist|is also the target of '{other}'}. Create a separately named entity for each concept." For (7): "The dispute over '{term}' between {parties} was decided by `{by}`, who is not above both of them in `org`. Escalate to `{common_ancestor}`."
+- *Limits:* Requires the team to maintain `glossary.yaml`. Check (2) is an exact text comparison, so harmless edits trigger it; `rules.1_2.b.definition_source: glossary` makes the glossary the single source and turns inline definitions into references. Check (5) depends on `data_team_principals` being kept current, and check (7) on `org` being kept current. Without `org`, check (7) catches only a party deciding its own dispute. The linter cannot judge whether a split was the right call, that is, whether the concepts are genuinely different. It only checks that a recorded split shows up in the model.
+
+#### Design C — CODEOWNERS consistency (A, deterministic)
+
+- *Measure:* Resolve CODEOWNERS for the entity's defining file, using last-matching-pattern-wins semantics as GitHub does, and compare the result with the declared `owner` (mapped through `mml.yaml: owner_aliases` from `team:x` to `@org/x`).
+- *Fails when:* no CODEOWNERS rule covers the file, or the declared owner is not among the resolved CODEOWNERS owners.
+- *Suggestion:* "`{entity}` declares owner `{owner}`, but CODEOWNERS assigns {file} to {codeowners}. Align them so that schema reviews route to the definition owner."
+- *Limits:* CODEOWNERS works per file. When several entities with different owners share one migration or Go file, this check reports false mismatches; set `rules.1_2.c.skip_shared_files: true` or split the files. GitLab and Bitbucket CODEOWNERS dialects (sections, approval counts) need their own parsers.
+
+**Recommendation:** Build A for the MVP. Add B once a glossary exists: it is the only design that catches a definition picked by the data team, the only one that checks the split carve-out against the model, and the only one that checks that the escalation has authority over both parties.
+
+**Residual limit:** whether the stakeholders genuinely accept the definition, and whether an `org` hierarchy that someone typed in matches real authority.
+
+### §1.3 — Model the business process before systems `[MUST][METHOD]`
+
+**Applies to:** Go ◐ · SQL ◐ · JSON ◐ — applies to entities that represent process objects (those with a status or state field, or `layer=event`)
+**Checkability:** `declared` for the process descriptor, `direct` for drift between the descriptor and both the schema and the code's state writes, `proxy` for "before".
+
+#### Design A — Process descriptor contract (C, deterministic)
+
+- *Measure:* Identify process entities: those with a field matching `(^|_)(status|state|stage|phase)$` that has an enum or `CONSTR_CHECK`, or with `layer=event`. Require an annotation `process: <id>` that resolves to `model/process/<id>.yaml` with the keys `trigger`, `outcomes[]`, `business_object`, `actors[]` and `steps[]`, as §1.3 lists them.
+- *Fails when:* (1) there is no descriptor, or it lacks a required key; (2) the entity's state enum contains values that do not appear in `steps[] ∪ outcomes[]` (the structure has drifted from the process); (3) the entity is *added* (absent from `mml.lock.json`, M3) while no descriptor exists at all (the system was modeled with no process); (4) in Phase 2, the code corpus writes a state value that the descriptor does not list. The state values written are string constants assigned to the state field in Go (`o.Status = "on_hold"`, or a typed constant), and `ResTarget` values in `UpdateStmt`/`InsertStmt` for the state column (`SET status = 'on_hold'`). A schema with no enum or CHECK is thus still checked against the code; or (5) the descriptor's `fp=` no longer matches the entity (M1).
+- *Suggestion:* "`{entity}.{status_field}` encodes a process (values {values}), but no process descriptor is linked. Create `model/process/{canonical}.yaml` with trigger, outcomes, business_object, actors and steps, and set `//mml:process {canonical}`. The values {unmapped} do not appear in the process."
+- *Limits:* Only catches process objects that expose state. A process represented only by event rows with no enum is caught only through `layer=event`. The state-field pattern is configurable (`rules.1_3.a.state_field_pattern`). Check (4) sees only constant state values, so values computed at run time or loaded from configuration are missed.
+
+#### Design B — Technique-before-process scan (L + A, heuristic)
+
+- *Measure:* In ADRs (`docs/adr/*.md`) that name an entity's `Canonical`, find the first technique or platform term (`kimball`, `star schema`, `data vault`, `lakehouse`, `one big table`, `snowflake`, `bigquery`, `redshift`, `parquet`, `columnar`) and the first process term (`trigger`, `starts when`, `ends (at|when)`, `actor`, `step`, `outcome`). Compare their character offsets.
+- *Fails when:* an ADR that introduces entities contains a technique term but no process term, or its first technique term comes before its first process term.
+- *Suggestion:* "ADR {file} chooses '{technique}' before describing the business process. Add a 'Process' section (trigger, outcome, actors, steps) above the 'Decision' section."
+- *Limits:* The computation is deterministic, but word order is only a proxy for decision order, so on its own this design reports at `note`. Under M5 it rises to `warning` when a second, independent signal agrees: Design A finds that an entity this ADR names has no process descriptor. "Snowflake" is ambiguous (the platform or a snowflake schema); both count as technique terms. Configure the lexicons with `rules.1_3.b.technique_terms` and `process_terms`.
+
+**Recommendation:** Build A. It ties structure to process deterministically, and check (4) in Phase 2 ties it to the code too. B is an optional nudge about prose, promoted only by M5.
+
+**Residual limit:** whether the process was really understood before the technique or platform was chosen. A descriptor written after the fact that matches the schema is indistinguishable from one written first, except in git history.
+
+### §1.4 — Interview for exceptions; verify actual practice `[MUST][METHOD]`
+
+**Applies to:** Go ◐ · SQL ◐ · JSON ◐ (process entities, as in §1.3)
+**Checkability:** `direct` for whether the model has unhappy paths and whether recorded exceptions resolve to modeled elements, `proxy` for whether interviews happened.
+
+#### Design A — Unhappy-path coverage in state model (S + C, deterministic)
+
+- *Measure:* For process entities with a state enum, require two things: (1) the enum, or the linked process descriptor, has ≥1 non-success terminal state, matched by the lexicon `cancel*`, `fail*`, `reject*`, `error`, `void*`, `expired`, `on_hold`, `manual*`, `exception`, `denied`, or marked in the descriptor as `outcomes[].kind: failure`; and (2) the descriptor has an `exceptions[]` list with ≥1 entry, each with `when` and `handling`.
+- *Fails when:* only happy-path states exist; or `exceptions[]` is empty or has an entry missing `when` or `handling`; or an entry's `handling` does not resolve to a modeled element. `handling` must name at least one of these: a state value of the entity (`on_hold`), another entity (`urgent_order`), an `observed_sources[].id`, or a declared manual step (`steps[].manual: true`). Free-text exceptions that change nothing in the model fail.
+- *Suggestion:* "`{entity}.{field}` has only happy-path states {values}. Ask domain experts what happens when the {business_object} fails, is cancelled, or the system is down. Add those states, or document `exceptions[]` (`when`, `handling`) in {descriptor}."
+- *Limits:* Some domains have no failure states; waive with a reason. Domain-specific failure names (`rma_denied`, `returned_to_sender`) are missed unless they are added to `rules.1_4.a.failure_state_patterns` or tagged `kind: failure`. The resolution requirement means an exception "we phone the customer" must be modeled as a manual step or a state. That is deliberate, because an exception the model cannot represent is exactly what the rule warns about. The design cannot tell whether the listed exceptions came from interviews.
+
+#### Design B — Shadow-source evidence register (A + Q, deterministic)
+
+- *Measure:* Each process descriptor must have `observed_sources[]` (spreadsheets, shadow tools, manual workarounds), each with `verified_on`. In addition, the code corpus is scanned for shadow inputs in packages that write a process entity:
+  - string-literal paths ending in `.csv`, `.xlsx` or `.gsheet` passed to `os.Open`, `os.ReadFile` or `csv.NewReader(os.Open(...))`;
+  - `excelize.OpenFile` from `github.com/xuri/excelize/v2`;
+  - Google Sheets reads through `(*sheets.SpreadsheetsValuesService).Get` from `google.golang.org/api/sheets/v4`, with a constant spreadsheet ID.
+
+  Each `observed_sources[]` entry carries the M1 `fp=` of the process entity, so a structural change to the entity invalidates the verification.
+- *Fails when:* `observed_sources` is absent; a `verified_on` date is older than `mml.yaml: process_verification_max_age` (default 365d); an entry's `fp=` is stale (M1); or a detected spreadsheet path or sheet ID is not listed.
+- *Suggestion:* "Process `{id}` has no verified record of how work is actually done (last verified {date}). Record observed workarounds such as {detected_file} in `observed_sources[]` with `verified_on`."
+- *Limits:* The spreadsheet scan sees only paths that are compile-time constants, and only spreadsheets read by this codebase. A warehouse team's private spreadsheet is invisible, which is why the register exists. The age check depends on the CI date, so a commit that passes can fail later; this is by design, and it reports at `warning`.
+
+**Recommendation:** Build A. It is structural and catches the most common failure, a model with no failure states, and the resolution requirement stops exceptions from being recorded only as prose.
+
+**Residual limit:** whether anyone interviewed for exceptions, and any workaround (a private spreadsheet, a phone call) that leaves no trace in this repository.
+
+### §1.5 — Don't adopt AI-generated schema without review against conceptual model `[MUST][METHOD]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔ (entities and refs added in a PR, and joins in the query corpus)
+**Checkability:** `direct` for conformance of entities, refs and query join keys to the conceptual model, `proxy` for whether a practitioner reviewed the change.
+
+#### Design A — Conceptual-model conformance of new entities (G + C, deterministic)
+
+- *Measure:* For each added entity and each added `Ref` (FK, `$ref`, or `*_id` field), where "added" means absent from `mml.lock.json` (M3) or from the base IR in diff mode, check that the entity maps to a conceptual entity in `model/conceptual.yaml` (or to a glossary term), and that each Ref matches a declared conceptual relationship (`relationships[]: {from, to, cardinality, via?}`). The join key must agree: the FK column's canonical name equals `{to}_id`, or the declared `via`.
+- *Fails when:* an entity or relationship has no conceptual counterpart, or the FK target or key differs from the declared relationship. For example, `order_items.return_id → returns` where the conceptual model declares `order_item → order via order_id`.
+- *Suggestion:* "`{entity}.{column}` joins to `{target}`, but the conceptual model has no `{entity}→{target}` relationship (declared: {declared}). Confirm the join key with the model owner, or add the relationship to `model/conceptual.yaml`."
+- *Limits:* Requires a conceptual model file. It does not detect whether the schema came from an AI, and does not need to: the rule is about reviewing against the model, whoever wrote the schema. Relationships in a JSON Schema that are expressed only by embedding (no `$ref`, no `*_id`) are not seen.
+
+#### Design B — Generic-schema fingerprint (L + S, heuristic)
+
+- *Measure:* Compare the set of entities added in the PR against built-in "generic template" fingerprints (e-commerce: `user, product, order, order_item, category, review, payment`; CRM; blog) using Jaccard similarity on canonical names. Also count the added entities whose names match no glossary term.
+- *Fails when:* Jaccard ≥ 0.6 with a template and ≥50% of the added entity names are absent from the glossary.
+- *Suggestion:* "The added entities {names} match the generic '{template}' schema, and {k} of them are not glossary terms. Check them against your conceptual model (carts vs orders, customers vs accounts) before merging."
+- *Limits:* Heuristic, so on its own it reports at `note`. Under M5 it reports at full severity only when Design A also finds ≥1 of the added entities with no conceptual counterpart, which is a graph signal independent of the name match. A real e-commerce company legitimately has most of these entities; glossary coverage is what separates the two cases. Thresholds are set with `rules.1_5.b.jaccard` and `rules.1_5.b.unknown_ratio`, and templates live in `rules.1_5.b.templates`.
+
+#### Design C — Review attestation for AI-assisted changes (H, deterministic)
+
+- *Measure:* Find commits in the PR whose trailers match the configured AI identities in `rules.1_5.c.ai_markers` (for example a `Co-authored-by:` naming an AI assistant, or `Assisted-by:`), or files carrying a configured AI marker comment. If such a commit adds or changes an entity, the PR must carry a `Model-Reviewed-By: <principal>` trailer, where the principal is the entity's `owner` or a member of it.
+- *Fails when:* an AI marker is present and the review trailer is absent or names someone other than the owner.
+- *Suggestion:* "The schema change to `{entity}` in {commit} is AI-assisted but has no `Model-Reviewed-By` trailer from `{owner}`. Have the owner review the join keys and grain against the conceptual model, then add the trailer."
+- *Limits:* Only detects AI use that was disclosed, and trailers can be forged. Standard `// Code generated ... DO NOT EDIT.` headers from sqlc, protoc or ORMs are deliberately **not** markers, because that is the mechanical translation §1.5 allows. Owner-membership checks need team membership from the `gh` API, or `mml.yaml: owner_members`.
+
+#### Design D — Query join-key conformance (Q, deterministic)
+
+- *Measure:* In the query corpus, for every `JoinExpr` (and every equality in `SelectStmt.whereClause` between columns of two `FROM` items), extract the equated column pairs from `quals` (`A_Expr` with `=`, `ColumnRef` on both sides, resolved through aliases and CTEs to IR fields). A pair is *sanctioned* when it is a declared FK (`fk_attrs` → `pk_attrs`), the `via` of a `model/conceptual.yaml` relationship, or a `JOIN ... USING` on a column that is an FK on one side.
+- *Fails when:* a join between two entities uses an unsanctioned column pair, such as `order_items.return_id = orders.order_id`, or `returns.customer_id = orders.order_id`. This is the rule's "plausible joins on the wrong key" failure, which is where a generated schema or a generated query does its damage even when the DDL looks fine.
+- *Suggestion:* "{file}:{line} joins `{left}.{lcol}` to `{right}.{rcol}`, which is neither a declared foreign key nor a relationship in the conceptual model. The modeled join is `{left}.{fk} = {right}.{pk}`. Check the grain (§7.2) and correct the key, or declare the relationship in `model/conceptual.yaml` if it is real."
+- *Limits:* Needs the query corpus (Phase 2). Joins on non-key attributes for legitimate analytical reasons (a range join on dates, a match on `email` during identity resolution, §4.2) are exempt when a comment `-- mml:join reason=...` is on the join, or when the entity is `role=identity_map`. Joins built dynamically in Go are missed unless the SQL is a constant.
+
+**Recommendation:** Build A. It is the only design that measures the schema against the model. Add D in Phase 2, since it is the only one that catches a wrong join key in queries, which is the rule's fan-out example. C is a cheap addition.
+
+**Residual limit:** whether a practitioner actually reviewed an AI-generated change, as opposed to the change merely conforming to the conceptual model. If the conceptual model itself was generated without stakeholder context, every check passes against a wrong model.
+
+### §1.6 — No speculative entities or over-normalization `[MUST][METHOD]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔
+**Checkability:** `direct` for usage and lookup-chain depth, `proxy` for "hypothetical". The linter measures unused or over-split structure; it cannot know that a need is imaginary.
+
+#### Design A — Usage-backed entity test (Q, deterministic)
+
+- *Measure:* For each entity, count its readers and writers. In the query corpus these are `RangeVar`s in `FROM` and `JoinExpr` and the targets of `InsertStmt`, `UpdateStmt` and `DeleteStmt`. In the code corpus they are composite literals of the Go struct, methods called on values of the type, and decodes into it (`json.Unmarshal`, `rows.Scan` targets). For JSON Schemas, they are `$ref`s from schemas that a handler or a validator call site uses.
+- *Fails when:* an entity has zero readers *and* zero writers outside migrations, `_test.go` files and `testdata/`, and is not `layer=reference` with seed data (an `InsertStmt` in a migration counts as seed data). Severity depends on age, using the lock (M3). An entity *added* in this change with no use is speculative at birth and reports at the rule's full severity. A long-standing unused entity reports one level lower, as a removal candidate.
+- *Suggestion:* "`{entity}` is never read or written outside migrations ({pos}). If it models a hypothetical future need, remove it. Otherwise, add the use case that needs it."
+- *Limits:* An incomplete corpus produces false positives, for example tables read only by an external BI tool or another repo. List those in `rules.1_6.a.external_consumers`, or restrict the check to added entities. An entity added in one PR and used in the next is flagged in the first; the escape is `//mml:waive §1.6 reason="used by #123"`. Per the rule's carve-out, an entity that captures events at a fine grain is never flagged for being fine-grained (§7.5), only for being unused.
+
+#### Design B — Normalization-depth graph metric (G, deterministic)
+
+- *Measure:* In the FK graph, find *thin lookup* entities: ≤2 columns that are neither keys nor audit columns (`created_at`, `updated_at`, `*_by`), referenced by exactly one parent entity, and part of a chain of such entities. Compute the join depth needed to rebuild the root entity's attributes. For example, `address → city → state → country` is depth 3.
+- *Fails when:* a chain of thin lookups has depth ≥ `mml.yaml: max_lookup_chain` (default 3), or a translation table (`*_translation|*_i18n|*_locale`) exists while the configured `locales` list has length 1.
+- *Suggestion:* "`{root}` needs {depth} joins through the thin lookup tables {chain} to rebuild one record. Fold {chain} into columns of `{root}` until a real requirement for them appears (§1.6)."
+- *Limits:* A shared taxonomy (§2.3) is referenced by many parents, or is one self-referencing table, so it does not count as a chain. `layer=reference` entities are skipped if `rules.1_6.b.skip_reference` is set. The design never flags fine event grain or timestamp precision, which the rule explicitly keeps (§7.5, §9.8). A legitimately normalized OLTP design with real lookup attributes is not "thin" and passes.
+
+**Recommendation:** Build B for the MVP; it needs only DDL. Add A in Phase 2. A thin lookup chain (B) whose links are also unused (A) is the strongest evidence of over-modeling, and the finding says both.
+
+**Residual limit:** whether an unused entity is speculation or near-term planned work, and use by consumers outside the repository.
+
+### §1.7 — Harden scratchpad models before recurring use `[MUST][METHOD]`
+
+**Applies to:** Go ◐ · SQL ✔ (tables and especially views) · JSON ◐
+**Checkability:** `direct` + `declared`
+
+#### Design A — Scratch-name/location detector with dependency check (L + G, deterministic)
+
+- *Measure:* Classify an entity as scratch if `lifecycle=scratch`, its schema is in `{sandbox, scratch, tmp}` or matches `dev_*`, or its name matches `(?i)(^tmp_|^test_|_v\d+$|_old$|_new$|_copy$|_bak$|_(mon|tues?|wed|thur?s?|fri|sat|sun)(day)?(_|$)|_\d{8}$)`. Then look for consumers that are not scratch: views and queries, dbt `ref()`s, Go code, and `semantic_layer` or dashboard manifests that reference it.
+- *Fails when:* a scratch-classified entity has ≥1 consumer that is not scratch.
+- *Suggestion:* "`{entity}` looks like a scratchpad model ({reason}), but `{consumer}` depends on it. Promote it: rename it to the convention (for example `fct_`/`dim_`), add an owner, column descriptions and tests, and set `lifecycle=recurring`."
+- *Limits:* Name patterns produce false positives (`order_v2` may be a deliberate API version) and misses (a scratch view with a clean name). `rules.1_7.a.scratch_name_patterns` and `scratch_schemas` are configurable. Consumers outside the repo, such as a BI tool's saved queries, are invisible unless they are exported as a manifest.
+
+#### Design B — Hardening checklist on promoted entities (C + A, deterministic)
+
+- *Measure:* For entities with `lifecycle ∈ {recurring, published}`, evaluate the rule's hardening items: (1) the name passes the §5.2 convention; (2) there is a PK or a declared grain key; (3) there is ≥1 uniqueness test and ≥1 not-null test, either in dbt `schema.yml` or in `tests/data/*.sql` referencing the entity; (4) there is a freshness test (`freshness:` or `mml:freshness`); (5) there is an owner and ≥80% of columns are described. For views only: (6) the body has ≤5 `CaseExpr` nodes and ≤100 lines, or it is decomposed into `CommonTableExpr`s or upstream models ("refactor the SQL").
+- *Fails when:* any applicable item fails. The finding reports a score `k/n`, where `n` is 5 for tables and 6 for views.
+- *Suggestion:* "`{entity}` is recurring, but hardening is {k}/{n}: missing {items}. {per_item_fix}"
+- *Limits:* Checks that tests and metadata exist, not that they are good. Thresholds (`rules.1_7.b.max_case`, `max_lines`, `min_described`) are configurable. Teams that run tests outside dbt must list their test globs in `rules.1_7.b.test_globs`.
+
+**Recommendation:** Build B first, because it is directly actionable (Phase 2, since it needs test artifacts). Add A for detecting promotion; it runs on DDL and views alone.
+
+### §1.8 — Keep conceptual/logical models technology-agnostic `[SHOULD][METHOD]`
+
+**Applies to:** Go ✘ · SQL ✘ (physical by definition) · JSON ◐ (when a schema is used as a logical model) — applies to `model/conceptual.yaml`, `model/logical/*.yaml`, and the `definition` text of annotations
+**Checkability:** `direct` on model artifacts. `direct` in git history for whether the format was chosen before the logical design (Design C).
+
+#### Design A — Physical-vocabulary lint on upper-level models (L, deterministic)
+
+- *Measure:* Tokenize conceptual and logical artifacts and `definition` texts, and match them against a lexicon of physical terms: SQL types (`VARCHAR\(\d+\)`, `BIGINT`, `JSONB`, `TIMESTAMPTZ`, `SERIAL`), index phrases (`\b(GIN|GiST|BRIN|B-?tree|hash)\s+index\b`), file formats (`parquet`, `avro`, `\borc\b`, `delta lake`, `iceberg`), and engines (`postgres(ql)?`, `snowflake`, `bigquery`, `redshift`).
+- *Fails when:* any term matches in a conceptual or logical artifact, or the text matches the "our model is a format" pattern `(?i)\bmodel (is|=) (parquet|avro|json|delta)\b`.
+- *Suggestion:* "{file}:{line} uses the physical term '{term}' in a {level}-level model. Move it to the physical model, and type '{attribute}' by domain instead (for example identifier, money, timestamp)."
+- *Limits:* Engine names inside quoted source-system descriptions ("migrated from Redshift") are false positives; suppress inline or list them in `rules.1_8.a.allow_phrases`. Physical concepts phrased in plain words ("store it columnar") are missed.
+
+#### Design B — Physical-format justification contract (C, deterministic)
+
+- *Measure:* Entities with a declared storage format (`mml:format=parquet`, dbt `file_format`, a JSON Schema marked as an Avro source) must also declare `format_reason`, chosen from `{scan_heavy, write_heavy, compression, interop, schema_evolution, streaming}`.
+- *Fails when:* a format is declared without a reason, or a format is declared on a conceptual or logical artifact instead of a physical entity.
+- *Suggestion:* "`{entity}` is stored as {format} with no workload justification. Add `format_reason` (one of {enum}) to its physical model."
+- *Limits:* A one-word reason is easy to add without thinking; the design proves only that a reason was chosen from the workload list. Ordering is Design C's job. Formats set only in pipeline code (Spark `.write.format(...)`) are invisible unless declared.
+
+#### Design C — Format-before-logical-design ordering (H, deterministic)
+
+- *Measure:* With full git history, for each entity with a declared storage format, find `t_format`, the first commit that set the format: `format=` in an annotation, `file_format` in a dbt config, or the Avro marker. Also find `t_logical`, the first commit that created the entity's logical model entry (`model/logical/*.yaml`, or `entities.<id>.logical`). The lock (M3) cannot answer this, because it records shape, not time.
+- *Fails when:* `t_format < t_logical` in different commits, or a format is set and no logical entry exists at all. The format was chosen before the logical design, which is the rule's "treating the file format as the model".
+- *Suggestion:* "`{entity}` was given format {format} in {commit} ({date}), before its logical model existed ({t_logical|never}). Write the logical model (entities, keys, cardinality) first, then justify {format} with `format_reason` against the workload."
+- *Limits:* Needs `fetch-depth: 0`. A squash merge puts both in one commit, which counts as simultaneous and passes. The check sees only the order in this repository, so a design done on a whiteboard first is invisible. Brownfield entities older than `config.adoption_date` are exempt.
+
+**Recommendation:** Build A. It is purely lexical, runs over model files, and is cheap. C (Phase 3) is the only design that addresses the rule's ordering ("only afterwards"), and only to the extent the history shows it.
+
+**Residual limit:** the real order of decisions when both land in one squashed commit or were made outside the repository, and whether a `format_reason` reflects a real workload analysis.
+
+### §1.9 — Derive physical from logical; document each deviation's rationale and cost `[SHOULD][METHOD]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔ (physical entities compared with the logical model)
+**Checkability:** `direct` (given a logical model) + `declared`
+
+#### Design A — Logical↔physical structural diff (S + G, deterministic)
+
+- *Measure:* For each logical entity in `model/logical/*.yaml`, compute its set difference with the linked physical entity: missing attributes, extra attributes, key mismatches, and relationships realized as a JSON column instead of a child table. The last case is detected when a logical entity has no physical table while a parent has a `json|jsonb` field whose name matches the logical entity's canonical name or plural.
+- *Fails when:* any diff item lacks a matching deviation record. A record is either an inline `deviation=` annotation pointing at an ADR, or an entry in `mml.yaml: deviations[]: {entity, item, rationale, cost, link?}`. A record also fails when its `rationale` or `cost` is empty or `TODO`.
+- *Suggestion:* "Physical `{entity}` deviates from the logical model: {diff_item}. Either align it, or record the deviation with its rationale and what it costs (for example 'catalog in JSON for launch; cost: every analytics extract must unpack the JSON and breaks when its shape changes')."
+- *Limits:* Needs a maintained logical model, so it is Phase 2. The rule no longer asks for a repayment date, so none is required. Teams that want one can add `repay_by` and turn on `rules.1_9.require_repay_by`. Physical-only columns (`created_at`, `_loaded_at`, soft-delete flags) are excluded through `rules.1_9.a.physical_only_columns`. Renames show up as one missing plus one extra attribute.
+
+#### Design B — Undocumented-shortcut check (L + A, deterministic)
+
+- *Measure:* Scan DDL comments, Go comments within an entity's declaration, and JSON `description`s for shortcut markers: `(?i)\b(for now|temporary|temp hack|hack|TODO|FIXME|XXX|quick fix|until we)\b`.
+- *Fails when:* a marker has no linked deviation record that states both a rationale and a cost. A record counts if it is either of these:
+  - an inline `deviation=` annotation whose ADR has a `Rationale` heading and a `Cost` (or `Consequences`) heading;
+  - a `deviations[]` entry for the entity with non-empty `rationale` and `cost`.
+
+  An issue reference (`#\d+|[A-Z][A-Z0-9]+-\d+`) alone does not count, because it does not show the cost next to the entity.
+- *Suggestion:* "The shortcut '{marker}' at {pos} has no documented rationale or cost. Add a deviation entry, for example `{entity: {entity}, item: {field}, rationale: 'launch deadline', cost: 'every analytics extract must unpack {field}'}` (§1.9)."
+- *Limits:* `TODO`s that are not modeling shortcuts (documentation chores) are false positives, because only comments attached to entities and fields are scanned. Shortcuts without a marker are missed. That includes the rule's ✗ example, a catalog stored as one JSON column "for now" *with no note*. Design A catches it when a logical model exists, Design C catches the reverse-fitted logical model, and §6.1-A and §10.2-A flag the JSON column itself. This design proves that a rationale and a cost were written down. It cannot prove the shortcut was taken consciously, or that the stated cost is accurate.
+
+#### Design C — Reverse-fit detector (H, deterministic)
+
+- *Measure:* In git history, find the first commit that created the physical entity and the first commit that created its logical model file. Compare the logical attribute list with the physical column list.
+- *Fails when:* the logical file was first committed after the physical entity, and its attribute names, in order, equal the physical columns, including physical-only columns such as `id`, `created_at` and `updated_at` that an ORM generates.
+- *Suggestion:* "`model/logical/{canonical}.yaml` mirrors the physical columns of `{entity}` exactly and was written after them. Revisit the logical model (keys, cardinality, missing entities such as `{candidate_child}`) instead of copying the ORM output."
+- *Limits:* It needs full git history (`fetch-depth: 0` in CI). A logical model that legitimately matches a simple physical table exactly, written after a brownfield reverse-engineering (§1.1-C), is a false positive; `model/reverse/` snapshots are excluded.
+
+**Recommendation:** Build B for the MVP; it needs no logical model. Add A in Phase 2.
+
+### §1.10 — Publish an out-of-scope list `[SHOULD][METHOD]`
+
+**Applies to:** Go ◐ (a package containing entities) · SQL ◐ (a schema) · JSON ◐ (a schema directory) — the list is declared per modeling unit and reported on each entity in that unit
+**Checkability:** `declared` for the list, `direct` for contradictions between the list and the model through explicit `keywords[]` and `entities[]`.
+
+#### Design A — Scope declaration contract (C, deterministic)
+
+- *Measure:* Each modeling unit (an SQL schema, a Go package containing entities, a JSON schema directory, or an entry in `mml.yaml: domains[]`) must declare `out_of_scope[]` with ≥1 item, each `{topic, reason | phase, keywords[]?, entities[]?}`. `keywords[]` are exact column or entity name tokens, and `entities[]` are canonical entity names, that would implement the topic.
+- *Fails when:* the list is missing or empty. A modeling unit that is *added* (absent from `mml.lock.json`, M3, or from the base IR in diff mode) must include its list in the same change, which is the rule's "at the start of a modeling effort". It also fails, deterministically, when the current model already contains something the list excludes: an entity named in `entities[]`, or a field whose name tokens include a `keywords[]` token.
+- *Suggestion:* "Domain `{domain}` has no out_of_scope list. Add one to {file} (for example `{topic: non-USD reporting, phase: 2}`) so that new requests can be checked against it."
+- *Limits:* A one-item list satisfies the check. The contradiction check is only as good as the `keywords[]` and `entities[]` the team writes; a topic phrased in prose alone ("sub-second queries") cannot contradict anything. The design cannot tell whether the list covers the real exclusions. Small single-team units can opt out with `domains[].out_of_scope_required: false`, in line with the source's note about single-application teams.
+
+#### Design B — Scope-creep detector (H + L, heuristic)
+
+- *Measure:* Tokenize the *added* entity and column names (absent from `mml.lock.json`, M3, or from the base IR in diff mode). Match them against words from the domain's `out_of_scope[].topic` text, extended with glossary synonyms and stemmed (Porter stemmer). Stopwords and generic words (`reporting`, `data`, `id`) are removed from the topic words first. Exact `keywords[]` matches belong to Design A; this design covers the fuzzy remainder.
+- *Fails when:* an added entity or column matches ≥1 distinctive keyword of an out-of-scope topic (for example `currency_code` against "non-USD reporting" through the synonym `currency`).
+- *Suggestion:* "`{entity}.{column}` appears to implement the out-of-scope topic '{topic}' ({reason}). Get the scope change approved and update out_of_scope, or drop the addition."
+- *Limits:* Stemmed and synonym matching has real false positives and misses, so it reports at `note` and is labeled heuristic. Under M5 it rises to `warning` when the stem match and a glossary synonym match agree on the same topic. The suggestion then offers to copy the matched token into the topic's `keywords[]`, which moves the case to Design A's deterministic check. Topics phrased in prose ("sub-second queries") cannot be matched to columns at all.
+
+**Recommendation:** Build A first. Its contradiction check is the deterministic core once teams write `keywords[]`. B pays off once lists exist, and it feeds keywords back into A.
+
+**Residual limit:** whether the list names the exclusions that matter, and scope creep that shows up as new behaviour rather than new names, such as a latency requirement.
+
+### §1.11 — Competency questions as tested queries `[SHOULD][METHOD]`
+
+**Applies to:** Go ◐ · SQL ✔ · JSON ◐ (per logical entity or domain)
+**Checkability:** `declared` for the questions, `direct` for whether they parse against the model, `direct` via M4 result ingestion for whether they return real results and match expected figures.
+
+#### Design A — Competency-question test harness (Q + C, deterministic)
+
+- *Measure:* Read `model/competency/*.yaml` entries `{question, sql, max_joins, entities[], expect?: {min_rows, value, tolerance, source}}`. Parse each `sql` with the dialect parser, resolve every `RangeVar` and `ColumnRef` against the IR, and count `JoinExpr` nodes plus comma-joined `FROM` items. For the rule's "returns real results", `mixedmodellint scaffold competency` writes one dbt singular test (or SQL assertion) per question. The test fails when the query returns fewer than `expect.min_rows` (default 1) rows, or when its first value differs from `expect.value` by more than `tolerance`; `expect.value` is the rule's "matches finance's figure". Each test carries `meta: {mml_rule: "§1.11", mml_question: <id>}`. `check --results target/run_results.json` ingests the outcomes (M4).
+- *Fails when:* the SQL does not parse, references an unknown table or column, or has more joins than `max_joins` (default 3); a domain has 0 questions; a question has no scaffolded test; or, with results ingested, a question's test failed (`mml/competency-no-results` or `mml/competency-mismatch`) or did not run (`mml/test-not-run`).
+- *Suggestion:* "Competency question '{question}' {needs {n} joins (limit {max})|references the missing column {col}}. The model probably has the wrong grain or is missing `{entity}`. Adjust the model, or the question."
+- *Limits:* Without ingested results, the design proves only that a question can be expressed. With results, it proves the question returned data in whatever environment CI ran it against. A seeded test database proves less than a production-like one, so `results_env` is recorded in the finding. `expect.value` must be updated when the real figure changes, and a stale value fails loudly rather than silently. Joins hidden inside views count as one table; set `rules.1_11.a.expand_views: true` to count them.
+
+#### Design B — Coverage of entities by questions (G, deterministic)
+
+- *Measure:* Compute the union of entities touched by competency queries, with views expanded to their base tables, and compare it with the published entities of the domain.
+- *Fails when:* a published entity (`lifecycle=published`) is not touched by any competency question.
+- *Suggestion:* "`{entity}` is not exercised by any competency question. Add the business question it answers, or reconsider whether it is needed (§1.6)."
+- *Limits:* One trivial question per entity (`SELECT * FROM x`) satisfies it. Supporting entities such as a mapping table (§4.3), or anything with `layer ∈ {staging, external}`, are exempt.
+
+**Recommendation:** Build A (Phase 2, since it needs query parsing and, for its result half, M4). B is a trivial addition.
+
+**Residual limit:** whether the competency questions are the business questions that matter, and whether the CI environment's data is representative.
+
+### §1.12 — Change process for breaking changes `[SHOULD][METHOD]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔
+**Checkability:** `direct` for breaking-change detection, including value changes in reference seed data (M3), plus `declared` for the change policy.
+
+#### Design A — Breaking-change classifier with approval gate (H, deterministic)
+
+- *Measure:* Diff `mml.lock.json` against the current IR (M3), or the base IR against HEAD when `--base` is given, and classify each change per entity. Breaking changes are: a column or property removed or renamed; a type narrowed (`BIGINT→INT`, `VARCHAR(100)→VARCHAR(50)`); a nullable column made `NOT NULL` without a default; an enum or `CONSTR_CHECK` `IN (...)` value removed or renamed; a PK change; a property added to JSON `required`; `additionalProperties` changed from `true` to `false`; or a *meaning* change in reference data. The lock also records the seed rows (`InsertStmt` in migrations, dbt seeds) of `layer=reference` entities, keyed by PK. Changing a non-key value of an existing row is breaking: a territory reparented under a different region, a code relabelled, or a mapping row changed. This catches the rule's `region` reorg when the region values stay the same strings but what they contain changes.
+- *Fails when:* a breaking change lacks either of these:
+  1. An entry in `CHANGELOG` or `DEPRECATIONS` that mentions `{entity}.{field}`.
+  2. Approval from an owner whose authority is documented. The approver must belong to the entity's `owner`, and the owner's §1.13 ownership record must list `approve_breaking_change` in `decisions[]`. Approval is an approving PR review from such a member, checked through the `gh` API in CI, or an `Approved-By:` trailer that names one.
+- *Suggestion:* "Breaking change: {change} on `{entity}`. Add a deprecation entry (old→new mapping and removal date) to DEPRECATIONS.md, get approval from `{owner}`{ — first record `approve_breaking_change` in `{owner}`'s ownership record (§1.13), since nobody has documented authority to approve it}, and notify the consumers {consumers}."
+- *Limits:* Meaning changes that leave no trace in the repository, such as reference data edited directly in production, or a reinterpretation of a value with no change to any row, are invisible. Seed-data diffing covers only reference data that is versioned in migrations or seeds. A rename appears as a drop plus an add of the same type, and is reported as a rename. The approval check needs `pull-requests: read` to list reviews (`GET /repos/{o}/{r}/pulls/{n}/reviews`). Resolving whether a reviewer belongs to the owner team needs org `members: read`, which the Actions `GITHUB_TOKEN` cannot be granted. Use a GitHub App token, or list members in `mml.yaml: owner_members`.
+
+#### Design B — Change-policy contract (C + A, deterministic)
+
+- *Measure:* Each published entity must declare `change_policy: {approver, consult[], notify[], changelog}`, where `changelog` resolves to an existing file. In Phase 2, the policy is also compared with the consumers found in the query and code corpora: each consumer's CODEOWNERS owner must appear in `notify[]`.
+- *Fails when:* any of these holds:
+  - the policy is missing;
+  - `approver` is not the entity's `owner`;
+  - the owner's §1.13 ownership record does not list `approve_breaking_change`;
+  - the changelog path does not exist;
+  - a detected consumer's owner is not in `notify[]`.
+- *Suggestion:* "`{entity}` has no change policy{, or consumer `{consumer}` (owner `{o}`) is not in notify[]}. Add `change_policy` with approver, consult, notify and changelog{, and document the approver's authority in its ownership record (§1.13)}."
+- *Limits:* Consumers outside the repo (dashboards, ML models in other repositories) are invisible unless they are listed. The policy can be declared and then not followed; Design A is what enforces it on real changes.
+
+**Recommendation:** A has the highest value and is the one to build. With the lock (M3), its classification needs no git history; the CHANGELOG and approval checks need repo artifacts and the PR API, so A is Phase 2. B's presence check can ship earlier through the sidecar, with the consumer comparison following in Phase 2.
+
+**Residual limit:** whether upstream owners and consumers were actually consulted, as opposed to being listed in `notify[]`, and meaning changes made outside the repository.
+
+### §1.13 — Ownership documents responsibilities and empowered decisions `[MUST][METHOD]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔. The ownership record belongs to the owner and the model. It is checked on every entity that declares an `owner` (§1.2), and every MUST finding lands on that entity.
+**Checkability:** `declared` for the record; `direct` for whether repo mechanics agree with the authority it claims.
+
+#### Design A — Ownership-record contract (C, deterministic)
+
+- *Measure:* Each distinct `owner` value must have an ownership record. It goes in `mml.yaml: owners.<owner>` or in `model/ownership/<owner>.yaml`, with this shape: `{model[] (entity globs), responsibilities[], decisions[], granted_by, granted_on}`.
+  - `responsibilities[]` items come from the vocabulary `{definitions, data_quality, change_approval, access, documentation, incident_response}`, or are free text of 3 or more words.
+  - `decisions[]` items come from `{approve_breaking_change, reject_breaking_change, change_definition, deprecate, set_quality_threshold, grant_access}`, or are free text. Each item carries a `without_signoff: true|false` flag.
+  - Every entity that names this owner must match one of the `model[]` globs.
+- *Fails when:* any of these holds:
+  - an entity's `owner` has no record;
+  - `responsibilities[]` or `decisions[]` is empty;
+  - no decision has `without_signoff: true`. That is ownership with no power of its own, the rule's "liability".
+  - `granted_by` is missing;
+  - an entity names the owner but falls outside the record's `model[]` scope.
+- *Suggestion:* "`{entity}` is owned by `{owner}`, but {there is no ownership record|its record lists no decisions the owner can make without further sign-off|the record does not cover `{entity}`}. Add `owners.{owner}: {model: [{glob}], responsibilities: [definitions, data_quality, change_approval], decisions: [{name: approve_breaking_change, without_signoff: true}], granted_by: <role>}` to mml.yaml. If that authority cannot be obtained, record `ownership: liability` so the gap is visible (§1.13)."
+- *Limits:* The linter cannot verify that the authority was actually granted, or that `granted_by` had the power to grant it; that is proxy evidence. Padding the record satisfies the shape checks, so Design B checks it against how changes are really approved. An explicit `ownership: liability` entry is reported as a `warning` on every covered entity rather than failing silently, and the setting `rules.1_13.liability_severity` controls its level.
+
+#### Design B — Claimed authority versus approval mechanics (A, deterministic)
+
+- *Measure:* For each decision with `without_signoff: true`, compare the claim with the repo's actual approval paths for the files that define the owner's entities:
+  1. **CODEOWNERS:** resolve the files with last-match-wins semantics. If the matching line lists principals outside the owner, mapped through `owner_aliases`, then every listed team is requested for review, and with branch protection's "Require review from Code Owners" any one of them can satisfy it.
+  2. **Branch rules:** read the rules that apply to the target branch through `GET /repos/{o}/{r}/rules/branches/{b}`. That endpoint returns the active ruleset rules, including `pull_request` with `require_code_owner_review`, and needs only read access. Classic branch protection (`GET /repos/{o}/{r}/branches/{b}/protection`) is read as well when the token allows it.
+  3. **Required status checks:** look for checks owned by another team that gate merges on these paths, configured in `mml.yaml: config.signoff_checks`.
+- *Fails when:* the owner claims to `approve_breaking_change` without sign-off, but CODEOWNERS for the entity's files names only other principals, or the owner is absent from them. This is the ✗ case, where every change "still waits on another team's sign-off". It also fails when a configured sign-off check owned by another team is required on those paths.
+- *Suggestion:* "`{owner}`'s ownership record says it approves breaking changes to `{entity}` without further sign-off, but merges to {file} require review from {other_principals} ({source: CODEOWNERS line {n} | branch protection | check {check}}). Either add `{owner_principal}` to that CODEOWNERS line and remove the other requirement, or correct the record to `without_signoff: false` and name who signs off (§1.13)."
+- *Limits:* Classic branch protection needs repository administration read access, which the Actions `GITHUB_TOKEN` cannot be granted, so a GitHub App or fine-grained token is needed for it. Without one, the check uses CODEOWNERS plus the rulesets endpoint, and the finding says that classic protection was not read. GitLab and Bitbucket approval rules need their own adapters. Off-platform sign-off, such as a change-advisory board, is invisible. If the team uses one, list it as a decision with `without_signoff: false`.
+
+#### Design C — Approval history versus claimed authority (H, deterministic)
+
+- *Measure:* In diff mode, and over the last `rules.1_13.c.lookback` merged PRs (default 50) that touched the owner's entity files, collect the approving reviewers through the `gh` API (`GET /repos/{o}/{r}/pulls/{n}/reviews`). For each PR, record whether the approvers included a member of the owner and whether they included anyone outside it.
+- *Fails when:* among the PRs that changed the structure of an owned entity (the same breaking-change classifier as §1.12-A), at least `rules.1_13.c.min_ratio` (default 0.8) were approved only by non-owners, while the record claims `approve_breaking_change` with `without_signoff: true`. In practice someone else holds the authority.
+- *Suggestion:* "In the last {n} breaking changes to `{entity}`, {k} were approved only by {principals}, never by `{owner}`. The documented authority does not match practice. Either route approval to `{owner}` or update the ownership record to reflect who actually decides (§1.13)."
+- *Limits:* Needs full history and API access. Small samples are noisy, so nothing is reported below `rules.1_13.c.min_prs` (default 5) changes. Membership is read from `owner_members`, or from the GitHub team API (`GET /orgs/{org}/teams/{team}/members`) at evaluation time. The team API needs org `members: read`, which the Actions `GITHUB_TOKEN` lacks. Either way, someone who has since left the team is misattributed.
+
+**Recommendation:** Build A first, as an MVP check through the sidecar. It makes the record exist and states the power it claims. Add B in Phase 2 when artifact loaders exist, since it is the design that catches the ✗ example. C is a Phase 3 audit.
+
+### §1.14 — Six Core Questions, Who and Why first `[SHOULD][METHOD]`
+
+**Applies to:** Go ◐ · SQL ◐ · JSON ◐. Requirements are declared once for each modeling unit: a domain, SQL schema, Go package or schema directory, as in §1.10. Findings are reported on the unit's first entity.
+**Checkability:** `declared` for whether the answers exist, `direct` for their ordering in history, `proxy` for the quality of the answers.
+
+#### Design A — Requirements-record contract (C, deterministic)
+
+- *Measure:* Each modeling unit has `model/requirements/<unit>.yaml`, or `mml.yaml: domains[].requirements`. The record has these keys, in this order:
+  - `who: {stakeholders[], users[], ai_systems[]}`;
+  - `why`, as text;
+  - `what: {entities[], attributes[], relationships[]}`;
+  - `when ∈ {historical, predictive, both}`;
+  - `where: [{source, location, available: bool}]`;
+  - `how`, as text.
+
+  Parse the file with `gopkg.in/yaml.v3` `yaml.Node`, so that the key order in the file can be read.
+- *Fails when:* any of these holds:
+  - any of the six keys is missing or empty (`TODO` counts as empty);
+  - `who.ai_systems` is absent. An explicit empty list `[]` with `ai_systems_reason` passes, so the AI question has at least been asked.
+  - `when` has a value outside its set;
+  - a `where` entry has no `available` value;
+  - the top-level keys are not in canonical order. Out of order reports at `note`, since order in a file is weak evidence.
+- *Suggestion:* "Requirements for `{unit}` are {missing|missing {keys}|missing who.ai_systems}. Add `model/requirements/{unit}.yaml` with who (stakeholders, users and AI systems), why, what, when (historical/predictive/both), where (sources and availability) and how, in that order (§1.14)."
+- *Limits:* This checks that each answer exists, not that the answers are any good; that is a proxy. The record carries an M1 `fp=`, a hash over the sorted fingerprints of the unit's entities. When the unit's model changes structurally, the record reports `mml/stale-declaration` until someone re-reads it and refreshes it. A single-entity unit inherits the requirements of its parent domain, so it does not need its own file. Teams with one application and one consumer can opt out with `domains[].requirements_required: false`, in line with the scope note.
+
+#### Design B — Who/Why-before-What/How ordering in history (H, deterministic)
+
+- *Measure:* With full git history, find three timestamps for each unit:
+  - `t_why`: the first commit in which both `who` and `why` in the unit's requirements file are non-empty;
+  - `t_what`: the first commit that adds any entity to the unit, meaning a `CreateStmt` in its schema, a tagged struct in its package, or a schema file in its directory;
+  - `t_how`: the first commit that fills in `what` or `how`.
+
+  In diff mode on a PR, the same comparison runs on the PR's commit order. A PR that creates the unit's first entity must already have `who` and `why` on the base branch, or set them in an earlier commit of the same PR.
+- *Fails when:* `t_what < t_why` or `t_how < t_why`, which means entities or a build plan came before anyone recorded who the model serves and why.
+- *Suggestion:* "`{unit}`'s first entity `{entity}` was added in {commit} on {date}, before its requirements recorded who and why ({t_why|never}). Record who the model serves, including AI systems, and why it is needed, then revisit `{entity}` against those answers (§1.14)."
+- *Limits:* Needs `fetch-depth: 0`. Squash merges collapse the order within a PR, so on the main branch, ordering inside one squashed PR is treated as simultaneous, and simultaneous passes. Brownfield units that existed before the linter was adopted are exempt when their first entity predates `config.adoption_date`. Recording the answers retroactively cannot repair the history, so a waiver with a reason is the escape hatch.
+
+#### Design C — Answers checked against the model (A + S, deterministic)
+
+- *Measure:* Cross-check the recorded answers against the IR:
+  1. Every entity in the unit is either listed in `what.entities[]` or reached by a `Ref` from a listed entity.
+  2. Every `where[].source` resolves to a declared source definition (§3.6) or a `source: legacy|third_party` entity.
+  3. If `who.ai_systems` is non-empty, at least one of the unit's entities carries `agent_exposed` (§2.4).
+  4. If `when` is `predictive` or `both`, the unit contains or references a `layer: training|feature` entity, or `what` names one.
+  5. (Phase 2, M2.) If the code corpus shows an AI system reading the unit's entities, `who.ai_systems` must be non-empty. That means a package imports an LLM or agent SDK (`github.com/anthropics/anthropic-sdk-go`, `github.com/openai/openai-go`, `github.com/mark3labs/mcp-go`, or modules listed in `rules.1_14.c.ai_sdk_modules`) and also reads one of the unit's entities through a query or decode.
+- *Fails when:* any of the five checks fails.
+- *Suggestion:* "`{unit}`'s requirements {do not mention `{entity}`|name source `{source}`, which has no source definition|list AI systems, but no entity is marked agent_exposed|say `when: predictive`, but nothing models features or labels|list no AI systems, but `{pkg}` sends `{entity}` data to {sdk}}. Bring the requirements and the model back into agreement (§1.14)."
+- *Limits:* Check 1 can be satisfied by listing every entity. Checks 3 and 4 depend on other rules' annotations, so they report only once those annotations are in use (`rules.1_14.c.require_agent_exposed`). This design checks consistency, not whether the questions were asked in the right order; Design B does that.
+
+**Recommendation:** Build A first, as Phase 2, because it reads requirements artifacts. Build C next, cheaply, once A exists: together with A's fingerprint, it is what stops the answers from going stale, and check 5 catches an unanswered AI question from the code. B is the only design that measures the rule's ordering clause directly, and it is a Phase 3 diff-mode check.
+
+**Residual limit:** the quality of the answers to Who and Why, the true order of thinking within one squashed commit, and AI consumers outside this repository.
+
+## §2 — Shared Meaning, Taxonomies and Semantics
+
+### §2.1 — One label per concept; synonyms mapped `[MUST][ARCH]`
+
+**Applies to:** Go ✔ (struct names and field names, linked to their logical entity) · SQL ✔ (table and column names) · JSON ✔ (`$defs` names and property names).
+**Checkability:** `declared` for the synonym map; `direct` for synonyms in names, and for merged populations or flattened columns once two independent signals agree (M5).
+
+#### Design A — Glossary-driven term resolution (L, deterministic)
+
+- *Measure:* Tokenize every entity and field name with a camel/snake splitter and a Porter2 stemmer (`github.com/kljensen/snowball`). Look up each token in `glossary.yaml` (`terms: [{preferred: customer, synonyms: [client, account_holder], definition, owner}]`). Assign each token one of three classes: `preferred`, `synonym`, or `unknown`.
+- *Fails when:* A name contains a token classed `synonym`, for example `client_id` where `customer` is preferred. Also fails when two entities in different sources link to the same logical entity but use different glossary terms, such as Go `Client` and SQL `customers`.
+- *Suggestion:* `"{name}" uses synonym "{token}"; glossary prefers "{preferred}" (owner {owner}). Rename to "{suggested_name}", or add an explicit //mml:entity mapping if this is a different concept.`
+- *Limits:* Only as complete as the glossary. If no glossary exists, the linter reports one `§2.1 glossary missing` note per repo rather than one finding per name. Stemming can merge distinct words (`account` and `accounting` both stem to `account`), so the glossary may pin exact tokens with `match: exact`. Configure with `lexicon.stemmer` and `lexicon.extra_stopwords`.
+
+#### Design B — Generic-column collision detection (S + G, heuristic, promoted by M5)
+
+- *Measure:* Build a cross-entity index `field_name → [entities]` over every field whose name has no domain qualifier. A name qualifies if it matches `^(arrival|departure|start|end|close|open|completion|delivery)_(time|timestamp|at|date)$` or appears in the configured `generic_terms` list (default: `arrival_timestamp`, `status_date`, `amount`, `score`, `result`). For each name, count the distinct `owner` annotations (falling back to CODEOWNERS teams) across the entities that hold it. This collision is signal 1. It is promoted (M5) when an independent signal 2 agrees:
+  - **(L)** The field's descriptions on the colliding entities resolve to different glossary terms, or their token Jaccard is below 0.3.
+  - **(Q)** In the code or query corpus, the field is written by functions in two or more `domains.<name>.paths` packages, or by `INSERT`/`UPDATE` statements in two or more domains' query files, which points to more than one producing rule.
+  - **(C)** A `producers` annotation on one field lists more than one domain. This is deterministic on its own.
+- *Fails when:* A `producers` annotation lists more than one domain, at full severity. Or signal 1 fires together with an L or Q signal 2, at full severity. Signal 1 alone reports at `note`.
+- *Suggestion:* `"{field}" appears in {n} entities owned by {owners}{evidence: " and is written by {domains}" | " with differing descriptions"}. If the meanings differ, split it into domain-named columns (e.g. "{owner1}_{field}", "{owner2}_{field}") and record the producing actor and domain in each column's description; if they are identical, annotate mml:"definition=<glossary term>".`
+- *Limits:* The same name in different domains is often correct because it is one shared definition (`scheduled_arrival_timestamp` in §2.1's ✓ example). A glossary entry for the term suppresses signal 1. Only names in `generic_terms` or matching the regex are checked, so a flattened column with an unusual name is missed. The Q signal sees only writes the corpus can resolve.
+
+#### Design C — Status-flag merged population (S, heuristic, promoted by M5)
+
+- *Measure:* For entities whose canonical name matches a glossary term, find a population discriminator. That is a boolean field matching `^(is_|has_)(customer|buyer|lead|prospect|member|registered)`, or an enum field whose values name population types (`prospect`, `lead`, `customer`). Then count the fields that are required only for one discriminator value. In SQL this is a `CHECK (x IS NOT NULL OR kind <> 'lead')` shape, and in JSON Schema an `if: {properties: {kind: {const: ...}}} then: {required: [...]}` block. That count is signal 1 (S). Signal 2 (L, deterministic) holds when the glossary defines two or more of the discriminator's values as separate preferred terms, each with its own `definition`, such as `prospect` and `purchasing_customer`. The glossary then records them as different concepts, yet one entity holds both.
+- *Fails when:* Signal 2 holds, at full severity whatever the conditional-field count, because that contradiction between glossary and model is deterministic. Or signal 1 reaches `populations.min_conditional_fields` (default 3), at `note` until signal 2 or a `definition` annotation on the entity agrees.
+- *Suggestion:* `"{entity}" mixes populations via "{flag}" ({values}); {k} fields apply only to "{value}"{" and glossary.yaml defines \"{value}\" as a separate concept"}. Model "{value}" as its own entity keyed to "{entity}_id" (e.g. "purchasing_{entity}").`
+- *Limits:* This overlaps with the legitimate discriminator in §4.10, which is why signal 1 alone is a note. Go structs carry no conditional-requiredness, so this design sees Go only through `validate:"required_if=Kind lead"` tags. Signal 2 depends on the glossary distinguishing the populations.
+
+**Recommendation:** Build A first. It is cheap once a glossary exists, and it makes synonym findings fully deterministic. C's glossary-contradiction signal is MVP too. Add B in Phase 2, using CODEOWNERS and its Q signal from the code corpus.
+
+**Residual limit:** whether one label really covers two different concepts is a question of meaning. The linter can only see it once the glossary, a `producers` declaration, or the write paths make the difference visible. A merged concept with no glossary entry, one producer, and no conditional fields leaves no trace.
+
+### §2.2 — Reconcile shared terms across domain boundaries `[MUST][ARCH]`
+
+**Applies to:** Go ◐ (a struct in package `crm` referencing a type or ID from package `support`) · SQL ✔ (cross-schema FKs and joins) · JSON ◐ (a `$ref` into another domain's schema file).
+**Checkability:** `declared` (boundaries come from schemas, packages, or `owner`), `direct` for global god entities.
+
+Naming each concept separately is §2.1's job. These designs check only that shared terms are reconciled and that boundary crossings model the translation; shared hierarchical classifications are exempt (§2.3).
+
+#### Design A — Boundary-crossing translation contract (G + C, deterministic)
+
+- *Measure:* Assign each entity a domain: the SQL schema name, the Go package path segment that matches `domains.<name>.paths`, the JSON Schema directory, or the `owner` annotation. For each edge in `Refs` whose endpoints sit in different domains, look for one of three things. (1) A translation entity annotated `//mml:translates from=<a> to=<b>`, or a table named `*_map`/`*_xref` that has FKs into both domains. (2) An `x-mml-mapping` on the `$ref`. (3) A sidecar `boundaries: [{from, to, term, agreed_definition, adr}]` entry. Edges whose target is a shared taxonomy (`//mml:taxonomy`, or `layer=reference` with a self-referencing parent key) are exempt, because §2.2 shares hierarchical classifications outright under §2.3.
+- *Fails when:* A non-exempt cross-domain edge has none of the three.
+- *Suggestion:* `{src_entity} ({src_domain}) references {dst_entity} ({dst_domain}) directly. Record the agreed meaning of "{term}" in mml.yaml boundaries (with ADR link), or route the reference through a mapping entity "{src_domain}_{term}_map".`
+- *Limits:* Needs domain assignment. If none is configured, the design is skipped and the linter emits a setup note. Checks that an agreement is recorded, not that the two owners actually agree. Go references by bare `int64` ID (no typed reference) are found only through name-inferred `Refs`.
+
+#### Design B — Cross-domain join scanner (Q, deterministic)
+
+- *Measure:* In the query corpus, walk pg_query `JoinExpr` nodes (both `quals` and `usingClause`) and comma joins (several items in `SelectStmt.fromClause`, with the join condition in `SelectStmt.whereClause`), and resolve both sides to entities. When the two sides belong to different domains and the join key's name is a glossary term with more than one definition (a `glossary.yaml` term with two or more `contexts:`), check for a `WHERE` or `ON` predicate that filters on a column listed in `glossary.<term>.contexts[].filter`.
+- *Fails when:* A cross-domain join on a multi-context term has no context filter.
+- *Suggestion:* `Join of {left} ({d1}) and {right} ({d2}) on "{key}" mixes definitions "{def1}" and "{def2}". Add filter "{filter}" (from glossary), or join via the boundary mapping table.`
+- *Limits:* Depends on the glossary recording contexts. Join keys built dynamically in Go cannot be resolved. A filter applied in an upstream CTE or view is found only if the view is in the corpus.
+
+#### Design C — Global-entity sparsity score (S, heuristic)
+
+- *Measure:* For each entity, compute `nullable_ratio = nullable_fields / fields` and `owner_fanin`, the count of distinct domains whose entities hold an FK or `$ref` to it.
+- *Fails when:* `fields ≥ 40`, `nullable_ratio ≥ 0.6`, and `owner_fanin ≥ 3`. All three thresholds are configurable under `global_entity.*`.
+- *Suggestion:* `"{entity}" looks like a global table serving {fanin} domains ({domains}) with {pct}% nullable columns. Let each domain own its view (e.g. "{domain}_{entity}") sharing "{entity}_id", with an explicit mapping where they meet.`
+- *Limits:* Wide reference tables and shared taxonomies trigger this legitimately. Waive them with `layer=reference`. Narrow global tables, such as one `customer` table with 15 columns that every domain reads, are not caught here. Design A catches the cross-domain references to them, and §4.8-B catches the rule's ✗ case of columns that belong to other domains (lead score, credit score, loading-dock number) on one entity.
+
+**Recommendation:** Start with A (MVP, using schema or package names as domains). Add B once the query corpus exists. C is a cheap secondary signal.
+
+### §2.3 — One strict shared taxonomy; no free-text classification `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (a `Category string` field versus a `CategoryID` that references a taxonomy type) · SQL ✔ · JSON ✔ (`enum` versus free `string`).
+**Checkability:** `direct`.
+
+#### Design A — Classification-field type check (L + S, deterministic)
+
+- *Measure:* Match field names against `classification_terms` (default regex `(^|_)(category|region|area|territory|segment|tier|class|classification|genre|department|geo|geography)(_|$)`). For each match, record whether the field has an FK or `$ref` to an entity tagged `layer=reference` or `//mml:taxonomy`, a JSON `enum`, or a SQL `CHECK (x IN (...))`.
+- *Fails when:* The field is a free `string`/`VARCHAR`/`TEXT` with no FK, enum, or check.
+- *Suggestion:* `"{entity}.{field}" stores classification as free text. Replace with "{stem}_id" REFERENCES {taxonomy_entity}(id) (taxonomy found: {taxonomy_entity}) or constrain to the taxonomy's node list.`
+- *Limits:* Name-based. `area` and `class` also name measurements (`floor_area_sqm`) and code concepts, so numeric types are skipped and terms can be removed from `classification_terms`. An enum or `CHECK` passes even when it duplicates a taxonomy that another domain also hard-codes; Design B catches that case.
+
+#### Design B — Parallel-hierarchy detection across entities (G + L, heuristic)
+
+- *Measure:* Collect every taxonomy-like entity, meaning one with a self-referential `parent_id` FK or a JSON `$ref` to itself, or one whose name matches the classification terms. Group them by the glossary concept their name or synonyms resolve to (`region`, `area`, `territory` → `geography` via `glossary.synonyms`).
+- *Fails when:* Two or more taxonomy entities resolve to the same concept, for example `sales.region` and `marketing.area`.
+- *Suggestion:* `{n} hierarchies model "{concept}": {entities}. Consolidate into one shared taxonomy "{concept}" (owner {owner}) and reference it from all domains.`
+- *Limits:* Needs synonyms in the glossary. Without them, it falls back to exact-name duplicates only. Deliberate per-context hierarchies (a legal-entity tree versus a sales-territory tree) need a waiver with a reason.
+
+#### Design C — Strict-ordering guard check (S, deterministic)
+
+- *Measure:* For each self-referencing taxonomy entity, look for a structural guard against a node sitting above its own ancestor. A PostgreSQL `CHECK` cannot read other rows, so it cannot enforce this on its own. Any one of these passes: (1) a `CreateTrigStmt` on the table (`BEFORE INSERT OR UPDATE`) whose function (`CreateFunctionStmt`) body contains a recursive CTE over the parent column; (2) an `ltree` path column (`TypeName` `ltree`) maintained by a trigger, with a `UNIQUE` constraint on the path; (3) a closure table (`{entity}_closure(ancestor_id, descendant_id, depth)`) with FKs to the entity and a `CHECK (depth >= 0)`. A `CHECK (parent_id <> id)` alone does not pass, because it blocks only self-parenting and not longer cycles.
+- *Fails when:* None of (1) to (3) is present.
+- *Suggestion:* `Taxonomy "{entity}" has no ordering guard; a node can sit above its own ancestor. Add a BEFORE INSERT OR UPDATE trigger that rejects a parent_id found among the row's descendants (recursive CTE), or maintain an ltree "path" or a closure table.`
+- *Limits:* JSON Schema cannot express acyclicity, and Go has no declarative form either. For both, and for application-enforced SQL, accept `//mml:enforced_in=<pkg.Func>` as evidence; the linter only checks that the function exists, not that it is correct. Design D checks the hierarchy itself in those cases.
+
+#### Design D — Acyclicity of the taxonomy itself: committed data plus ingested test (A, deterministic)
+
+- *Measure:* Two paths, depending on where the taxonomy's nodes live.
+  1. **Committed nodes (static input).** Nodes may be committed as dbt `seeds/*.csv`, YAML or JSON under `taxonomy.paths`, SQL `InsertStmt … VALUES` rows in migrations, a JSON Schema `enum` plus `x-mml-parent: {child: parent}` map, or SKOS Turtle (`skos:broader`, parsed with `github.com/knakk/rdf`). In each case, build the parent graph and run an iterative DFS with three colours. Check that:
+     - there are no cycles, with the cycle path recorded;
+     - every `parent_id` resolves to a node, so no edge dangles;
+     - there is one root per hierarchy when `taxonomy.single_root: true`;
+     - when the taxonomy declares `levels`, every child sits deeper than its parent.
+
+     In the same pass, check the classification fields from Design A that are constrained by a JSON `enum`, a SQL `CHECK (x IN …)` or a Go `const` block. Every allowed value must be a node of the taxonomy they classify against, so values cannot drift from the shared taxonomy.
+  2. **Runtime-only nodes.** `mixedmodellint scaffold acyclic {entity}` generates a data test: a recursive CTE over `parent_id` with a `CYCLE parent_id SET is_cycle USING path` clause (PostgreSQL 14+) that fails on any `is_cycle`, plus an orphan-parent check. The test carries `meta: {mml_rule: "§2.3", mml_entity: "{entity}"}`. Its result is ingested with `check --results` (M4).
+- *Fails when:*
+  - the committed graph has a cycle, a dangling parent, a level inversion, or an extra root when `single_root` is set;
+  - an enum or `CHECK` value is not a taxonomy node;
+  - an ingested `acyclic` test failed;
+  - a self-referencing taxonomy with no committed nodes has no scaffolded test, or the test exists but did not run (`mml/test-not-run`).
+- *Suggestion:* `Taxonomy "{entity}" has a cycle {path} (in {file}:{line}); re-parent "{node}" so no node sits above its own ancestor.` / `"{entity}.{field}" allows "{value}", which is not a node of taxonomy "{taxonomy}"; reference the taxonomy node instead.` / `Taxonomy "{entity}" is only enforced in data; run "mixedmodellint scaffold acyclic {entity}" and add the test to CI.`
+- *Limits:* Path 1 sees only the committed snapshot. Rows inserted at runtime are covered only by path 2, and only as often as CI runs the test against a real database. SKOS and OWL support covers `skos:broader` and `rdfs:subClassOf` only. The `CYCLE` clause needs PostgreSQL 14 or later. For other platforms, the scaffold emits a depth-bounded recursive CTE (`taxonomy.max_depth`, default 32) that fails when the bound is reached.
+
+**Recommendation:** A is the highest-yield MVP check. Add C for every self-referencing table. D path 1 is MVP wherever nodes are committed, and is the only check that covers JSON and Go taxonomies. D path 2 is Phase 2 (M4 results). B needs the glossary (Phase 2).
+
+**Residual limit:** a taxonomy maintained only in a live database is checked only as of the last CI test run, and only if CI has a database to test against. Whether the chosen hierarchy is the *right* one for all domains is not checkable.
+
+### §2.4 — Ground AI agents in a targeted semantic slice `[MUST][ARCH]`
+
+**Applies to:** Go ◐ (agent tool definitions that expose schema) · SQL ◐ (grants to agent roles) · JSON ◐ (tool/function JSON Schemas).
+**Checkability:** `direct` for whether the grounding material exists, resolves against the IR (M2), is fresh (M1), and is sliced per tool. `proxy` for what the agent actually receives at runtime.
+
+#### Design A — Agent-exposed entity metadata completeness, resolved and fresh (C + A, deterministic)
+
+- *Measure:* Identify the agent-reachable entities in three ways: entities annotated `//mml:agent_exposed`; tables granted to roles matching `agents.roles` (`GRANT SELECT ON ... TO ai_agent`, from `GrantStmt`); and entities referenced from a JSON Schema whose path matches `agents.tool_schemas` (`tools/*.json`). For each one, require a `definition`, a column-level description on 100% of fields, and a semantic-layer entry for the entity (`semantic_layer/*.yml` containing `entity: {canonical}`) that states at least one business rule (`rules:` or `filter:`). Two further checks apply:
+  - **M2 resolution:** every column, relationship and filter expression named in the semantic entry must resolve against the IR. A relationship `Customer → CompletedOrder` must match an FK, `$ref` or linked `Ref` between those entities. A filter's `ColumnRef`s, parsed with pg_query as an expression, must name existing fields. A `rules:` entry that names an entity must name one in the IR.
+  - **M1 freshness:** the semantic entry carries `fp=` for each entity it describes. A mismatch with the current fingerprint is `mml/stale-declaration`. For agent-reachable entities this is reported at the rule's strength, because an agent will state stale definitions with confidence.
+- *Fails when:*
+  - any agent-reachable entity is missing a definition or a semantic-layer entry;
+  - field description coverage is below `agents.min_description_coverage` (default 1.0);
+  - a semantic-entry reference does not resolve;
+  - the entry's `fp` is stale.
+- *Suggestion:* `"{entity}" is reachable by agent role/tool {via} but its grounding is {missing | "stale since {changed_fields} changed" | "refers to {ref}, which does not exist"}. Update semantic_layer/{file} (business rules, e.g. what qualifies as "{canonical}") and run "mixedmodellint annotate --refresh {entity}".`
+- *Limits:* Checks that the definitions exist, resolve and were reviewed since the last shape change, not that they are correct. Agents connected through credentials outside the repo (a BI tool's service account) are invisible unless listed in `agents.roles`.
+
+#### Design B — Whole-model dump detection in agent wiring (Q, heuristic, promoted by M5)
+
+- *Measure:* In the Go code corpus, find call sites that build agent context: functions listed in `agents.context_builders`, or values assigned to struct fields named `System`/`Context`/`Tools` in configured agent SDK types. Detect whole-catalog sources feeding them: queries over `information_schema.*` or `pg_catalog.*` without a `WHERE table_name` filter, `os.ReadDir`/`filepath.Glob`/`fs.WalkDir` over the whole `semantic_layer` directory, or a `//go:embed semantic_layer/*.yml` whose `embed.FS` is passed through unfiltered.
+- *Fails when:* An agent context is built from the full schema or the full semantic model with no call to a selection function (configurable `agents.slice_funcs`) on the path between source and context. On its own, this reports at `note` (M5). It reaches full severity when a second, structural signal agrees: either the context builder's tool has no slice manifest (Design C), or the builder reads catalog sources outside the declared slice. In the second case, the `WHERE table_name IN (…)` literal set, or the embedded file set, is not a subset of the slice.
+- *Suggestion:* `{func} at {pos} loads the entire {source} into agent context. Retrieve only the entities relevant to the request (e.g. via {slice_func}) and their relationships.`
+- *Limits:* Only works for Go-built agents that follow recognizable patterns. Agents written in other languages, or wired through prompt templates outside Go, are not seen.
+
+#### Design C — Per-tool slice manifest cross-checked against usage (C + Q, deterministic)
+
+- *Measure:* Each agent tool (a JSON Schema in `agents.tool_schemas`, or a Go tool registration in `agents.context_builders`) must declare its semantic slice: `x-mml-slice: [entity, …]` in the tool schema, or `agents.slices.<tool>.entities` in `mml.yaml`. Compute four things:
+  1. Slice size: `|slice|`, and `|slice| / |agent-reachable entities|`.
+  2. Closure: every entity that the tool's query templates touch, taken from the query corpus by resolving `RangeVar`s in SQL attached to the tool (`agents.slices.<tool>.queries` globs or `//mml:tool <name>` on the Go function), must be in the slice.
+  3. Relationship closure: every FK or `Ref` between two slice members must be described in the semantic layer.
+  4. Slice resolution: every slice member exists in the IR and has a semantic entry (Design A).
+- *Fails when:*
+  - a tool has no slice declaration;
+  - the slice exceeds `agents.max_slice_entities` (default 15), or `agents.max_slice_share` (default 0.25) of the agent-reachable catalog, without `slice_reason=`;
+  - a queried entity is missing from the slice;
+  - a slice member does not resolve.
+- *Suggestion:* `Tool "{tool}" {has no semantic slice | declares {n} entities ({pct}% of the catalog) | queries {entity} outside its slice}. Declare x-mml-slice with only the entities this tool needs (from its queries: {queried}) and their relationships.`
+- *Limits:* Applies only to tools whose queries are in the corpus. A tool that composes SQL at runtime from model output has no static query set, and is checked only for size and resolution. The share threshold is a policy choice, so it is configurable.
+
+**Recommendation:** A (Phase 2, needs grants or a tool-schema config plus the semantic layer). C is Phase 2. It is the deterministic measure of "targeted slice", and it gives B its second signal. B is a Phase 2 refinement on the code corpus.
+
+**Residual limit:** what the agent receives at runtime, such as retrieval results or prompt assembly outside the repo, cannot be seen statically. Neither can whether its model actually follows the grounding over its priors. Agents built outside Go and outside the tool-schema convention are checked only through grants (Design A).
+
+### §2.5 — Business metadata on every published table and column `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ (doc comments on structs and fields) · SQL ✔ (`COMMENT ON`) · JSON ✔ (`description`).
+**Checkability:** `direct`.
+
+#### Design A — Metadata coverage and quality scoring (C, deterministic)
+
+- *Measure:* For entities with `lifecycle=published` (or all non-`scratch` entities when `lifecycle` is unset), compute three things. Entity coverage: `definition` (Doc), `owner`, and `status ∈ {draft,validated,deprecated}` present. Field coverage: the percent of fields with a description of at least `metadata.min_words` (default 4) words that does not merely restate the name, checked by Jaccard(tokens(description), tokens(name)) < 0.8. Unit coverage: every field with `Type ∈ {decimal,float,int}` whose name matches the measure regex `(amount|price|cost|revenue|weight|length|height|distance|duration|qty|quantity|total|fee|balance)` has `unit` or `currency`.
+- *Fails when:* Any entity-level key is missing, field coverage falls below `metadata.min_field_coverage` (default 0.9), or any measure field lacks a unit.
+- *Suggestion:* `"{entity}" metadata {coverage}% (need {min}%). Missing: {list}. e.g. COMMENT ON COLUMN {entity}.{field} IS '<meaning>, in <unit>. @unit: USD'`. The suggestion includes a SARIF fix that adds a stub `COMMENT ON` or doc comment containing TODO.
+- *Limits:* Boilerplate can pass the checks; tautology detection keeps the gaming somewhat in check. A stub containing `TODO` counts as missing, so the auto-fix never makes a finding pass. Units on names outside the measure regex (`elevation`) are not required. Field-level M1 binding closes one gap. A description written for `price_cents BIGINT` stays attached when the column becomes `price NUMERIC(10,2)`, so each description carries a field fingerprint `fp=` over `(name, LogicalType, unit)`. A mismatch is `mml/stale-declaration` on that field.
+
+#### Design B — Opaque-name gate (L, deterministic)
+
+- *Measure:* Flag names that carry no meaning: names matching `^[a-z]{1,2}_?\d+$` (`c_3`, `f12`), or names in which no token is either a word in the bundled English wordlist or an entry in `lexicon.allowed_abbrev`.
+- *Fails when:* An opaque name has no description.
+- *Suggestion:* `"{field}" ({raw_type}) conveys no meaning and has no description. Rename (e.g. "<what>_<unit>") and add a description with units.`
+- *Limits:* Overlaps with §5.2. Findings are deduplicated by fingerprint so one name yields one finding. Domain jargon that is not in the wordlist (`sku`, `ein`) needs adding to `lexicon.allowed_abbrev`.
+
+#### Design C — Catalog drift and freshness check (A, deterministic)
+
+- *Measure:* If a catalog export is configured (dbt `schema.yml`, the `mml.yaml` sidecar, or a DataHub/OpenMetadata JSON export), diff its set of columns against the IR.
+
+  A catalog kept only in a SaaS tool (DataHub, OpenMetadata, Atlan, Collibra) is brought in through a **committed export**. A scheduled job or a developer runs `mixedmodellint catalog pull`, which calls the tool's export (`catalog.export_cmd`, for example `datahub get --urn …` or the OpenMetadata `/api/v1/tables` endpoint) and writes `catalog/export.json`. Beside it, `catalog/export.lock.json` records the time of the export (`exported_at`) and, for each entity, the IR fingerprint at that moment (M1). `check` never calls the SaaS tool, so results do not change between runs of the same commit.
+
+  The check then compares three things:
+  1. Columns in the IR against columns in the export.
+  2. Each entity's current fingerprint against the fingerprint stored in the lock. A mismatch means the entity changed after its catalog description was exported.
+  3. `exported_at` against `catalog.max_age` (default 30 days).
+- *Fails when:*
+  - a column exists in the IR but not in the catalog, or the reverse (a stale entry);
+  - a published entity's fingerprint differs from the one recorded at export (`mml/stale-declaration`: the catalog describes an older shape);
+  - the export is older than `catalog.max_age`, which reports at `note`.
+- *Suggestion:* `Column {entity}.{field} is not in catalog {catalog_file}; add an entry with description, owner, status.` For a stale entry: `Catalog {catalog_file} lists {entity}.{field}, which no longer exists; remove or deprecate the entry.` For a changed entity: `{entity} changed ({changed_fields}) after catalog export {exported_at}; update its catalog entry and run "mixedmodellint catalog pull".`
+- *Limits:* Only as current as the committed export. Edits made in the SaaS tool after the export are invisible until the next pull, so the age check only bounds how stale the export can be. The export command needs CI credentials for the catalog API. Entities outside the catalog's scope are excluded with `catalog.include` globs.
+
+**Recommendation:** A is the MVP and shares its machinery with §1.7 and §5.3. Add C when a catalog file is present, and add `catalog pull` for SaaS catalogs.
+
+**Residual limit:** whether a description is *accurate*, as opposed to present, specific, unit-bearing and newer than the column's last change, is not checkable. A SaaS catalog is checked only as of its last committed export.
+
+### §2.6 — Define each metric once in a semantic layer `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (metric computation functions) · SQL ✔ (queries and views) · JSON ◐ (metric definitions in JSON).
+**Checkability:** `direct` against the query corpus.
+
+#### Design A — Duplicate-expression detection across queries (Q, deterministic)
+
+- *Measure:* Parse every query and view. For each aggregate target (a `ResTarget` whose `val` contains a `FuncCall` named sum/avg/count, or an `A_Expr` dividing two aggregates), compute a canonical fingerprint: fold constants, sort commutative operands, and resolve each `ColumnRef` to `entity.field`. Group targets by their alias stem (`average_order_value`, `aov`, resolved through glossary synonyms).
+- *Fails when:* One metric alias maps to more than one distinct fingerprint, or the same fingerprint appears in at least `metrics.max_copies` (default 2) files outside `semantic_layer/`.
+- *Suggestion:* `Metric "{alias}" is computed {n} different ways ({files}). Define it once in semantic_layer/{alias}.yml with calculation, scope and exclusions, and reference it.`
+- *Limits:* Go-built SQL needs constant folding. ORM aggregates are not covered. Two equivalent formulas written differently (`SUM(a)/SUM(b)` versus `AVG` over pre-joined rows) get different fingerprints, so the design reports them as different definitions; that is usually the drift it is looking for.
+
+#### Design B — Semantic-layer completeness contract (A + C, deterministic)
+
+- *Measure:* For each metric in `semantic_layer/**/*.yml`, require a calculation, scope, exclusions (an explicit empty list `[]` is allowed), owner, and grain. In the `mml` format these are keys of the same names. For dbt MetricFlow, map calculation to `type_params` (`measure`/`expr`), exclusions to `filter`, and scope, owner and grain to `meta.scope`, `meta.owner` and `meta.grain`. For Cube, map calculation to the measure's `sql`, exclusions to `filters`, and the rest to `meta`. Each column referenced by the calculation must resolve to an IR field.
+- *Fails when:* A required key is missing or a reference does not resolve.
+- *Suggestion:* `Metric "{metric}" lacks {keys}; e.g. exclusions: ["digital subscription cancellations"]. Column "{ref}" not found in {entity}.`
+- *Limits:* Checks that the definition is complete, not that dashboards use it; Design A covers reuse. An explicit `exclusions: []` passes, so a team can claim "no exclusions" without thinking. Other semantic-layer formats need an adapter.
+
+**Recommendation:** B is cheap and always useful (Phase 2, artifacts). A is the real duplication detector (Phase 2, query corpus).
+
+### §2.7 — Prefer existing standard vocabularies `[SHOULD][METHOD]`
+
+**Applies to:** Go ◐ · SQL ◐ · JSON ✔ (JSON-LD `@context` and Schema.org `$ref`s are common).
+**Checkability:** `direct` for B on value sets that can be bundled, and for A in domains declared regulated. `proxy` for A elsewhere: a name match alone is advice.
+
+#### Design A — Regulated-domain code-list detector (L, heuristic, promoted by M5)
+
+- *Measure:* A bundled table maps field-name regexes to standards: `diagnos|icd` → ICD-10/SNOMED CT; `procedure` → CPT/ICD-10-PCS; `drug|medication` → RxNorm; `country` → ISO 3166; `currency` → ISO 4217; `language|locale` → BCP 47; `unit_of_measure|uom` → UCUM; `industry|naics` → NAICS; `sex|gender` → ISO/IEC 5218 or HL7 AdministrativeGender. For each match, check for one of three things: an FK to an entity tagged `//mml:standard <name>`, a field annotation `standard=<name>`, or a JSON `$ref`/`@context` to a known standard URI.
+- *Fails when:* A regulated-concept field is a home-grown enum or free text with no `standard` annotation. A name match alone reports at `note`. It reaches full severity (M5) when an independent signal agrees:
+  - **(C, deterministic)** The entity sits in a domain declared regulated, via `domains[].regulated: [healthcare|finance|…]` in `mml.yaml`, and a bundled sector table lists the concept for that sector: healthcare → diagnosis, procedure, medication, unit; finance → currency, country, industry.
+  - **(S)** The field is an enum, and Design B finds at least 50% overlap with a bundled value set.
+  - **(L)** The field's description names the concept's standard or its domain term (`ICD`, `diagnosis code`, `ISO country`).
+- *Suggestion:* `"{field}" looks like a {concept} code{" in regulated domain {domain}"}; use {standard} instead of a local list. Annotate mml:"standard={standard}" or mml:"standard=local;reason=..." to record the decision.`
+- *Limits:* The table is curated and name-based, so `country` in a free-text address line is a false positive unless a second signal agrees. `standard=local;reason=` passes, so a team can decline the standard if it records why.
+
+#### Design B — Local enum vs standard value-set overlap (S + L, deterministic)
+
+- *Measure:* For enum fields (SQL `CHECK (x IN (...))`, JSON `enum`, Go `const` blocks of a named string type), compute the share of values found in bundled value sets (ISO 3166-1 alpha-2, ISO 4217, ISO 639-1 primary language subtags used by BCP 47).
+- *Fails when:* At least `standards.min_overlap` (default 80%) of the values belong to one standard and either the field declares no `standard`, or some values are off-standard variants (`UK` where ISO 3166 assigns `GB`).
+- *Suggestion:* `Enum "{field}" values match {standard} ({pct}%) but deviate: {diffs}. Adopt {standard} codes and annotate standard={standard}.`
+- *Limits:* Only covers value sets that can be bundled. Licensed vocabularies such as SNOMED CT and CPT are recognized by name in Design A, not by value. Short enums (fewer than 3 values) are skipped because chance overlap is high.
+
+**Recommendation:** B is precise and fully deterministic (MVP). A is MVP too. It is deterministic in declared regulated domains, and advice elsewhere.
+
+**Residual limit:** whether a *licensed* vocabulary such as SNOMED CT or CPT is used correctly cannot be checked by value, because its codes cannot be bundled. Whether a standard suits the use case is a judgment the `standard=local;reason=` record captures but cannot verify.
+
+### §2.8 — Encode permitted operations and state transitions as data `[CONSIDER][ARCH]`
+
+**Applies to:** Go ◐ (state constants and transition functions) · SQL ✔ (status columns, transition tables, triggers) · JSON ✔ (`enum` plus `x-mml-transitions`).
+**Checkability:** `declared` for the encoding. `direct` for contradictions between the declaration and the grants (M2), and between the declaration and the write paths (Design B).
+
+#### Design A — State-machine and permissions as data (S + G, deterministic)
+
+- *Measure:* Find agent-actionable entities: those with `GRANT INSERT|UPDATE|DELETE` to a role in `agents.roles` (`GrantStmt`), those referenced by an agent tool schema in `agents.tool_schemas` whose operation writes, or those annotated `agent_ops=` with any value beyond `read`. For each one, look for (1) a declaration of permitted operations (`agent_ops=read,aggregate,write,delete,trigger`, `x-mml-agent-ops`, or a sidecar `agent_ops:` list), and (2) for each enum-like status field (name matches `(_status|_state)$`, or an enum with three or more values), a transition encoding. A transition encoding is a sibling entity `{entity}_{field}_transitions(from_state, to_state, ...)`, a generic `state_transitions` table with an FK to the entity, a JSON `x-mml-transitions: {from: [to...]}`, or a sidecar `transitions:` block.
+- *Fails when:*
+  - an agent-actionable entity lacks the operations declaration, or one of its status fields lacks a transition encoding;
+  - (M2) the declaration contradicts the grants: `agent_ops` omits `write`, but a `GrantStmt` gives an agent role `INSERT` or `UPDATE` on the entity; or it omits `delete`, but `DELETE` is granted;
+  - (M2) the transition table's state values do not equal the status field's enum or `CHECK` value set;
+  - (M2) a transitions table has no FK or trigger tying it to the status column, so the declared moves are not enforced at write time. This last case reports at `warning`.
+- *Suggestion:* `"{entity}" can be modified by agent {via} but declares no {missing}.` / `"{entity}" declares agent_ops={ops} but {role} is granted {privilege}; revoke the grant or declare the operation.` Encode permitted operations (agent_ops=...) and allowed moves as data (e.g. table {entity}_{field}_transitions(from_state, to_state, policy)) so agents can check them.
+- *Limits:* Checks that the encoding exists and agrees with the grants, not that it matches the business rules. Design B compares it with the write paths. Policy rules that are not state transitions (rate limits, approval thresholds) are only checked if they appear in a `policy` column or key. Grants made outside the repo (cloud IAM, a DBA console) are invisible.
+
+#### Design B — Declared transitions vs actual write paths (Q, deterministic)
+
+- *Measure:* Collect every (from, to) transition the code or queries perform on a status field that has a declared transition set. Each tuple is labelled with how it was found:
+  1. **SQL, deterministic.** An `UpdateStmt` whose `targetList` sets the status column to an `A_Const` is one tuple per write. If the `whereClause` has an equality or `IN` on the same column, `from` is that literal set. If not, `from` is `*`, any state. The same applies to `MergeStmt` `WHEN MATCHED THEN UPDATE` and `InsertStmt … ON CONFLICT DO UPDATE`.
+  2. **Go, direct guards, deterministic.** An `ast.AssignStmt` writing `x.Status = StatusY` inside an `if`/`switch` guard on `x.Status == StatusX` within the same function, with constants resolved through `go/types`.
+  3. **Go, cross-function guards, heuristic.** Guards found through SSA (`golang.org/x/tools/go/ssa`) data flow across calls. These report at `note` unless the same tuple is also found by 1 or 2 (M5).
+
+  Also collect guards whose condition compares with a time or threshold literal (`90*24*time.Hour`, `INTERVAL '90 days'`).
+- *Fails when:*
+  - a tuple from path 1 or 2 is missing from the declared set (a `from = *` write fails unless every state may move to `to`);
+  - a declared transition is guarded in code by a literal threshold that has no matching `policy` value in the transitions data;
+  - a declared transition is never performed by any write path, which reports at `note` because it may be dead or may be performed elsewhere.
+- *Suggestion:* `{func|file:line} moves {entity}.{field} {from}→{to}{" with no prior-state check"} under rule "{guard}", which is not in the declared transitions. Add it with policy "{guard}" as data, or guard the write with WHERE {field} IN ({allowed_from}).`
+- *Limits:* Only covers writes in the corpus. Writes from other services, ORMs that build updates through reflection, and generic setters (`SetField(name, v)`) are missed. A transition set through a variable instead of a constant is reported as `to = ?` at `note`.
+
+**Recommendation:** A (MVP for agent-actionable entities only, including the grant cross-check). B is Phase 2 and is the more valuable check where agents act, since its SQL and direct-guard paths are deterministic.
+
+**Residual limit:** whether the declared state machine and policies match the *business's* rules is not checkable. The linter can only make the declaration, the grants and the write paths agree with each other. Writes from systems outside the repo are invisible.
+
+### §2.9 — Govern consumed cross-domain data with a data contract `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (a consumer struct that decodes another domain's payload, e.g. `json.Unmarshal` of a message from a topic owned by another team, or a struct mapped to another domain's table) · SQL ✔ (queries, views and dbt models that read another domain's schema or dbt `source`) · JSON ✔ (the contract itself is usually a JSON Schema or an ODCS YAML file; consumer schemas `$ref` it).
+**Checkability:** `declared` (that a contract exists and is complete), `direct` (that consumers stay inside it and producers do not drift from it).
+
+A *consumption edge* is any read whose source entity belongs to a different domain than the reader, using the same domain assignment as §2.2-A (SQL schema, Go package path in `domains.<name>.paths`, JSON Schema directory, or `owner`). Reads inside one domain are out of scope.
+
+#### Design A — Contract registry and completeness (A + C, deterministic)
+
+- *Measure:* For each consumption edge (producer domain P, entity E, consumer domain C), look for a contract that covers E: a file under `contracts/` (configurable `contracts.paths`) that is either a JSON Schema annotated `"x-mml-contract": {"producer": P, "consumers": [C, ...]}` or an Open Data Contract Standard (ODCS) YAML document (read through the field mapping in `contracts.format: odcs`). A contract is complete when it has (1) the producer and consumer owners, (2) every field the contract exposes with a type and a `description`, (3) a `change_policy` stating how changes are announced (for example `notice_days=14;channel=#orders-data`), (4) for each field whose name is a glossary term, a `term:` link that resolves in `glossary.yaml` or a matching §2.2 `boundaries:` entry, so the contract is founded on the shared definition, and (5) the entity's grain: an `x-mml-grain` / `grain:` value in the contract (ODCS through the `contracts.grain_field` mapping), which must match E's §7.1 grain statement and, through §7.1-B, E's key.
+- *Fails when:* A consumption edge has no contract, the contract does not list C as a consumer, any of (1)–(5) is missing, or the contract's grain differs from the producer's declared grain. Consumers assume a grain whether or not it is written down, and a wrong assumption is the fan-out bug the contract exists to prevent.
+- *Suggestion:* `"{consumer_entity}" ({C}) reads "{E}" owned by {P} with no data contract. Add contracts/{P}_{E}.yaml naming producer {P}, consumer {C}, fields {fields} with type and meaning, and change_policy (notice period and channel). Link "{term}" to glossary.yaml so both sides share the definition (§2.2). State the grain ("grain: {grain}") so consumers know what one row of {E} represents.` For a grain mismatch: `Contract {contract} says one row of {E} is "{contract_grain}", but {E} declares "{grain}" (key {key}). Correct the contract, and tell {consumers} per change_policy if the contract was the one that was right.`
+- *Limits:* Checks that an agreement is written down, not that the producer honours it at runtime. Needs domain assignment; with none configured the design is skipped with a setup note. ODCS has more structure than the linter reads; only the four elements above are checked. Reads from external vendors (`source=third_party`) are not contracts between teams; route them through §3.5 instead.
+
+#### Design B — Consumer reads outside the contract (Q + S, deterministic)
+
+- *Measure:* For each contracted edge, collect what the consumer actually uses. In SQL, resolve every `ColumnRef` in the consumer's queries, views and compiled dbt models (`target/compiled/**`) that resolves to E. In Go, collect the fields of the consumer struct that `json`/`db` tags map to E's payload, or the keys read from `map[string]any` decoded from it. Compare the set with the contract's field list, and compare each contract field's type with the consumer's type (`LogicalType` in the IR).
+- *Fails when:* The consumer reads a field the contract does not list (it depends on whatever shape the producer happens to emit), or the consumer's type for a field is incompatible with the contract's type (for example contract `string` with `format: date-time`, consumer `int64`).
+- *Suggestion:* `{file}:{line} reads {E}.{field}, which is not in contract {contract}. Ask {P} to add "{field}" to the contract (with type and meaning), or stop reading it. Contracted fields: {fields}.`
+- *Limits:* `SELECT *` on E is reported as reading every field and needs an explicit column list to pass. Go consumers that decode into `map[string]any` and read keys dynamically are only partly resolved. Consumers outside the repo are invisible.
+
+#### Design C — Producer drift against the contract (H, deterministic)
+
+- *Measure:* In diff mode, compare the producer entity E in the base and head IR. Classify each change to a contracted field as breaking (removed, renamed, type narrowed, made nullable, enum value removed) or additive. A change to E's grain is also breaking: a different PK or grain-key column set, or an edited grain statement (both visible against `mml.lock.json` through M3, so this part runs without a base ref). Also compare the head IR of E with the contract's field list, types and grain.
+- *Fails when:* A breaking change to a contracted field or to E's grain lands without the contract's `version` changing in the same PR, or the head IR of E no longer contains a contracted field with a compatible type.
+- *Suggestion:* `This PR {change} {E}.{field}, which contract {contract} promises to {consumers}. Bump the contract version, announce it per change_policy ({policy}), and keep the old field until consumers migrate (expand and contract).`
+- *Limits:* Needs a base ref and the producer's schema in the same repo (or vendored). Changes in meaning with the same name and type are invisible. A renamed field looks like a removal plus an addition unless the contract records `renamed_from`.
+
+**Recommendation:** A first (Phase 2: needs the domain assignment plus the contracts directory). C next, because it catches the "learns of a renamed column when the dashboard breaks" failure in the producer's own PR. B once the query corpus exists.
+
+## §3 — Process, Normalization and Layers
+
+### §3.1 — Capture history when the model must answer how state was reached `[MUST][ARCH]`
+
+**Applies to:** Go ✔ (a struct with a `Status` field, plus a sibling `*Event` struct or a versions struct) · SQL ✔ (state columns, event tables, history or versions tables, temporal triggers) · JSON ✔ (a schema with a state property, plus an event schema that `$ref`s it).
+**Checkability:** `declared` (whether history is needed), then `direct` (whether it is captured).
+
+The rule is conditional: a current-state attribute alone is fine for transactional use that only reads the latest state. So an entity with a state field is put in one of three classes, and only the first is checked:
+
+- **History required:** annotated `history=required`, or the state field is consumed downstream for life-cycle analysis. That means an entity with `layer ∈ {analytical, obt, feature}`, or a query in the analytics paths (`layers.analytical_query_paths`), reads the state field according to lineage (view definitions, compiled dbt `depends_on`).
+- **Latest only:** annotated `history=latest_only` (optionally with `reason=`). Never flagged.
+- **Undeclared, with no downstream use of the state field:** never flagged. `rules.3_1.ask_undeclared: true` turns on a `note` asking the team to choose.
+
+History can be captured in either form the rule names: an event entity, or temporal records.
+
+#### Design A — History-required contract (C + G, deterministic)
+
+- *Measure:* A state field is one whose name matches `(^|_)(status|state|stage|phase)$`, or one with an enum of three or more values that is updatable (it is a target in an `UpdateStmt`, or a JSON property that is not `readOnly`). The `UpdateStmt` test needs the query corpus, so in the MVP only the name pattern and the JSON `readOnly` test apply. For each such field on a *history required* entity, search for either form of history:
+  - **Event entity** *H*: it references the entity (FK or `$ref`); it is named `{entity}_(events|history|log|transitions|audit)` or annotated `history_of={entity}`; and it has who (`(actor|user|agent)_id`, or a `_by$` field), what (an event-type field, or the from/to state), and when (a field with `time=event`, or named `occurred_at`).
+  - **Temporal records:** a versions entity with `valid_from`/`valid_to` (or `txn_from`/`txn_to`) keyed by the entity's id; a `versioning()` trigger from the `temporal_tables` extension on the table; SQL:2011 `WITH SYSTEM VERSIONING` on dialects that support it; or a dbt snapshot (`snapshots/*.sql` with `{% snapshot %}`) whose `unique_key` is the entity's key.
+  - **External stream:** `history_in=<topic or schema>` naming an event schema that exists.
+- *Fails when:* A history-required entity has none of these forms, or its event entity lacks the who, what or when field. It also fails when the entity is annotated `history=latest_only` but lineage shows the state field consumed by an analytical layer: the declaration contradicts how the data is used.
+- *Suggestion:* `"{entity}.{field}" is used for life-cycle analysis by {consumers} but only its current state is stored. Add {entity}_events({entity}_id REFERENCES {entity}, event_type, actor_id, occurred_at TIMESTAMPTZ NOT NULL), or keep temporal records (a {entity}_versions table with valid_from/valid_to, or a dbt snapshot). If only the latest state matters, annotate history=latest_only and stop the downstream use. Missing fields in the existing history entity: {missing}.`
+- *Limits:* Downstream use is only seen through lineage that is in the repo; BI tools that read the table directly are invisible, so declaring `history=required` is the reliable path. Enums that are not workflow states (`currency`, `country`) are excluded by the updatable test. A dbt snapshot captures state at snapshot time, not every transition; it passes, because the rule accepts temporal records, but short-lived states between snapshots are lost.
+
+#### Design B — Life-cycle questions asked of current state (Q, deterministic)
+
+- *Measure:* In the query corpus, find queries that try to answer a history question from a current-state entity:
+  1. Time in stage: arithmetic between `now()`/`CURRENT_TIMESTAMP` and `updated_at` (or another single mutable timestamp) in a query that filters or groups by the state field.
+  2. Funnel or stall analysis: `GROUP BY` on the state field together with a time bucket (`date_trunc` on `updated_at`/`modified_at`).
+  3. Hand-rolled snapshots: an `InsertStmt ... SELECT` that copies the state field into another table together with `CURRENT_DATE`/`now()` (a homemade history).
+
+  For entities that are history-required and have an event entity, also run the paired-write check: an `UpdateStmt` that sets the state field must sit in the same Go function, or the same `.sql` query group, as an `InsertStmt` into *H*, or an `AFTER UPDATE OF {field}` trigger (`CreateTrigStmt.columns`) must exist.
+- *Fails when:* A query of kinds 1–3 reads an entity that has no history (it promotes the entity to history required: the life cycle's consumers now need it), or a state update on a history-required entity has no paired event insert and no trigger.
+- *Suggestion:* For kinds 1–3: `{file}:{line} measures {question} from {entity}.{field}, which keeps only the latest state, so the answer is wrong for any object that has moved on. Record transitions in {entity}_events and query those.` For an unpaired update: `UPDATE {entity} SET {field} at {pos} has no event record. Insert into {history} in the same transaction, or add a trigger AFTER UPDATE OF {field}.`
+- *Limits:* Only queries in the corpus are seen. ORM updates (`db.Model(&o).Update("status", ...)`) are covered through `orm.update_funcs`. An event insert in a helper called from another function is missed unless it is a direct call from the same function body.
+
+**Recommendation:** A first (MVP with annotations; the lineage trigger arrives with Phase 2). B in Phase 2: its kinds 1–3 are the strongest evidence that history has become necessary, which is exactly when the rule says to promote transitions to events.
+
+### §3.2 — Normalize OLTP unless there is a stated reason; separate competing workloads `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (structs mapped to OLTP tables; write paths; analytics packages that open database connections) · SQL ✔ · JSON ◐ (copies of another document's fields across schemas).
+**Checkability:** `direct` for duplication and update anomalies, `declared` for layer and for the stated reason.
+
+#### Design A — Copied attribute without a stated reason (G + S, deterministic)
+
+- *Measure:* Within entities with `layer=oltp` (or the default layer when unset), find each host entity that has an FK to another entity X and a non-key field that copies an X field: either named `{x_canonical}_{f}`, or named `{f}` where X has a field `{f}` of the same logical type. Count, for each X field, the host entities that copy it.
+- *Fails when:* A copy exists without `denormalized_for=<reason>`. The reason must be one of `access_pattern:<text>`, `latency_sla:<text>` or `other:<text>`, with at least three words of text, because the rule asks you to state the reason, not just tick a box. When two or more hosts copy the same field without a reason, they are reported as one finding that lists every copy. Severity stays at `warning`, because the rule is a SHOULD.
+- *Suggestion:* `{field} in {entities} copies {source_entity}.{source_field} (reachable via FK {fk}). Read it through the join, or state why it is denormalized, e.g. mml:"denormalized_for=latency_sla:fraud check must answer in 50 ms" or "access_pattern:order page is read 200x more than written".`
+- *Limits:* Values captured at transaction time are legitimate (§6.6): fields annotated `captured_at_transaction`, and price-like names on line-item entities, are exempt. Entities with `layer ∈ {event, analytical, obt, feature}` are exempt, because they are meant to be denormalized. The reason text is checked for presence and shape, not truth.
+
+#### Design B — Update-anomaly scanner (Q, deterministic)
+
+- *Measure:* In the query corpus and Go write paths, find one Go function, transaction (`BeginTx` … `Commit`), or `.sql` query group that issues `UpdateStmt`s setting the *same* source attribute (matched as in Design A) on two or more entities: `UPDATE orders SET customer_email = $1 …`, `UPDATE invoices SET customer_email = $1 …`. This is the shotgun-surgery cost of copying.
+- *Fails when:* Such a fan-out update exists and the copies carry no `denormalized_for` reason. When a reason is declared, the finding drops to `note` and lists the write paths that must stay in step.
+- *Suggestion:* `{func} updates {attr} in {n} tables ({entities}). Keep it in {source_entity} only and join to it, or declare denormalized_for on the copies and keep this function as the single place that updates them.`
+- *Limits:* Updates spread across separate functions, services or async jobs are missed. ORM updates are recognized only through `orm.update_funcs`.
+
+#### Design C — Repeated attribute group with no shared source (S, heuristic)
+
+- *Measure:* Across OLTP entities, collect groups of at least `normalize.min_group` (default 3) fields that share a prefix other than the entity's own name and have the same suffix set (`customer_email`, `customer_phone`, `customer_name`). Fingerprint each group by its suffix set and types.
+- *Fails when:* The same fingerprint appears in two or more OLTP entities, none of them has an FK to an entity holding those attributes, and no group is annotated `captured_at_transaction` or `denormalized_for`.
+- *Suggestion:* `Fields {suffixes} are repeated in {entities} with no shared source. Extract a {prefix} entity ({prefix}_id, {suffixes}) and reference it by {prefix}_id, or annotate the copy that is a deliberate snapshot (§6.6).`
+- *Limits:* A group inside a single entity is not flagged, because §1.6 allows an address held as columns on one entity. Groups whose suffixes differ slightly (`zip` versus `postal_code`) are missed unless synonyms are configured in `normalize.suffix_synonyms`.
+
+#### Design D — Analytics on the transactional database (Q + A, deterministic)
+
+- *Measure:* Static analysis cannot measure resource contention, so this design detects the configuration in which it happens. In the Go code corpus, resolve the DSN argument of every `sql.Open`/`pgxpool.New`/`pgx.Connect` call in packages listed in `layers.analytical_packages` to a config key. In repo artifacts, resolve the connection target of BI and dbt profiles (`profiles.yml` `host`/`dbname`, or the configured `bi.connection_files`). Compare each with the OLTP connection keys in `config.oltp_dsn_keys`.
+- *Fails when:* An analytical package, dbt target or BI connection resolves to the OLTP primary, and `workload.shared` has not been declared with a reason (for example `workload.shared: "single-tenant, < 1k rows/day; revisit at 10k"`).
+- *Suggestion:* `{consumer} runs analytical queries against the OLTP database ({dsn_key}). When analytics competes with transactions, move it to a separate database and model: a read replica for the short term, or CDC into {warehouse} with a star schema or wide tables for BI and a feature store for ML.`
+- *Limits:* Cannot tell whether contention is actually happening; the declared `workload.shared` reason is the escape hatch for small systems. A read replica looks the same as the primary unless its DSN key is listed separately. BI tools configured outside the repo are invisible.
+
+**Recommendation:** A (MVP). B in Phase 2: it shows the concrete cost the rule's ✗ example describes. D in Phase 2 with the artifact loaders. C catches copies that A misses because there is no FK to follow.
+
+### §3.3 — One Big Table only fed by a modeled upstream `[SHOULD][ARCH]`
+
+**Applies to:** Go ✘ · SQL ✔ (tables, views, dbt models) · JSON ◐ (wide denormalized event schemas).
+**Checkability:** `direct` with lineage.
+
+#### Design A — Lineage-depth check from query corpus (Q + G, deterministic)
+
+- *Measure:* Identify OBTs: entities whose name matches `^(obt|wide)_`, entities annotated `layer=obt`, or views and models with at least `obt.min_columns` (default 50) columns. For SQL views and `CreateTableAsStmt` bodies, parse the defining `SELECT` and resolve every `RangeVar` to an entity. For dbt models, read `depends_on.nodes` from `target/manifest.json`, because Jinja `{{ ref() }}` and `{{ source() }}` calls do not parse as SQL. Classify each input by its `layer` and `source`.
+- *Fails when:* Any input has `layer ∈ {external, oltp}` or `source ∈ {legacy, third_party}` (a raw source), rather than `core`. An input with no layer is reported as a separate `note` asking for one.
+- *Suggestion:* `OBT "{entity}" reads raw source(s) {sources} directly. Add a modeled core layer (stg_{src} → core_{src}) and build {entity} from it.`
+- *Limits:* Needs lineage in SQL or a compiled dbt manifest (CI must run `dbt compile` or `dbt parse` first). Materializations built in Go code are invisible.
+
+#### Design B — Layer contract on wide tables (C + S, deterministic)
+
+- *Measure:* For each entity with at least `obt.min_columns` columns, require `layer` to be set, `grain` to be declared, and an `upstream=[...]` list whose entities all exist in the IR with `layer=core`.
+- *Fails when:* A wide entity has no layer or grain, or its declared upstream is missing, lists unknown entities, or lists entities that are not core.
+- *Suggestion:* `Wide table "{entity}" ({n} cols) has no declared upstream/grain. Annotate layer=obt, grain=..., upstream=[core_*] — or reduce it to a modeled entity.`
+- *Limits:* Checks the declared upstream, not the real one; Design A verifies it against lineage. Wide tables below the column threshold are not checked unless named or annotated as OBTs.
+
+**Recommendation:** B is the MVP because it is cheap. A is the stronger check (Phase 2).
+
+### §3.4 — Master/reference data as a governed interface `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ (`validate:` tags and constructors) · SQL ✔ · JSON ✔ (`required`, `minimum`, `enum`).
+**Checkability:** `declared` (which entities are master data, with undeclared candidates inferred by M2) plus `direct`. Through M4, `direct` for whether invalid records are actually rejected.
+
+#### Design A — Write-time enforcement audit (S, deterministic)
+
+- *Measure:* For entities tagged `layer=reference` or `//mml:master`, check four things:
+  - Required fields are enforced: every field listed in `master.required_fields.{entity}` (or in the entity's `required=` annotation) is `NOT NULL`, JSON `required`, or a Go non-pointer field with `validate:"required"` (`github.com/go-playground/validator/v10`).
+  - Every quantity field (name matches `(_qty|_quantity|_weight|_length)$`) has a range check: `CHECK (x > 0)`, JSON `exclusiveMinimum: 0`, or `validate:"gt=0"`.
+  - Every unit field (`unit_of_measure`, `*_uom`) is constrained to canonical units by an enum, a `CHECK (x IN (...))`, or an FK to a units entity.
+  - Hierarchy fields are constrained: `level` by an enum or `CHECK`, and `parent_id` by an FK.
+- *Fails when:* Any of the four checks fails for any field.
+- *Suggestion:* `Master entity "{entity}": {field} is optional/unchecked. Add NOT NULL and CHECK ({check_suggestion}) so bad records are rejected at write time.`
+- *Limits:* Without `required_fields` or a `required=` annotation, only the quantity, unit and hierarchy checks run. A Go `validate` tag enforces at write time only if every write path calls the validator; Design B looks for paths that do not. Master data that was never declared would escape the check entirely, so M2 infers candidates. An undeclared entity is a candidate when it has FK or `$ref` fan-in from at least `master.min_fanin` (default 5) entities, no outbound FK to an `oltp` or `event` entity, and a name in `master.name_patterns` (`item|sku|product|location|unit|currency|supplier`). Each candidate is reported at `note`, with a suggestion to add `//mml:master` or `master=false`.
+
+#### Design B — Warn-not-block validator scan (Q, deterministic for known validators; heuristic otherwise)
+
+- *Measure:* In Go write paths for the entity (functions that call an insert or upsert into it), find validation branches whose failure path logs and continues: a branch with a `log.Warn`, `logger.Warn` or `slog.Warn` call and no `return`, `panic` or error assignment, followed on the control-flow graph (`golang.org/x/tools/go/cfg`) by the insert. A branch counts as a *validation* branch in two ways:
+  - **Deterministic:** its condition uses the result of a known validator: `(*validator.Validate).Struct`/`Var` from `go-playground/validator/v10`, a method named `Validate() error` on the entity type, or a function listed in `master.validators`.
+  - **Heuristic:** its condition is a variable named `valid`, `ok` or `isValid`, or an `err` of unknown origin. These report at `note` (M5) unless the entity is declared master data or Design C's test for it is failing.
+- *Fails when:* A deterministic validation branch warns and then reaches the insert. Heuristic branches are notes.
+- *Suggestion:* `{func} logs a validation failure for {entity} at {pos} and proceeds to insert. Return an error (block), or route to a quarantine table.`
+- *Limits:* Validators called indirectly (through an interface or a callback) are missed. A deliberate "accept and flag" path, such as writing to a quarantine table, needs a waiver. Writes from other languages or services are invisible; Design C covers them at the database.
+
+#### Design C — Rejection test for invalid records (A, deterministic)
+
+- *Measure:* For each declared master entity, `mixedmodellint scaffold reject {entity}` generates one negative data test per enforceable rule from Design A: a missing required field, a quantity ≤ 0, a unit outside the canonical set, and a parent that does not exist. Each test attempts the invalid `INSERT` inside a transaction that is rolled back, and it passes only if the database raises an error (SQLSTATE class `23`, integrity constraint violation). The tests carry `meta: {mml_rule: "§3.4", mml_entity, mml_case}` and their results are ingested with `check --results` (M4).
+- *Fails when:*
+  - an ingested rejection test shows the invalid record was accepted;
+  - a declared master entity has no generated tests;
+  - the tests exist but did not run (`mml/test-not-run`).
+- *Suggestion:* `Inserting {entity} with {case} was accepted in CI's database ({test}). Add {constraint} so the record is rejected, not warned about.`
+- *Limits:* Needs a CI database built from the migrations. Enforcement that lives only in application code is not exercised, because the test writes directly to the table. Application-only enforcement is reported as accepted, and the suggestion points to a database constraint. If the team enforces in the application on purpose, it waives the test with a reason and relies on Design B.
+
+**Recommendation:** A (MVP). B in Phase 2. B is the distinctive check for the "speed bumps vs gates" failure. C (Phase 2, M4) is the only design that proves records are *blocked*, not merely that a constraint is declared.
+
+**Residual limit:** writes through systems outside the repo and the CI database, such as vendor loaders or manual console edits, are not exercised. Whether the canonical units and hierarchy levels are the right ones is a business decision.
+
+### §3.5 — Don't alter legacy or third-party schemas you don't control; document them `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (structs mapping vendor tables, and runtime migrations such as GORM `AutoMigrate` on them) · SQL ✔ (migrations) · JSON ◐ (vendored schemas under `third_party/`).
+**Checkability:** `direct` once foreign sources are `declared`.
+
+A *foreign entity* has `source ∈ {legacy, third_party}`, lives in a SQL schema listed in `sources.foreign_schemas`, or is a JSON file under `sources.foreign_paths`. Hard-coded host and server names are a separate rule (§3.6).
+
+#### Design A — Foreign-schema mutation detector (H + S, deterministic)
+
+- *Measure:* Scan the migrations for `AlterTableStmt`, `DropStmt`, `RenameStmt`, `CreateTrigStmt` and `IndexStmt` whose target resolves to a foreign entity. In diff mode, also flag modified vendored JSON Schema files.
+- *Fails when:* Any DDL mutates a foreign entity.
+- *Suggestion:* `Migration {file} alters third-party table {entity}. Leave it untouched: create {own_schema}.{entity_name}_ext keyed by its id, or build what you need downstream in staging.`
+- *Limits:* Only declared or configured foreign entities are protected. Mutations made outside the repo, such as in the vendor's admin console, are invisible. Vendor-sanctioned extension points (custom-field tables) need a waiver with a reason.
+
+#### Design B — Foreign-source documentation (A, deterministic)
+
+- *Measure:* For each foreign source (a group of foreign entities that share a schema or vendored directory), look for its documentation: `sources.<name>.doc` in `mml.yaml` pointing to a Markdown file, or a dbt `sources.yml` entry with a `description` on the source and on each table read downstream. A Markdown doc must contain a "Representation" and a "Limits" (or "Quirks") heading, each with at least one non-empty line. If the vendored schema carries a version (a `$id` or `version` in JSON, a version comment in the DDL, or `sources.<name>.version` in config), the doc must record `reviewed_version:` equal to it.
+- *Fails when:* A foreign source that is read downstream has no doc, the doc lacks either heading, or `reviewed_version` differs from the vendored version.
+- *Suggestion:* `Third-party source {source} is modeled downstream but undocumented. Add {doc_path} with "Representation" (how {entities} encode {concepts}) and "Limits" (known quirks, nulls, codes), and record reviewed_version: {version}.`
+- *Limits:* Checks that the study was written down and kept current, not that it is accurate. Sources with no version marker are checked for presence only.
+
+#### Design C — Runtime alteration of foreign tables from code (Q, deterministic)
+
+- *Measure:* In the Go code corpus, find (1) GORM `AutoMigrate` calls whose argument type is a struct mapped to a foreign entity, (2) `Exec`/`ExecContext` calls whose constant-folded SQL parses to DDL (`AlterTableStmt`, `IndexStmt`, `CreateTrigStmt`) on a foreign entity, and (3) migration-library registrations (`goose`, `golang-migrate`, `atlas`) whose files target a foreign schema outside the migrations directory scanned by Design A.
+- *Fails when:* Any of the three targets a foreign entity.
+- *Suggestion:* `{file}:{line} alters {entity} at runtime via {call}. Remove {entity_struct} from AutoMigrate (map it read-only) and put any extra columns in {own_schema}.{entity_name}_ext.`
+- *Limits:* SQL built dynamically at runtime is missed. ORMs other than GORM need their migrate entry points listed in `orm.migrate_funcs`.
+
+**Recommendation:** A (MVP, cheap, catches the destructive case). B in Phase 2 with the artifact loaders; it covers the "study and document" half of the rule. C in Phase 2: GORM `AutoMigrate` on a vendor table is an easy accident to miss in review.
+
+### §3.6 — No hard-coded host, server or database names in transformations `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (SQL literals and DSN strings inside transformation packages) · SQL ✔ (views, transformation queries, dbt models) · JSON ✘ (JSON Schema holds no transformation logic; pipeline config in JSON is covered as an artifact by Design B).
+**Checkability:** `direct`.
+
+The rule names the smell but the source gives no remedy; "one named source definition per upstream" is a team convention, so the form of that definition is configurable: `sources.definition_kind: dbt_sources | mml_sources | stg_model`. Hard-coded *column* names, mentioned in the rule's rationale, are optional (`rules.3_6.check_columns`, off by default), because the rule itself names only servers, hosts and databases.
+
+#### Design A — Hard-coded upstream location scan (Q, deterministic)
+
+- *Measure:* Over every transformation in the query corpus (views, `.sql` transformations, compiled dbt models, and constant-folded SQL in Go packages listed in `layers.transformation_packages`), look for:
+  1. A `RangeVar` with a `catalogname` (database qualifier) naming an upstream system rather than the current database.
+  2. Four-part names (`server.db.schema.table`) or hostnames, which `pg_query` cannot parse. For files that fail to parse, apply the regexes in `sources.host_patterns` (defaults, applied in `FROM`/`JOIN` position: `\b[a-z0-9]+(-[a-z0-9]+)*-db-\d+\b`, which matches `prod-db-07`; `\b[a-z][a-z0-9]*(-[a-z0-9]+)+\.[a-z_]\w*\.[a-z_]\w*\b`, a hyphenated host followed by schema and table; and `\b\w+\.\w+\.\w+\.\w+\b`, a four-part name) to the raw text.
+  3. Connection strings in SQL: a `FuncCall` to `dblink`, `dblink_connect` or `dblink_exec` whose `A_Const` argument contains `host=`, `dbname=` or `server=`; or a `CreateForeignServerStmt` (or `AlterForeignServerStmt`) whose `options` list has a `DefElem` named `host` or `dbname`, outside the source-definition files.
+  4. DSN literals in Go transformation packages: string constants matching `^(postgres(ql)?|mysql|sqlserver|snowflake)://`, or containing `host=`.
+- *Fails when:* Any of the four appears outside the file(s) that hold the source definitions.
+- *Suggestion:* `{file}:{line} hard-codes {location} ({kind}). Reference the upstream through its named source definition, e.g. {{ source("{source}", "{table}") }} or stg_{table}, and record {location} only in {definition_file}.`
+- *Limits:* SQL assembled at runtime from config values is fine and not flagged; SQL assembled from literal fragments is only seen when constant folding resolves it. The four-part-name regex can match dotted identifiers in comments, so comments are stripped first (using `pg_query.Scan` where the file scans).
+
+#### Design B — One source definition per upstream (A + G, deterministic)
+
+- *Measure:* Build the set of upstream systems from the source definitions: dbt `sources.yml` entries (`database`, `schema`), `mml.yaml` `sources:` entries (`host`, `database`), or `stg_*` models per `sources.definition_kind`. Count the definitions per upstream system, keyed by host plus database (or dbt `database` plus `schema`). Then, from the compiled dbt manifest (`target/manifest.json`), check each model: a model whose `raw_code` (`raw_sql` before dbt 1.3) names a schema-qualified table of an upstream system, instead of using `{{ source() }}` or `{{ ref() }}` to a staging model, bypasses the definition. A model's `depends_on` should show a `source.` node.
+- *Fails when:* An upstream system has two or more definitions, or a transformation reaches an upstream table without going through its definition.
+- *Suggestion:* `Upstream {system} is defined {n} times ({files}). Keep one definition in {preferred_file} and point every transformation at it.` For a bypass: `Model {model} reads {schema}.{table} directly; replace it with {{ source("{source}", "{table}") }}.`
+- *Limits:* Without dbt or an `mml.yaml` `sources:` block there is nothing to count, so the design emits a setup note. Two definitions for the same host under different DNS aliases look like two systems unless `sources.host_aliases` is configured.
+
+**Recommendation:** A (Phase 2, query corpus); it finds the exact ✗ example. B in Phase 2 with the dbt manifest, to stop a second definition growing back.
+
+## §4 — Identity and Entity Boundaries
+
+### §4.1 — Stable unique identifier for every entity `[MUST][CODE]`
+
+**Applies to:** Go ✔ (a `primaryKey`/`db:"id"`/`//mml:pk` field; for `json`-only structs, a field the linked SQL entity treats as its key) · SQL ✔ (a `Constraint` node with `contype = CONSTR_PRIMARY`, either in `ColumnDef.constraints`, in `CreateStmt.tableElts`, or added by an `AlterTableStmt` `AT_AddConstraint` command) · JSON ✔ (a `required` property that is the key: `x-mml-key`, or named `id`/`<entity>_id` with `format: uuid` or `type: integer`)
+**Checkability:** `direct`
+
+#### Design A — Key presence and key-type stability (S, deterministic)
+
+- *Measure:* For each entity, find `PrimaryKey`. In Go, use the tag (`gorm:"primaryKey"`, `bun:",pk"`, `db:"id"` plus the struct naming convention) or `//mml:pk`. In SQL, use the PK constraint. In JSON, use `x-mml-key`, else a property matching `^(id|{canonical}_id)$` that is in `required`. Then classify each key column as *unstable* in either of two cases. It is *mutable-natural* when the name matches `(?i)(^|_)(e?mail|phone|mobile|msisdn|name|first_name|last_name|full_name|username|handle|ssn|address)$`, or the JSON `format` is `email`/`idn-email`/`hostname`. It is *time-identified* when the name matches `(?i)(^|_)(start(ed)?_at|created_at|timestamp)$` or the type is `date`/`timestamp*` (§4.1's `pipeline_runs` identified by start time; two runs can start at the same instant, and a re-run changes it).
+- *Fails when:* `PrimaryKey` is empty (SQL tables, and Go structs/JSON schemas with `layer` ≠ `external`), OR any PK column is classified *unstable*.
+- *Suggestion:* No key: `"{entity} has no primary key. Add a system-generated identifier, for example {canonical}_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY (SQL), {Canonical}ID uuid.UUID \`db:\"{canonical}_id\"\` (Go), or a required \"{canonical}_id\": {\"type\":\"string\",\"format\":\"uuid\"} (JSON)."` Unstable key: `"{entity}.{field} is used as the primary key but its value can change or repeat ({reason}). Add a surrogate {canonical}_id PRIMARY KEY and keep {field} as UNIQUE (or as a plain indexed attribute if it can repeat)."` A SARIF `fix` with the DDL fragment is attached.
+- *Limits:* Name lists are configurable (`rules.4_1.mutable_key_patterns`). Value objects (`//mml:value-object`, JSON `$defs` that are only ever embedded) are exempt. Count only Go structs that carry persistence tags. A purely in-memory DTO is exempt. Time-series tables whose key is `(series_id, ts)` are composite and handled by §4.4, so the time-identified class fires only when a time column is the *whole* key or the key together with non-identifying columns.
+
+#### Design B — Identifier continuity across forms (G, deterministic)
+
+- *Measure:* For each *logical entity* (the cross-source link), collect the key field name of every member: the SQL table PK, the Go struct key, and the JSON Schema key. Also check every event, document, or metadata schema whose `layer` is `event` or `reference`, or whose name matches `(?i)(run|event|log|document|file|image)s?$`. Each needs a field that is `required` (JSON) or `NOT NULL` (SQL) and matches a key pattern.
+- *Fails when:* A linked member has no field that maps to the logical key (after case and plural folding), or the members disagree on key type (for example `BIGINT` in SQL but `string` without `format: uuid`/`pattern: ^[0-9]+$` in JSON).
+- *Suggestion:* `"{member} represents logical entity {logical} but has no identifier matching {key} ({key_type}) found in {other_member}. Add {key} as a required field of type {key_type}."`
+- *Limits:* Needs good linking (`x-mml-entity`). Overlaps §4.5, where Design B reports only the key-type mismatch and §4.5 reports missing propagation into referencing forms.
+
+#### Design C — Key mutation in the write path (Q, heuristic)
+
+- *Measure:* Scan the query corpus for `UpdateStmt` whose `targetList` has a `ResTarget` naming a PK column, and the code corpus for GORM `.Update("{pk}", ...)`/`.Updates(map{"{pk}": ...})`, or (through `go/ssa`) a store to the PK field of a value that was loaded from the database and is then passed to `.Save()`/`.Updates()`.
+- *Fails when:* Any write assigns a PK column.
+- *Suggestion:* `"{file}:{line} updates primary key {entity}.{pk}. Identifiers must stay fixed for the life of the instance; move the changing value to a non-key column."`
+- *Limits:* Can only see queries in the corpus. Dynamic SQL is missed. `ON UPDATE CASCADE` on inbound FKs is reported as supporting evidence that key changes are expected.
+
+**Recommendation:** Build A first (MVP; it covers both examples in the rule). Add C once the query corpus exists. It is the only design that catches a "stable-looking" key that is actually rewritten.
+
+### §4.2 — Identity resolution with a named owner `[MUST][ARCH]`
+
+**Applies to:** Go ◐ (structs in a `staging`/`core` package that combine sources) · SQL ✔ (tables that hold entities fed by more than one source) · JSON ◐ (schemas carrying `source_system`)
+**Checkability:** `declared` (owner), `direct` for the resolution structure (M2), and data results for duplicates (M4). Only the owner's agreement stays `proxy`.
+
+#### Design A — Multi-source entity requires a resolution contract (C, deterministic)
+
+- *Measure:* An entity is *multi-source* when (a) it has ≥2 fields matching `(?i)^(legacy_|src_|source_)?({source_systems})_(id|key)$`, where `{source_systems}` comes from `rules.4_2.source_systems` (default `crm|erp|stripe|salesforce|hubspot|netsuite|shopify|zendesk`), or (b) it has a `source_system` column, or (c) the sidecar lists ≥2 `sources`. For multi-source entities, require the annotations `resolution` (the path to the resolution model or query, or a table name) and `resolution_owner` (a team that appears in CODEOWNERS or `mml.yaml owners:`).
+  Then cross-check the declaration against structure (M2). The `resolution` target must be an entity, or a model whose output columns can be resolved, that contains `{canonical}_id`, a source-system column, and a source-ID column. Every source-ID field found in (a) must be covered: the mapping's `source_system` CHECK/enum (or the `sources` list) must include that system. The golden record (the entity itself) must be referenced through `{canonical}_id` by the mapping. The declaration carries `fp=` (M1) for the entity's shape.
+- *Fails when:* Either annotation is missing, or the `resolution` target does not resolve. It also fails when the target lacks the three mapping columns, when a source system in the entity is absent from the mapping's allowed systems (for example `zendesk_id` is present but the map only allows `crm|erp`), when the owner is unknown, or when `fp` is stale (`mml/stale-declaration`).
+- *Suggestion:* `"{entity} merges records from {sources} but declares no identity resolution. Add @resolution: <model that maps source IDs to {canonical}_id> and @resolution_owner: <team> (for example Sales Ops). See §4.3 for the mapping-table shape."`
+- *Limits:* An entity fed by several systems that do not expose their IDs as columns is missed unless the sidecar declares `sources`. The owner check only proves that a team is named and exists, not that the team agreed. The M2 coverage check reads the mapping's allowed values only when they are constrained (CHECK, enum, FK to a `source_systems` table). An unconstrained `source_system TEXT` passes coverage with a note that recommends constraining it (§5.4).
+
+#### Design B — Golden-record graph check (G, deterministic)
+
+- *Measure:* In the FK graph, find every logical entity with ≥2 inbound "source" entities (entities with `layer: staging` or `source: legacy|third_party` that reference or feed it, through FK or dbt `ref()` lineage when available). Verify that an entity exists between them shaped like `{canonical}_id_map(canonical_id, source_system, source_id)` or one annotated `@role: identity_map`.
+- *Fails when:* There are multiple sources and no identity-map node exists on the path.
+- *Suggestion:* `"{entity} is fed by {n} sources ({list}) with no identity-resolution step. Insert {canonical}_id_map({canonical}_id, source_system, source_id) and resolve all source IDs through it."`
+- *Limits:* Needs lineage. Without dbt or a query corpus, it falls back to the FK graph only, which rarely shows "feeds" edges.
+
+#### Design C — Duplicate-candidate uniqueness (S, heuristic)
+
+- *Measure:* For multi-source entities (as defined in A), check whether a `UNIQUE` constraint or index exists on a normalized natural-key column (an `IndexStmt` whose `indexParams` contain an expression such as `lower(email)`, or a column named `normalized_*`), or whether a `(source_system, source_id)` unique exists.
+- *Fails when:* Neither exists.
+- *Suggestion:* `"{entity} has no uniqueness on (source_system, source_id) or on a normalized natural key, so the same {canonical} can be inserted twice. Add UNIQUE (source_system, source_id)."`
+- *Limits:* Says nothing about the ownership half of the rule. Fuzzy matches ("ACME Corp" vs "ACME Corporation, LLC") cannot be prevented by any constraint; this only proves an exact-match guard exists.
+
+#### Design D — Duplicate-candidate data test with result ingestion (A, deterministic)
+
+- *Measure:* `mixedmodellint scaffold dupes {entity}` generates a data test with `meta: {mml_rule: "§4.2", mml_entity: "{entity}"}`. The test groups the golden record by each normalized natural key the entity carries (`lower(trim(email))`, a phone number with non-digits stripped, a `legal_name` with suffixes removed per `rules.4_2.name_suffixes`, default `inc|llc|ltd|corp|corporation|co`). It returns the groups where ≥2 distinct `{canonical}_id`s share a key. `check --results` ingests the outcome (M4). A generated test that is missing from the results is `mml/test-not-run`.
+- *Fails when:* The test reports ≥1 group. The finding carries the count and up to five example key values from the test output. It also fails when a multi-source entity (as in A) has no such test.
+- *Suggestion:* `"{n} {canonical} keys map to more than one {canonical}_id (for example {examples}). Resolve these duplicates in {resolution} and route new matches through {resolution_owner}'s match rules (§4.2). The rule's ✗ case is 'ACME Corp' and 'ACME Corporation, LLC' counted as two customers."`
+- *Limits:* Catches only duplicates that the configured normalizations make equal. Fuzzy matches beyond them, such as typos and transliterations, stay invisible. Needs a CI step that runs data tests against representative data.
+
+**Recommendation:** A (MVP, inline annotations), because the ownership requirement is only checkable when declared. Its M2 cross-check turns the declaration into a structural test. Add D in Phase 2, because it is the only design that measures actual duplicates, and B once lineage is loaded.
+
+**Residual limit:** whether the named owner agreed to own the match rules, and duplicates that no deterministic normalization makes equal.
+
+### §4.3 — Mapping table before identifier refactor `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (renamed key fields) · SQL ✔ (migrations) · JSON ✔ (renamed required ID properties)
+**Checkability:** `direct`, against the committed schema lock (M3). `--base` is an optional second source.
+
+#### Design A — Key-rename detector against the schema lock (H, deterministic)
+
+- *Measure:* Compare the current IR with `mml.lock.json` (M3), or with the base IR when `--base` is given. For each entity, detect:
+  - (a) a PK or FK column renamed. This shows up as a `RenameStmt` with `renameType = OBJECT_COLUMN` in a migration file newer than the lock, as a Go tag change on a key field, or as a key or ref field removed and another added with the same `LogicalType` and the same ref target or inbound refs.
+  - (b) an `UpdateStmt` in a migration file not yet reflected in the lock that assigns a key or ref column.
+
+  Count how many entities share the same old→new rename.
+- *Fails when:* Any key rename or in-place key rewrite occurs, and the current IR does not add an entity shaped like a mapping table (columns ⊇ {new_id, source_system|old_id}, or `@role: identity_map`). The lock catches renames that slip past diff mode, such as squashed migrations and Go-only tag edits.
+- *Suggestion:* `"This change renames/rewrites identifier {old} → {new} on {entities} ({n} entities, {k} inbound references). Introduce {canonical}_id_map({new}, source_system, source_id) and migrate consumers to it before changing identifiers in place (§4.3). Then run mixedmodellint lock to record the new shape."`
+- *Limits:* A rename done as drop plus add, with a different type or different refs, is reported with lower confidence. A rename inside one table that nothing references is low risk. The finding lists the inbound-reference count so reviewers can judge. If the lock is updated in the same PR as the rename, the lock diff hides the old name, so A also reads the lock file at `--base` when that is available.
+
+#### Design B — Parallel-identifier smell, two-signal (S+L, heuristic)
+
+- *Measure:* Two independent signals (M5):
+  - (L) key-like fields with different stems for one canonical entity: `client_id` in one table and `customer_id` in another, whose canonicals link through `synonyms` in `glossary.yaml` or explicit `@entity` links.
+  - (S) both fields are FKs to the same target entity, or to two members of one logical entity, with identical `LogicalType`.
+- *Fails when:* Both signals agree, ≥2 distinct identifier stems refer to one logical entity, and no mapping table exists. The lexical signal alone reports at `note`.
+- *Suggestion:* `"{entity} is referenced as {stems} in {tables}. Add a mapping table {canonical}_id_map instead of renaming {stem} in place (§4.3)."`
+- *Limits:* Depends on synonyms for (L). Without a glossary, only explicit `@entity` links are used. Parallel stems with no FK (unenforced warehouses) stay at note.
+
+**Recommendation:** A. With the lock (M3) it moves from Phase 3 to the MVP and detects exactly the risky event without git history. B is a Phase 2 advisory.
+
+**Residual limit:** consumers outside the repository (BI tools, partner feeds) that break on the rename are invisible, so the inbound-reference count is a lower bound.
+
+### §4.4 — Surrogate keys, natural keys indexed, no composite natural PK `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (composite `primaryKey` tags; `gorm:"index"`/`uniqueIndex` tags) · SQL ✔ · JSON ◐ (`x-mml-key` arrays; no index concept)
+**Checkability:** `direct`
+
+#### Design A — Primary-key composition classifier (S, deterministic)
+
+- *Measure:* For each PK, classify each column: *surrogate* (an identity column, `serial`/`bigserial`, `uuid` with a default `gen_random_uuid()`/`uuid_generate_v*`, Go `uuid.UUID`/`int64` named `{canonical}_id`, JSON `format: uuid`), *foreign* (it is also an FK), or *natural* (anything else). For composite PKs where all columns are *foreign*, treat the entity as a junction (§6.1) and pass.
+- *Fails when:* PK has ≥2 columns and ≥1 is *natural* (`PRIMARY KEY (first_name, last_name, birth_date)`), OR the PK is a single *natural* column on an entity flagged multi-source (§4.2-A).
+- *Suggestion:* `"{entity} uses composite natural key ({cols}) as primary key. Add {canonical}_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, and keep ({cols}) as an index for lookup."`
+- *Limits:* Fact tables with a degenerate composite key need `//mml:waive §4.4`. Junction tables with an extra natural column (`valid_from`) are allowed through `rules.4_4.allowed_pk_suffix: [valid_from, version]`. The Go classification relies on naming, because Go types cannot show whether the database generates the value.
+
+#### Design B — Natural/legacy IDs must be indexed attributes (S, deterministic)
+
+- *Measure:* For entities with a surrogate PK, find columns matching `(?i)^(legacy_\w+_id|\w+_(external|source|erp|crm)_id|(erp|crm)_id|email|sku|isbn|ein|vat_id|tax_id)$` or annotated `@natural_key`. Check that each one is the leading column of some index (`IndexStmt.indexParams[0]`), unique constraint, or Go `gorm:"index"`/`gorm:"uniqueIndex"`/`bun:",unique"` tag.
+- *Fails when:* A natural or legacy ID column is not indexed, OR a natural key that existed in the base IR was dropped (diff mode only).
+- *Suggestion:* `"{entity}.{col} looks like a natural/legacy identifier but has no index. Add CREATE UNIQUE INDEX ON {entity} ({col}) (or a non-unique index if duplicates are expected)."`
+- *Limits:* JSON Schema has no index concept, so JSON-only entities are checked only through their linked SQL or Go member. Go structs without GORM/bun index tags are checked through the linked SQL member.
+
+#### Design C — FK fan-out cost (G, deterministic)
+
+- *Measure:* For each composite PK, count the inbound FKs. Each one must repeat all PK columns.
+- *Fails when:* Composite natural PK with ≥1 inbound FK.
+- *Suggestion:* `"{n} tables ({list}) carry the {k}-column key of {entity}. A surrogate key would reduce each to one column."`
+- *Limits:* Supporting evidence. It boosts A's severity instead of being a separate finding.
+
+**Recommendation:** A + B together (both MVP, structural). C attaches its counts to A's finding.
+
+### §4.5 — Same identifier carried through every form `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ (event and DTO structs) · SQL ✔ · JSON ✔ (event, document, and metadata schemas)
+**Checkability:** `direct` (after linking)
+
+#### Design A — Reference-by-display-attribute detector (L+S, deterministic)
+
+- *Measure:* In every entity, find fields whose name is `{other_canonical}_(name|display_name|filename|title|email|handle|username)` or `(reviewer|author|uploader|owner)_(name|email)`. Check whether a sibling `{other_canonical}_id` or `(reviewer|author|...)_id` exists.
+- *Fails when:* A display-attribute reference exists without the ID sibling.
+- *Suggestion:* `"{entity}.{field} identifies a {other} by a changeable display value. Add {other}_id ({key_type}) referencing {other_entity} and keep {field} only as a denormalized label."`
+- *Limits:* Role prefixes (`reviewer` → `customer`) need `rules.4_5.role_map` or `@refers: customer`. An entity whose own key is a filename ("images keyed by upload filename") is reported by §4.7-A, not here.
+
+#### Design B — Logical-key propagation graph (G, deterministic)
+
+- *Measure:* For each logical entity E with key K, find every entity (across all three sources) that names E, through an inferred ref (field name stem = E's canonical), a `$ref`, or `@refers`. It is a *referencing form* when its `layer` is `event`, `reference`, or `unstructured`, or its name matches `(event|review|image|document|file|chunk)s?`. Check that it holds a field equal to K (name and type).
+- *Fails when:* A referencing form refers to E without K.
+- *Suggestion:* `"{entity} ({kind}) carries {other} data but not its identifier {K}. Add {K} so it can be joined with {members}. If the form already uses a different identifier, bridge it with a mapping table (§4.3) instead of rewriting it."`
+- *Limits:* Needs entity-level role naming. File and image metadata often live outside schemas.
+
+**Recommendation:** A (MVP, catches the rule's ✗ example directly). Add B once cross-source linking is reliable.
+
+### §4.6 — Derived-entity key = source ID + location `[MUST][CODE]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔ (detection, segment, and chunk schemas)
+**Checkability:** `direct` once triggered. The trigger is exact through `@derived_from`, or two-signal (M5).
+
+#### Design A — Derived-entity shape check (S+L, heuristic trigger)
+
+- *Measure:* An entity is *derived-from-source* when it is annotated `@derived_from: <entity>` (exact), or when two independent signals agree (M5):
+  - (L) its name matches `(?i)(detection|segment|chunk|span|frame|annotation|transcript_line|bounding_box|excerpt|passage)s?$`.
+  - (S) it has an FK, or a `*_filename|*_path|*_url` field, that points at a file entity (`@role: file`, `layer: unstructured`, or the §4.7/§9.4 file-entity shape), **and** it has at least one field from the location set below.
+
+  A single signal reports a `note` asking for `@derived_from`. Two signals trigger the full check. The entity must have (1) a field referencing the source by ID (`{source}_id`, not `*_filename|*_path|*_url`), (2) location fields from a configured set: temporal `(ts|time|offset)_(start|end)`/`start_ms`/`end_ms`, spatial `bbox|x|y|width|height|polygon`, textual `(char|byte|token)_(start|end|offset)|page|line`, and ordinal `chunk_index|sequence`, and (3) a PK or UNIQUE constraint that includes the source ID and the location fields.
+- *Fails when:* Any of (1)–(3) is missing, or the source is referenced by filename.
+- *Suggestion:* `"{entity} is derived from {source} but is keyed by {current_key}. Identify each instance by ({source}_id, {location_fields}), for example detections(video_id, ts_start, ts_end, bbox, label), with UNIQUE ({source}_id, {location_fields})."`
+- *Limits:* The name lexicon is English-only, but the structural signal is not, so a non-English name still gets a note through (S) alone. A surrogate `detection_id` PK is fine as long as (3) holds as a separate UNIQUE constraint. The rule's ✗ `detections(video_filename, label)` triggers on both signals (the name, plus a filename pointing at a file entity), so it fails even though it has no location fields: a missing (2) is then itself the violation.
+
+#### Design B — Location-in-key contract (C, deterministic)
+
+- *Measure:* Require that every entity with an FK to an entity of `layer: unstructured` (or with `@role: file`) declares `@location: [fields...]`. Check that those fields exist and appear in the PK or a UNIQUE constraint together with the FK.
+- *Fails when:* `@location` is missing, references fields that do not exist, or is not part of a unique key.
+- *Suggestion:* `"{entity} references unstructured source {source}. Declare @location: [...] naming the fields that locate the instance inside the source, and add UNIQUE ({fk}, ...location)."`
+- *Limits:* Needs `layer` on file entities. Entities that merely *describe* a whole file (tags, owners) also reference it; they declare `@location: whole_file` to opt out.
+
+**Recommendation:** A for MVP. B makes the trigger exact for teams that tag their file entities.
+
+**Residual limit:** a derived entity that matches no name and references its source by an untyped, unrecognized field (for example `src TEXT`) is not found until someone annotates it.
+
+### §4.7 — File entities: UUID identity, hash for versions `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔
+**Checkability:** `direct`
+
+#### Design A — Content-derived key detector (S+L, deterministic)
+
+- *Measure:* An entity is a *file entity* when it has a URI or path field (`(s3_|gcs_|object_|storage_)?(uri|url|path|key)`, JSON `format: uri`) together with a mime, size, or content field, or when it is annotated `@role: file`. Flag a PK column (or JSON `x-mml-key`) of any entity when its name matches `(?i)(^|_)(sha(1|256|512)?|md5|hash|digest|checksum|etag)($|_)`, or its type is `CHAR(32|40|64)` with a hex `CHECK`/JSON `pattern: ^[0-9a-f]{64}$`, or `bytea` with `CHECK (octet_length(col) IN (16, 20, 32, 64))`. On file entities, also flag a PK that is a filename or path, and a PK that is not `uuid`/`format: uuid`.
+- *Fails when:* A hash-typed PK exists, or a file entity's PK is a filename, path, or non-UUID value.
+- *Suggestion:* `"{entity} is keyed by {col} ({reason}). Editing a file changes its hash and renaming it changes its path, which breaks references. Use {canonical}_id UUID PRIMARY KEY DEFAULT gen_random_uuid() and keep {col} as a non-key attribute, for example content_sha256 CHAR(64) (or as the key of a {canonical}_version table)."` This mirrors the rule's ✗ `images(sha256 CHAR(64) PRIMARY KEY, ...)` → ✓ `images(image_id UUID PRIMARY KEY, content_sha256 CHAR(64), ...)`.
+- *Limits:* Content-addressed blob stores (`@role: blob_store`) are waived on purpose. `BIGINT` identity keys also satisfy "system-generated"; allow them through `rules.4_7.allow_identity: true`.
+
+#### Design B — References that point at a hash (G, deterministic)
+
+- *Measure:* In the reference graph, find every edge whose target column is a hash-like column (same lexicon as A): an FK `REFERENCES images(content_sha256)`, a Go field `ImageSHA256` linked to the hash column, or a JSON property with the hash pattern whose name stem equals a file entity's canonical name. Count the inbound edges per target.
+- *Fails when:* Any entity references a file entity through its hash rather than its stable identifier.
+- *Suggestion:* `"{n} entities ({list}) reference {file_entity} by {hash_col}. Each edit to the file will orphan these references. Reference {file_entity}.{id_col} instead, and keep {hash_col} only to pin a specific version where that is the intent (@role: version)."`
+- *Limits:* A reference that deliberately pins one version (an audit log of exactly which bytes were reviewed) is correct; annotate it `@role: version`. Needs linking to see JSON-side references.
+
+#### Design C — Key computed from content in the write path (Q, deterministic)
+
+- *Measure:* In the code corpus, use `go/ssa` data flow from `crypto/sha256.Sum256`, `crypto/md5.Sum`, `hash.Hash.Sum`, and `hex.EncodeToString` results into the PK field of a file-entity struct before an insert call (`db.Create`, `sqlx.NamedExec`, a `pgx` `Exec` with the struct's fields). In the query corpus, find an `InsertStmt` whose PK column value is a `FuncCall` to `digest`, `sha256`, `md5`, or `encode(sha256(...), 'hex')`.
+- *Fails when:* A hash of the content flows into a file entity's key at write time.
+- *Suggestion:* `"{file}:{line} sets {entity}.{pk} from {hash_func}(content). Generate the key with uuid.New() / gen_random_uuid() and store {hash_func} output in content_sha256 CHAR(64)."`
+- *Limits:* Needs the code or query corpus. Data flow through interfaces or reflection-based ORMs is missed.
+
+**Recommendation:** A (MVP, narrow and exact). Add B when the reference graph is built, since it shows how much will break. C (Phase 2) catches hash keys hidden behind a generic `id` column name.
+
+### §4.8 — Split God entities `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔ (object property counts)
+**Checkability:** `direct` (size); `direct` for cohesion when two signals agree (M5), otherwise a heuristic note
+
+The rule has two independent triggers. An entity should be split if it cannot be described in one breath without "and" (Designs B and C), **or** if it has at least 30 attributes, at least three of which apply only to a subset of rows (Design A). The source describes the God Entity symptom as 30–40 attributes; the rule sets the floor at 30.
+
+#### Design A — Width and sparse-subset metric (S, deterministic)
+
+- *Measure:* `n` = number of fields excluding audit and system columns (`created_at|updated_at|_loaded_at|deleted_at`). `sparse` = count of nullable, non-key fields whose name prefix (token before the first `_`) or Go embedded struct is shared by ≥2 other nullable fields but by no non-nullable field. These are the attribute groups that "apply only to a subset of rows". Also count each column tied to a discriminator by a CHECK constraint of the form `(type = 'x') = (col IS NOT NULL)`.
+- *Fails when:* `n ≥ rules.4_8.min_attributes` (default 30, the rule's floor) AND `sparse ≥ 3`. Both conditions are required: a wide entity whose attributes all apply to every row passes, and so does a narrow entity with sparse groups (those are §5.3 and §4.10 territory). Report as a note when `n ≥ 30` and `sparse` is 1 or 2, because the subset-only count is a heuristic and may be under-counted.
+- *Suggestion:* `"{entity} has {n} attributes, of which {sparse} ({list}) appear to apply only to a subset of rows. Move {group} to {suggested_entity} keyed by {pk}, or split by {discriminator} into subtype tables."` Here `{suggested_entity}` = `{entity}_{prefix}`.
+- *Limits:* Wide analytical OBTs (`layer: obt|feature`) are exempt by default (§3.3 allows them). Sparse columns without a shared prefix are not grouped and are missed, so `sparse` is a lower bound. Raising `min_attributes` above 30 makes the check laxer than the rule; the linter reports that config as an `mml/config-weaker-than-rule` note.
+
+#### Design B — Foreign-attribute cohesion, two-signal (L+G, heuristic)
+
+- *Measure:* Two independent signals per field (M5):
+  - (L) Tokenize each field name. The field's leading token(s) equal the canonical name of **another** entity in the catalog (`customer_shoe_size` → `customer`, `warehouse_manager_last_name` → `warehouse`), it is not an FK (`*_id`), and the entity has no `@denormalized_from` annotation.
+  - (G) A structural co-reference, meaning either of:
+    - the entity has an FK path (direct or one hop) to that other entity, so the field is transitively dependent on the FK, not on this entity's key;
+    - after the prefix is stripped, the other entity has a field with the same stem and type (`customer_shoe_size` ↔ `customer.shoe_size`), so the value is a copy.
+
+  Group foreign fields by the foreign entity. Separately, ≥3 non-key fields that share a leading token which is neither this entity's name nor any catalog entity form an *unnamed foreign group* (`marketing_campaign_budget`, `marketing_campaign_start`, `marketing_campaign_owner`).
+- *Fails when:* At least one foreign attribute has both signals. Raise to warning when ≥3 foreign entities are represented ("cannot be described without 'and'"). A field with (L) only, or an unnamed foreign group, reports a `note` that names the missing entity.
+- *Suggestion:* `"{entity}.{field} describes {other} rather than {entity}. Move it to {other} (which exists in {other_pos}) and reference it through {other}_id."`
+- *Limits:* Legitimate snapshotted values (`customer_name_at_order`) need the `_at_<event>` suffix or the annotation. This overlaps §3.2 denormalization. A foreign attribute whose entity does not exist yet is only a note, through the unnamed-group signal, and a single such field (one `campaign_budget`) is not reported. The rule's ✗ example fails on `customer_shoe_size` (both signals when `orders.customer_id` exists). `warehouse_manager_last_name` passes both signals when `orders` references `warehouse`.
+
+#### Design C — Single-breath definition (C+L, deterministic)
+
+- *Measure:* Require an entity `definition` (doc comment, `COMMENT ON TABLE`, JSON `description`). Tokenize the first sentence. No part-of-speech tagging is used: the check only counts coordinating conjunctions `\b(and|as well as|plus|along with)\b` that are outside quoted terms and parentheses and that join two entity names (or their synonyms) from the catalog.
+- *Fails when:* The first sentence of the definition contains such a conjunction. An entity with no definition cannot be evaluated here. It gets a `note` that points to §2.5, the rule that requires the definition, and is not a §4.8 failure.
+- *Suggestion:* `"{entity}'s definition joins {a} and {b}. This suggests two concepts. Split them or rewrite the definition as one concept."`
+- *Limits:* Proxy, and easy to work around. Use it only as a prompt for a human. A legitimate relationship entity ("an enrollment of a student in a course") passes because "in" is not a conjunction, but "students and courses they take" fails.
+
+**Recommendation:** B first. It matches the rule's ✗ example and gives a specific move target, and M5 keeps lexical coincidences at note. Add A as the threshold rule. C is optional.
+
+**Residual limit:** the "one breath without 'and'" judgment itself. B and C detect structural and textual symptoms of a mixed concept, but not a mixed concept whose attributes carry neutral names.
+
+### §4.9 — Explain or mark for removal: entities and junction tables nobody can explain `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ · SQL ✔ · JSON ◐
+**Checkability:** `declared` (meaning), with `direct` consistency (M2) and freshness (M1), plus `direct` usage evidence from the query corpus. Only whether the experts were consulted stays `proxy`.
+
+The rule no longer says "remove". An unexplained entity must either get a documented business meaning, or be treated as a candidate for removal. The linter accepts either outcome: a definition, or an explicit `@removal_candidate: <ticket or date>` marker. It fails only when neither is present.
+
+#### Design A — Undocumented junction detector (S+C, deterministic)
+
+- *Measure:* A *junction* = an entity whose non-audit fields are ≥2 FKs plus ≤1 other attribute, or whose name matches `(?i)(_xref|_map|_link|_rel|_join|_assoc|_bridge)$`. Require a definition with at least 6 words that does not merely restate the name. A definition is *trivial* when its normalized Levenshtein similarity to the de-tokenized name ("customer product xref") is ≥ 0.7. Then two structural checks:
+  - (M2) the definition must name, by canonical name or glossary synonym, every entity the junction's FKs reference. "A customer has saved a product to a wishlist" names `customer` and `product`.
+  - (M1) the definition carries `fp=`, which goes stale when the FK set changes.
+- *Fails when:* The junction has no business definition, or the definition is trivial or shorter than 6 words, and it carries no `removal_candidate` marker. It also fails when the definition omits a referenced entity (a definition that does not mention what the junction links cannot be an explanation of it), or when its `fp` is stale.
+- *Suggestion:* `"{entity} links {a} and {b} but has no business definition. Ask the domain experts what it records. If they can say, document that business relationship (for example 'a customer has saved a product to a wishlist') and rename it after it. If they cannot, mark it @removal_candidate: {ticket} and schedule its removal."`
+- *Limits:* Measures that a definition exists, mentions what is linked, and was reviewed since the last structural change. It cannot tell whether the definition is true. A `removal_candidate` marker that stays for longer than `rules.4_9.max_candidate_age` (default 180 days) is reported again as a note. The age comes from a `since=` date on the marker, or, when git history is available, from the marker's first commit through `git log -S`.
+
+#### Design B — Orphan/unused entity (Q+G, deterministic)
+
+- *Measure:* Count references to the entity in the query corpus (`RangeVar`s in FROM/JOIN), the code corpus (Go identifiers of the struct, GORM `Model(&X{})`), and inbound FKs.
+- *Fails when:* There are zero query or code references outside migrations and tests, the entity has no definition, it carries no `removal_candidate` marker, and it is not `source: legacy|third_party`.
+- *Suggestion:* `"{entity} is never read or written outside migrations and has no definition. Ask the domain experts what it records. Document the meaning and who uses it if they can say, or mark it @removal_candidate: {ticket} if they cannot."`
+- *Limits:* Out-of-repo consumers (BI) are invisible. `@consumers:` declared in the sidecar count as references.
+
+**Recommendation:** A (MVP), because its M2 check rejects explanations that do not mention what is linked. B in Phase 2, as an independent signal of unexplained "just in case" structures. An entity that fails both is reported once, at A's severity, with B's evidence attached.
+
+**Residual limit:** whether the documented meaning is correct, and whether domain experts were the source of it.
+
+### §4.10 — One concept, one entity (discriminator over per-channel tables) `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔
+**Checkability:** `direct` when two signals agree (M5): name clustering, column overlap, and UNION-back queries. A single signal is a note.
+
+#### Design A — Sibling clustering, two-signal (L+S, heuristic)
+
+- *Measure:* Tokenize entity names. Group entities that share a head noun (last token, singularized) and differ only in a qualifier token (`chat_tickets`/`email_tickets` → head `ticket`), or that share a leading stem and differ only in a generic trailing noun from `rules.4_10.generic_suffixes` (default `profile|account|record|info|details|data`; `CustomerProfile`/`CustomerAccount`/`CustomerRecord` → stem `customer`). For each group, compute the field-name Jaccard similarity, excluding keys and audit columns.
+  Also form *structure-only* pairs: two entities whose Jaccard is ≥ `rules.4_10.min_overlap_unnamed` (default 0.8) over ≥5 non-generic, non-key fields, whatever their names.
+- *Fails when:* M5 is applied with three independent signals: (L) the name group, (S) Jaccard ≥ `rules.4_10.min_overlap` (default 0.6), and (Q) Design B's UNION-back query on the same pair. With any two signals and no shared identifier through FK or PK reference (e.g. `customer_pii.customer_id → customer`), the finding reports at warning. With one signal, or with a structure-only pair, it reports at note.
+- *Suggestion:* `"{entities} share {pct}% of their columns and differ by {qualifier}. Merge them into {head}({head}_id, {qualifier_col}, ...) with {qualifier_col} IN ({qualifiers}), or, if the split is deliberate (performance or access control), key all of them by one {head}_id and declare @split_reason."`
+- *Limits:* Sibling names with low overlap and no union query stay at note. Subtype tables that share a supertype key pass. `CustomerAccount` may be a genuinely different concept (an account held by a customer); a shared-key FK or `@split_reason` resolves the finding. Structure-only pairs with generic columns (two lookup tables `(code, label, sort_order)`) are excluded through the generic-field list.
+
+#### Design B — UNION-back query detector (Q, deterministic)
+
+- *Measure:* In the query corpus, find a `SelectStmt` with `op = SETOP_UNION` whose `larg`/`rarg` arms select from different base tables with ≥ 80% matching projected column names, often with a literal `'chat' AS channel` (`ResTarget` whose `val` is an `A_Const`).
+- *Fails when:* ≥1 such query exists over entities not declared `@split_reason`.
+- *Suggestion:* `"{file}:{line} unions {tables} back together with a literal discriminator {literal_col}. Model them as one entity with a {literal_col} column."`
+- *Limits:* Needs the query corpus. It is very precise when it fires.
+
+#### Design C — Overlapping attributes without a shared key (G, deterministic)
+
+- *Measure:* For entity pairs linked to the same logical entity (same `@entity` or synonym), check whether they share a PK/FK path. Overlapping non-key fields with no path = an accidental split.
+- *Fails when:* There is overlap ≥3 fields and no shared identifier.
+- *Suggestion:* `"{a} and {b} both hold {fields} for {logical} with no common key. Pick one as the owner of those fields and key the other by {logical}_id."`
+- *Limits:* Depends on entity linking or glossary synonyms, so it cannot see splits whose names are unrelated. Audit columns and generic fields (`name`, `description`) are excluded from the overlap count to avoid trivial matches.
+
+**Recommendation:** A (MVP), with L+S agreement as its promotion rule. In Phase 2, B supplies the third signal, which removes most remaining false positives. C covers accidental splits that names alone would miss.
+
+**Residual limit:** whether a split is deliberate. The linter can only check that the reason is declared (`@split_reason`) and that the parts share one identifier.
+
+### §4.11 — Check existing data model patterns before designing from scratch `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (persisted structs with repeated contact fields) · SQL ✔ (tables repeating the same attribute cluster) · JSON ◐ (schemas whose properties repeat the cluster, or that `$ref` none of a shared `party`/`contact` definition)
+**Checkability:** `direct` for the duplicated-structure symptom (the rule's ✗ example). `declared` for the pattern decision, with `direct` consistency (M2) and freshness (M1). Only the quality of the weighing stays `proxy`.
+
+The rule asks for a check and a judgment, not for adoption. A team may weigh Party and Role and decline it, because it performs poorly when overused (self-joins, generic tables) and its vocabulary is not how stakeholders talk. Both designs therefore pass on a recorded evaluation, whatever its outcome.
+
+#### Design A — Repeated attribute cluster across sibling entities (G+S, deterministic)
+
+- *Measure:* Define attribute *clusters* in `lexicon/pattern_clusters.yaml`. Each maps a pattern to a set of normalized field stems:
+  - `party_contact`: `{name|full_name|first_name+last_name|legal_name, email, phone, address_line1|street, city, postal_code, country}`
+  - `location`: `{address_line1, city, region|state, postal_code, country, latitude, longitude}`
+  - `agreement`: `{start_date|effective_from, end_date|effective_to, terms, signed_at}`
+  - `account`: `{account_number, opened_at, closed_at, balance}`
+  For each entity, compute the cluster coverage: the share of a cluster's stems found among its fields, after removing an entity-name prefix (`vendor_email` → `email`). Then group the entities whose coverage of the same cluster is ≥ `rules.4_11.min_cluster_coverage` (default 0.6).
+- *Fails when:* ≥ `rules.4_11.min_entities` (default 3) entities cover the same cluster, they do not reference a shared entity that holds the cluster (no FK or `$ref` to a common `party`/`contact`/`location`), and none of them has an `@pattern` annotation (see Design B). The rule's ✗ example of `customers`, `employees`, `vendors` and `contractors`, each repeating name, address, email and phone, fails with 4 entities.
+- *Suggestion:* `"{n} entities ({list}) each repeat the {cluster} attributes ({stems}). Before adding another, evaluate the {pattern} pattern: for party_contact, model a party({party}_id, party_type) with party_role({party}_id, role) and contact_method({party}_id, kind, value), and key {list} by party_id. Weigh the trade-off first: Party and Role adds self-joins and generic names stakeholders don't use. Record the decision with @pattern: {pattern}=adopted|rejected reason=\"...\" on each entity (§4.11)."`
+- *Limits:* The cluster lexicon is English-centric and configurable. Coverage counting misses clusters stored as a single embedded value object (`address JSONB`), which is arguably already the pattern. Two entities sharing a cluster is common and legitimate, hence the default of 3. In diff mode the finding is raised one level when the PR *adds* a new member to an existing cluster group, which is the "before you design" moment the rule targets.
+
+#### Design B — Fingerprint-bound pattern-evaluation record (C+H, deterministic)
+
+- *Measure:* Collect entities that are new, or whose field set changed by ≥ `rules.4_11.refactor_threshold` (default 30% of fields added or removed), compared with the schema lock `mml.lock.json` (M3). `--base` is used when given. Add every entity in a cluster group that Design A finds. Each one must carry an `@pattern` annotation, either `@pattern: none-applicable` or `@pattern: <name>=adopted|adapted|rejected`, with a required `reason=` unless the value is `adopted`. Valid pattern names come from `rules.4_11.patterns` (default `account|agreement|event|location|party_role|product|classification`). Alternatively, the annotation may point to an ADR (`deviation=` or `pattern_adr=docs/adr/NNN.md`) that exists and mentions the pattern name. The record carries `fp=` (M1) and `members=<n>`, the cluster-group size when it was written. Then the decision is recomputed against structure (M2):
+  - `adopted` or `adapted` requires the entity to actually reference the pattern's shared entity (an FK or `$ref` to `party`, `location` or the configured target).
+  - `rejected` or `none-applicable` goes stale when Design A's cluster group has grown beyond `members`, because the trade-off was weighed for fewer duplicates.
+- *Fails when:* An entity in scope has no `@pattern` annotation, the pattern name is unknown, a `rejected`/`adapted`/`none-applicable` value has no reason, or the ADR path does not exist. It also fails when an `adopted` claim has no reference to the shared entity, or when the record is stale (an `fp` mismatch, or a cluster grown past `members`).
+- *Suggestion:* `"{entity} is new (or was refactored) without a recorded pattern check. Check whether {suggested_patterns} cover it and add @pattern: <name>=adopted|adapted|rejected reason=\"...\" or @pattern: none-applicable reason=\"...\" (§4.11)."` Here `{suggested_patterns}` comes from Design A's cluster coverage of the entity, or the default list.
+- *Limits:* It proves a decision was recorded, agrees with the structure, and was revisited when the structure changed. It does not prove the pattern was weighed well. `none-applicable` with a stock reason can be boilerplate; the linter reports a note when ≥ 80% of `@pattern` reasons in the repo are identical. "New" is judged against the lock, so a repository without `mml.lock.json` (and without `--base`) checks only the cluster members from A.
+
+**Recommendation:** A first (MVP). It catches the rule's ✗ example directly from the entity IR and points at a concrete pattern. Add B in the MVP too, because with the lock (M3) it no longer needs git history. It covers the "before you design" timing that A can only see after the fact, and makes a rejection expire when the duplication grows.
+
+**Residual limit:** the quality of the trade-off judgment, for example whether Party and Role's self-joins are acceptable for the workload.
+
+## §5 — Attributes and Naming
+
+### §5.1 — Specific column names; no ambiguous or reserved words `[MUST][CODE]`
+
+**Applies to:** Go ✔ (the persisted name from tag `db`/`gorm:"column:"`/`json`, else the snake-cased field name) · SQL ✔ · JSON ✔ (property names)
+**Checkability:** `direct`
+
+#### Design A — Reserved-word and bare-type lexicon (L, deterministic)
+
+- *Measure:* Lower-case each persisted field name and check it against these lists:
+  1. PostgreSQL keywords that cannot be column names without quoting: the `RESERVED_KEYWORD` and `TYPE_FUNC_NAME_KEYWORD` categories. Neither `pg_query_go` nor libpg_query exports a keyword list in its Go API, so generate `lexicon/postgres17_keywords.txt` at build time by parsing the `PG_KEYWORD(...)` lines of `src/include/parser/kwlist.h` from the matching PostgreSQL release, and embed it with `//go:embed`. (Examples: `user`, `order`, `group`, `select`, `table`, `check`, `default`, `limit`, `end`, `offset` are reserved. `date`, `type`, `status`, `name`, and `value` are not. `timestamp` is a `COL_NAME_KEYWORD`, which is allowed as a column name.)
+  2. The SQL:2016 reserved word list (`lexicon/sql2016_reserved.txt`), which reserves `date`, `timestamp`, `time`, `value`, `user`, and others, so portable models avoid them.
+  3. The reserved lists for any other configured targets (`rules.5_1.dialects: [postgres, bigquery, snowflake, mysql]`).
+  4. Ambiguous type words, which the rule names (`date`, `timestamp`) or which are ambiguous in the same way, because each could be any of several events or values: `date|time|timestamp|datetime|interval|boolean|json|text|number`.
+  5. Weakly ambiguous words that are acceptable when the entity makes the meaning clear: `type|kind`.
+  6. Generic words that do not say what is recorded: `name|value|data|info|flag|amount|category|code|key|level|count|desc|description`.
+
+  `status` and `state` are **not** flagged. The revised rule dropped them from its list, and its ✓ example `tickets(created_at, first_response_at, resolved_at, reopened_at, status)` uses a bare `status` column.
+- *Fails when:* A name exactly matches list 1 or 3 → error ("reserved in {dialect}"). It matches list 4 → error ("ambiguous type word"), even when PostgreSQL accepts the name, because the rule names `date` and `timestamp` as forbidden. It matches only list 2 → warning ("reserved in SQL:2016"), raised to error when `rules.5_1.portable: true`. SQL:2016 reserves many ordinary words (`year`, `result`, `position`, `language`, `count`) that the configured dialects accept, and the rule's syntax-error rationale applies only to dialects that actually reserve them. It matches list 5 → note ("weakly ambiguous"), raised to warning when the entity has two or more categorical fields, so that a bare `type` cannot tell them apart. It matches list 6 → warning ("generic name"). Entries in `rules.5_1.allow` (for example `[name]`) suppress lists 4, 5 and 6 only.
+- *Suggestion:* `"Column {entity}.{col} is {reason}. Rename it to say what it records, for example {entity_singular}_{col} ({example}). Candidates: {candidates}."` Candidates come from a template table: `type→{entity}_type`, `date/timestamp→created_at | {verb}_at`. If the code corpus contains a write that sets the column right after an event method (`Resolve()`, `Ship()`), it suggests `resolved_at`/`shipped_at`.
+- *Limits:* JSON property names in external API contracts may be required. `source: third_party` exempts them (§3.5). The keyword list must be regenerated for each PostgreSQL major version.
+
+#### Design B — Time-column event naming (S+L, deterministic)
+
+- *Measure:* For every field with `Type ∈ {date, timestamptz, timestamp_naive, time}`, require the name to match `^[a-z]+(_[a-z]+)*_(at|on|date|time|ts)$` and the stem (the tokens before the suffix) to contain a verb or participle from the lexicon (`created|updated|deleted|shipped|resolved|...`, plus WordNet-derived past participles in `lexicon/event_verbs.txt`), or an `{event}` name from `@time: event`.
+- *Fails when:* A temporal field is named with a bare suffix (`at`, `ts`, `dt`, `datetime`) or a non-event stem (`date1`, `order_date2`).
+- *Suggestion:* `"{entity}.{col} is a {type} but its name doesn't say which event it records. Rename it to <event>_at, for example {candidates}."`
+- *Limits:* Event nouns are accepted as stems through `rules.5_1.event_nouns`, which defaults to `order|response|first_response|signup|login|payment|arrival|departure|delivery|birth|renewal|expiry`. So `order_date` passes, and every time column in the rule's ✓ example `tickets(created_at, first_response_at, resolved_at, reopened_at, status)` passes, with `reopened` a past participle from `lexicon/event_verbs.txt`. Temporal values stored as strings are missed here and reported by §9.2.
+
+#### Design C — Quoted-identifier evidence (Q, deterministic)
+
+- *Measure:* The pg_query parse tree does not record whether an identifier was quoted, so use `pg_query.Scan` over the DDL and query corpus. Find `IDENT` tokens whose source text (from the token's start and end offsets) begins with `"` and whose unquoted, lower-cased text is in the keyword list from A.
+- *Fails when:* Any column or table needs quoting.
+- *Suggestion:* `"{n} queries quote \"{ident}\" because it is a reserved word. Rename it to {candidate}."`
+- *Limits:* This is supporting evidence, used to rank findings by how often the name hurts. Quoting used only for mixed case (`"OrderDate"`) is reported by §5.2 instead.
+
+**Recommendation:** A + B (both MVP). C adds weight in Phase 2.
+
+### §5.2 — Business vocabulary, one naming convention, no cryptic abbreviations `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ (persisted names, and Go type names for the entity) · SQL ✔ · JSON ✔
+**Checkability:** `direct` (convention, abbreviations), `declared` (business vocabulary)
+
+#### Design A — Convention conformance profile (S+L, deterministic)
+
+- *Measure:* For each persisted name, classify the case style (`snake`, `camel`, `Pascal`, `SCREAMING`, `lower-concat`), detect separators, and classify entity-name number (singular or plural, using `github.com/gertd/go-pluralize`). Compute the **dominant style per source kind** (persisted SQL/Go-tag names, JSON properties separately), or use `rules.5_2.convention: {case: snake, entity_number: singular}` if configured. Also detect concatenated-word names such as `ORDERDATE`/`orderdate` by dictionary segmentation (`lexicon/en_words.txt` + glossary terms): a name that splits into ≥2 dictionary words with no separator.
+- *Fails when:* A name deviates from the configured or dominant convention, or two fields in one entity, or two entities in one schema, normalize to the same tokens with different spellings (`OrderDate`, `order_date`, `ORDERDATE`).
+- *Suggestion:* `"{entity}.{col} uses {style}; the model uses {convention}. Rename it to {converted}."` (A SARIF fix is provided for JSON properties and Go tags. For SQL, the fix is an `ALTER TABLE ... RENAME COLUMN` statement.)
+- *Limits:* Go struct field names follow Go casing. Only the *persisted* name (tag) is checked. When no style dominates (no style above 60%), the check reports one note asking for `rules.5_2.convention` instead of flagging every name.
+
+#### Design B — Abbreviation and cryptic-token detector (L, deterministic)
+
+- *Measure:* Split names into tokens (on `_`, case boundaries, and digits). A token is *cryptic* when it is not in (dictionary ∪ glossary ∪ `rules.5_2.allowed_abbrev` [id, url, utc, usd, sku, ...]). Score = cryptic tokens / tokens. Also flag a trailing digit or version suffix (`\d+$`, `_v\d+`, `adj2`).
+- *Fails when:* Any token is cryptic and has length ≤4, or a name matches `^[A-Za-z]{1,4}_?\d+$` (`c_3`, `WTF1234`), or it has a numeric suffix not covered by §5.5.
+- *Suggestion:* `"{entity}.{col}: token(s) {tokens} are not words in the dictionary or glossary. Spell them out, for example {expansion} (from lexicon/abbrev_expansions.txt: qty→quantity, adj→adjusted, amt→amount, cust→customer), giving {suggested_name}."`
+- *Limits:* Domain jargon needs to be added to the glossary, which is itself the intended feedback loop.
+
+#### Design C — Ubiquitous-language glossary (A+L, deterministic)
+
+- *Measure:* Load `glossary.yaml` (`term`, `synonyms`, `forbidden_aliases`). For each entity and field token, check whether it is a `forbidden_alias` or a non-preferred synonym (`case` when the term is `claim`, `client` when the term is `customer`).
+- *Fails when:* A non-preferred synonym is used.
+- *Suggestion:* `"{entity} uses '{token}', but the business term is '{preferred}' (glossary.yaml:{line}). Rename it to {suggested}."`
+- *Limits:* It is only as good as the glossary. If there is no glossary, it does not run, and §1.2-B reports the missing glossary terms.
+
+**Recommendation:** A and B are MVP. C is Phase 2, and it is the only design that checks "the business's own words".
+
+### §5.3 — Declared nullability meaning; explicit NULL handling `[MUST][CODE]`
+
+**Applies to:** Go ✔ (pointer, `sql.Null*`, `omitempty`) · SQL ✔ · JSON ✔ (`required` and `"null"` in `type`)
+**Checkability:** `declared` (meaning), `direct` (handling in queries)
+
+The rule has two parts: document what `NULL` means for every nullable attribute (Designs A and C), and handle `NULL` explicitly before arithmetic or aggregation (Design B).
+
+#### Design A — Null-meaning contract (C, deterministic)
+
+- *Measure:* For every field that is not a PK, require `@null` ∈ {`missing`, `unknown`, `not_applicable`, `zero`, `forbidden`} (from the tag `mml:"null=..."`, `COMMENT ON COLUMN ... @null:`, or `x-mml-null`). A non-nullable field defaults to `forbidden` and needs no annotation. For `not_applicable`, require `@null_when: <predicate>` naming a discriminator field that exists in the entity (e.g. `order_type = 'digital'`). Cross-check the declaration against the structure: `@null: forbidden` on a nullable field (SQL without `NOT NULL`, JSON not `required` or allowing `"null"`, Go pointer) is a contradiction. A field with `@null: zero` should have `DEFAULT 0` or be converted upstream.
+- *Fails when:* A nullable field has no annotation or an invalid one, `@null_when` references a field that does not exist, or the declaration and structure contradict each other.
+- *Suggestion:* `"{entity}.{col} is nullable but does not say what NULL means. Add @null: missing|unknown|not_applicable|zero. If it is not_applicable, add @null_when naming the discriminator (e.g. {candidate_discriminator}). If NULL should never happen, make it NOT NULL."` `{candidate_discriminator}` = a field matching `_type|_kind` in the entity.
+- *Limits:* Boilerplate annotations are possible. Pair with B to make the declaration meaningful.
+
+#### Design B — NULL-unsafe aggregation and arithmetic (Q, deterministic)
+
+- *Measure:* In query ASTs, resolve each `ColumnRef` to `(entity, field)`. Flag: (1) a `FuncCall` to `avg|sum|min|max` whose argument is a nullable column not wrapped in `COALESCE` (`CoalesceExpr`), `NULLIF`, or `CASE` (`CaseExpr`); (2) `A_Expr` arithmetic (`+ - * /`) with a nullable operand that is not wrapped the same way; (3) `count(col)` on an `@null: zero` column used as a row count.
+- *Fails when:* Case (1), (2), or (3) occurs on a field with `@null: zero` → error. Case (1) or (2) on an undeclared nullable field → warning ("ambiguous"). Fields declared `missing`, `unknown`, or `not_applicable` pass, because skipping them is the declared intent.
+- *Suggestion:* `"{file}:{line}: {func}({col}) skips NULLs, but {entity}.{col} declares NULL = zero, so the result is {effect}. Use {func}(COALESCE({col}, 0))."` For undeclared fields: `"declare @null on {entity}.{col} so this aggregate can be checked"`.
+- *Limits:* Needs the query corpus. Go-side arithmetic on `sql.NullInt64.Int64` without checking `.Valid` is found by a `go/analysis` pass (a read of the value field of a `sql.Null*` that is not dominated by a `.Valid` check). Columns made nullable by an outer join are not tracked in the first version.
+
+#### Design C — Cross-form nullability consistency (G, deterministic)
+
+- *Measure:* For linked fields across Go/SQL/JSON, compare nullability: SQL `NOT NULL` vs Go pointer or `sql.Null*` vs JSON `required`/`"null"` in `type`.
+- *Fails when:* They disagree (for example SQL nullable but Go non-pointer `string`, which turns NULL into a scan error with `database/sql` or into `""` with some ORMs).
+- *Suggestion:* `"{field} is nullable in {a} but not in {b}; NULL becomes {zero_value_or_error} in {b}. Align them: make {b} {fix}."`
+- *Limits:* Needs reliable field linking. JSON "not required" (key absent) and "null allowed" (key present with `null`) are different states; the check treats both as nullable unless `rules.5_3.json_absent_is_null: false`.
+
+**Recommendation:** A (MVP, it is the core of the MUST). Then C (MVP, cheap). Then B (Phase 2).
+
+### §5.4 — Constrained enumerations; canonical codes `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ (named string type with a `const` block, `validate:"oneof=..."`) · SQL ✔ (`CHECK ... IN`, enum type, FK to a lookup table) · JSON ✔ (`enum`, `const`, `oneOf` of `const`s)
+**Checkability:** `direct`
+
+#### Design A — Unconstrained categorical detector (S+L, deterministic)
+
+- *Measure:* A field is *categorical* when its name matches `(?i)(^|_)(status|state|type|kind|category|reason|code|level|tier|channel|priority|stage)$` (so a bare `status`, which §5.1 now allows, is still checked here) or its Go type is a named string type. Check for a constraint: SQL `CHECK (col IN (...))`, a `CREATE TYPE ... AS ENUM` type (`CreateEnumStmt`), or an FK to a reference table. Go: a named type with ≥2 typed `const`s, or a `validate:"oneof=..."` tag. JSON: `enum`/`const`/`$ref` to an enum def.
+- *Fails when:* A categorical field has no constraint.
+- *Suggestion:* `"{entity}.{col} is a categorical {type} with no allowed list. Add CHECK ({col} IN ({values})) / \"enum\": [{values}] / a typed const block. Candidate values found in code: {values}."` `{values}` comes from string literals compared or assigned to this field in the code and query corpus. In MVP, before the corpus exists, the message lists `<value1>, <value2>, ...` placeholders.
+- *Limits:* Free-text "_code" fields may be legitimate. Waive with a reason. A Go named string type with consts does not stop arbitrary values being written, so Go-only enforcement is reported as a note asking for a database or schema constraint as well.
+
+#### Design B — Cross-form enum agreement and synonym collision (G+L, deterministic)
+
+- *Measure:* For linked fields, compare the enum sets of SQL CHECK, Go consts, and JSON `enum`. Normalize each value with `strings.ToLower(strings.TrimSpace)` and strip `_`/`-`. Find (1) values present in one form but not another, (2) values within one set that collide after normalization (`shipped`/`Shipped`/`SHIPPED `), and (3) values that share a stem with edit distance ≤2 or a prefix relation (`DEFECTIVE`/`DEFECTIVE_PRODUCT`/`DEFECT`).
+- *Fails when:* (1) Sets disagree → error. (2) Collisions → error. (3) Near-synonyms → warning.
+- *Suggestion:* `"{field}: SQL allows {sql_set}, Go defines {go_set}, JSON allows {json_set}; {diff} is missing from {where}."` / `"{values} look like variants of one code. Keep {canonical} and map the others with a mapping in {dim_table}."`
+- *Limits:* Near-synonym detection is heuristic, so it is reported as a warning. Legitimately distinct codes with similar spellings (`PAID`/`PAD`) need `rules.5_4.distinct_pairs`.
+
+#### Design C — Literal-value drift in the write path (Q, deterministic)
+
+- *Measure:* Collect the string literals written to the field (`INSERT ... VALUES`, `UPDATE SET col = 'x'`, Go struct literal `Status: "x"`), and compare them with the declared enum.
+- *Fails when:* A literal outside the allowed list is written.
+- *Suggestion:* `"{file}:{line} writes '{literal}' to {entity}.{col}, which is not in its allowed list {values}."`
+- *Limits:* Only literal values are seen. Values that arrive from request input or configuration are invisible, which is why A's database or schema constraint remains the primary guard.
+
+**Recommendation:** A (MVP), then B (MVP: it only needs linked IR). C in Phase 2.
+
+### §5.5 — No repeating numbered columns `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ (fields `PO1`…`PO10`, or fixed arrays `[10]string`) · SQL ✔ · JSON ✔ (`po_1`… properties, or `patternProperties` such as `^po_\d+$`)
+**Checkability:** `direct`
+
+#### Design A — Numbered-sibling detector (L+S, deterministic)
+
+- *Measure:* Match each field name against `^(?P<stem>.+?)_?(?P<n>\d+)(?P<suffix>_[a-z]+)?$`, and also against ordinal words (`first_|second_|third_|primary_|secondary_|alternate_`). Group by `(stem, suffix)`. Require the group to have ≥ `rules.5_5.min_repeats` (default 3, or 2 for ordinal words) and the same logical type. Also flag Go fixed-size arrays (`[N]T` with N ≥ 2) on persisted structs, and JSON `patternProperties` whose pattern ends in `\d+$`.
+- *Fails when:* A group meets the threshold, or a fixed array or numbered `patternProperties` pattern is found. Groups such as `address_line1/2` are allowed through `rules.5_5.allow_stems: [address_line]`.
+- *Suggestion:* `"{entity} has {n} numbered columns {stem}1…{stem}{max}. Replace them with a child table {entity_singular}_{stem}s({entity}_id REFERENCES {entity}, {stem}_seq SMALLINT, {stem} {type}, PRIMARY KEY ({entity}_id, {stem}_seq))."` A JSON fix proposes `"{stem}s": {"type":"array","items":{...}}` instead (with §6.1 caveats for shared consumers).
+- *Limits:* Process stages (`stage1_completed_at`) are flagged too. That is intended, because the rule says readers cannot tell items from stages. A pair such as `phone1`/`phone2` is below the default threshold and passes.
+
+#### Design B — Growth-by-migration detector (H, deterministic)
+
+- *Measure:* In diff mode or across the migration history, detect an `ALTER TABLE ADD COLUMN {stem}{n+1}` when `{stem}{1..n}` already exist, or a JSON Schema PR that adds `{stem}_{n+1}`.
+- *Fails when:* A numbered sibling is added.
+- *Suggestion:* `"This migration adds {stem}{n+1} to {entity}, the {k}th time this column series has grown. Move {stem} to a child table instead of adding another column."`
+- *Limits:* Needs history. It fires at the moment of decision, so the feedback is the most useful.
+
+**Recommendation:** A (MVP). B in Phase 3, to block the growth at review time.
+
+## §6 — Relationships
+
+### §6.1 — Resolve many-to-many with a junction table `[MUST][CODE]`
+
+**Applies to:** Go ◐ (`[]T`, `[]ID`, or `[]byte`/`json.RawMessage` JSON fields on a persisted struct) · SQL ✔ (array columns, `JSON`/`JSONB` columns that hold lists of keys, a single FK where the relationship is N:M) · JSON ✔ (`type: array` whose `items` is a `$ref` to another entity, or an array of `*_id` strings)
+**Checkability:** `direct` for arrays of keys and for JSON line items that queries unpack; `direct` (two-signal, M5) for a one-sided FK that should be N:M.
+
+#### Design A — Array-of-references detector (S, deterministic)
+
+- *Measure:* For each field, flag it when one of these holds:
+  (a) the SQL type is `T[]` (pg_query `TypeName.arrayBounds` is non-empty) and the column name matches `(?i)_ids?$` or the element type equals some entity's PK type;
+  (b) the Go type is `[]int64`, `[]uuid.UUID`, or `[]string` with a name matching `IDs$`, or `[]Other` where `Other` is another top-level IR entity that has **no FK back** to this entity, *and* the field is persisted (a `db`/`gorm`/`bson` tag without `-`). A `[]Other` whose `Other` carries an FK back is a 1:N has-many and is not flagged. `gorm:"many2many:..."` is exempt because GORM creates the junction table;
+  (c) the JSON Schema property is `type: array` whose `items.$ref` points to another top-level entity, or whose `items` has `format: uuid` or a name matching `_ids?$`.
+- *Fails when:* (a), (b), or (c) holds, the entity's `source` is not `legacy`/`third_party` (those go to §3.5), and the entity is not a document-model entity read only by its owner. That exemption covers a Go struct with only `bson`/`json` tags, or a JSON Schema not linked to a SQL table, *whose* `consumers` annotation lists only its owner. Such documents fall under §6.5. Any entity with `layer` ∈ {`core`,`analytical`,`obt`,`feature`,`reference`} or more than one declared consumer always fails, as the rule's "shared or analytical consumers" clause requires.
+- *Suggestion:* "`{entity}.{field}` stores a list of `{target}` references. Replace it with a junction table `{entity}_{target}({entity}_id REFERENCES {entity}, {target}_id REFERENCES {target}, PRIMARY KEY ({entity}_id, {target}_id))`, one row per pair."
+- *Limits:* Tag arrays (`tags TEXT[]`) that are not entity references are skipped unless a `tag` entity exists. Undeclared `consumers` is treated as shared, which favors false positives on single-owner documents; declaring `consumers` silences those. Config: `m2m.array_name_regex`.
+
+#### Design B — JSON payload line-item detector (S + Q, deterministic per signal; M5)
+
+- *Measure:* For `json`/`jsonb`/`VARIANT` columns and persisted Go `json.RawMessage`/`map[string]any` fields, collect three independent signals.
+  1. **Name (L):** the name tokenizes against `{items, lines, line_items, products, payload, cart, members, entries}`.
+  2. **Shape (S):** an `array` of objects that contains a `*_id` key. The shape is found either in a JSON Schema linked through `x-mml-schema`, or in a `CHECK (jsonb_typeof(...) = 'array')` on the column.
+  3. **Unpacking (Q):** a query in the corpus explodes the column. Examples are a `RangeFunction` over `jsonb_array_elements`/`json_array_elements`/`jsonb_to_recordset` (Snowflake `LATERAL FLATTEN`, BigQuery `UNNEST(JSON_QUERY_ARRAY(...))`) whose output `->>'{x}_id'` is then joined or grouped. This is the rule's "consumers must unpack" condition, observed directly.
+- *Fails when:* the shape signal or the unpacking signal holds, which is the rule's condition observed directly and is reported at full severity. Per M5, the name signal alone is a `note` with an `annotate` stub (`x-mml-schema`). The name signal is promoted to full severity only when the shape or the unpacking signal agrees.
+- *Suggestion:* "`{entity}.{field}` ({rawType}) appears to hold line items keyed by `{inner_key}`. Shred them into a `{entity}_{singular(field)}` table with FKs to `{entity}` and `{inner_entity}` so that consumers do not have to unpack JSON (§6.1, §10.2)."
+- *Limits:* `payload` columns that hold event envelopes, not line items, appear only as name-only `note`s. The unpacking signal needs the query corpus (Phase 2), and the shape signal needs a linked schema. A JSON array that no query unpacks and no schema describes stays at `note`.
+
+#### Design C — Hidden many-to-many from write patterns (Q, heuristic; M5)
+
+- *Measure:* In the code corpus, use `go/ssa` to find two write patterns inside a `for`/`range` loop over a slice:
+  (1) an `UpdateStmt` that sets a single-valued FK `{entity}.{fk}` with a loop-invariant `WHERE {pk} = $n`. Each iteration overwrites the last value, so only the final one survives;
+  (2) an `InsertStmt` into `{entity}` where every column except `{fk}` is bound to a loop-invariant value. That duplicates the row just to vary the FK.
+  Also flag a UNIQUE `(natural_key, fk)` on a table whose PK is a surrogate, because the duplicated-row workaround leaves that signature in the schema.
+- *Fails when:* pattern (1) or (2) is found for the same `{fk}`, or the UNIQUE signature exists. Per M5, a single signal reports at `note`. The finding reaches full severity when two independent signals agree: a write pattern (Q) together with the UNIQUE `(natural_key, fk)` signature (S), or patterns (1) and (2) at different call sites.
+- *Suggestion:* "`{entity}.{fk}` is written several times per `{entity}` at {pos}, so the relationship is many-to-many. Introduce `{entity}_{target}` and move `{fk}` into it."
+- *Limits:* Needs the code corpus and SQL string resolution. Loop-invariance analysis misses values that are recomputed inside the loop but are equal. A one-sided FK that is never written in a loop, and has no duplicated-row signature, is not detected.
+
+**Recommendation:** Ship A in the MVP because it is exact and cheap. Ship B's shape signal in the MVP too. Add B's unpacking signal and C in Phase 2. C catches the hidden "FK on one side" case, which A cannot see.
+
+**Residual limit:** a single-valued FK that the business treats as N:M leaves no structural or write-path trace until someone writes a second value. Then it shows up only as an overwrite, which C sees only within one loop.
+
+### §6.2 — Declare FKs and make mandatory parents NOT NULL `[MUST][CODE]`
+
+**Applies to:** Go ◐ (`XxxID` fields, `gorm:"foreignKey"`) · SQL ✔ (`REFERENCES`, `NOT NULL`) · JSON ◐ (no physical FK exists, so the "declared relationship" is `$ref`/`x-mml-ref` plus `required`)
+**Checkability:** `direct`
+
+#### Design A — Reference-shaped column without constraint (S + L, deterministic)
+
+- *Measure:* For every field whose name matches `^(?P<t>[a-z0-9_]+?)_id$` (SQL/JSON) or `^(?P<t>\w+?)ID$` (Go), resolve `t` against the `Canonical` names in the catalog, including plural and synonym folding. Record whether a declared ref exists: a pg_query `Constraint{contype: CONSTR_FOREIGN}` (column-level, or table-level with `fk_attrs` containing the column), a GORM `foreignKey`/`references` tag, or a JSON `x-mml-ref`/`$ref`.
+- *Fails when:* `t` resolves to an entity, no declared ref exists, and the entity's `source` is not `legacy`/`third_party` (§3.5). On a dialect configured `enforces_constraints: false` (Snowflake, BigQuery, dataframes), a declared but unenforced FK passes here, and the enforcement obligation goes to §6.3.
+- *Suggestion (with SARIF fix):* "`{entity}.{field}` refers to `{target}` but has no foreign key. Add `ALTER TABLE {entity} ADD CONSTRAINT fk_{entity}_{field} FOREIGN KEY ({field}) REFERENCES {target}({target_pk});`"
+- *Limits:* `parent_id` self-references resolve to the entity itself. Polymorphic `subject_id` + `subject_type` pairs are exempt when a `*_type` sibling exists. An `_id` field that names an external system (`stripe_customer_id`) does not resolve and is correctly skipped. An external system whose name is also an entity name is a false positive.
+
+#### Design B — Mandatory-parent nullability contract (C, deterministic)
+
+- *Measure:* For each declared ref, read `card` from the annotation (`mml:"ref=customer;card=1..N"` / `@card: 1..N`). A lower bound ≥ 1 means mandatory. Compare that with `Field.Nullable`. When `card` is missing, a guess picks the wording of the message. The parent is presumed mandatory when the child's name contains the parent's name (`order_item` → `order`) or when the FK is part of the PK.
+- *Fails when:* the ref is mandatory but the column is nullable. This covers a Go `*int64` or `sql.NullInt64`, a SQL column without `NOT NULL`, and a JSON property missing from `required`. It also fails when no `card` is declared and the column is nullable, because optionality has to be a recorded decision.
+- *Suggestion:* "`{entity}.{field}` is {a mandatory|an undeclared-cardinality} reference to `{target}` but allows NULL, so orphans are possible. Add `NOT NULL` (Go: `{GoType}` instead of `*{GoType}`; JSON: add `\"{field}\"` to `required`), or declare `card=0..N` with `null=not_applicable` if the parent is truly optional."
+- *Limits:* Optionality is a business decision. B forces it to be declared rather than guessing it. A non-pointer Go `int64` counts as not nullable, but its zero value `0` is still an orphan reference. The suggestion for Go also recommends `validate:"required"` or `gorm:"not null"`.
+
+#### Design C — Cross-source constraint parity (G, deterministic)
+
+- *Measure:* Within one logical entity, compare the ref sets and their nullability across Go, SQL, and JSON. Example: the Go struct has `Customer Customer \`gorm:"foreignKey:CustomerID"\`` but the SQL table lacks `REFERENCES`, or the JSON Schema has `customer_id` required while SQL allows it to be nullable.
+- *Fails when:* the ref or nullability differs between linked sources.
+- *Suggestion:* "`{logical}.{field}` is a required reference in {sourceA} ({posA}) but {state} in {sourceB} ({posB}). Align the physical schema with {sourceA}."
+- *Limits:* Needs accurate cross-source linking. A read-model JSON Schema that deliberately makes the reference optional needs `waive`.
+
+**Recommendation:** A and B in the MVP. C is cheap once linking exists.
+
+### §6.3 — Enforce constraints in the pipeline where the platform does not `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (dataframe and warehouse loaders) · SQL ✔ (warehouse DDL: Snowflake, BigQuery, Databricks, Redshift, or PostgreSQL 18+ `NOT ENFORCED`) · JSON ◐ (documents in stores without integrity checks)
+**Checkability:** `direct` for detecting the gap; `direct` through M4 for actual violations (duplicate keys, orphans and nulls reported by the tests that run in CI); `proxy` only where no test results are supplied.
+
+#### Design A — Unenforced-constraint inventory × test manifest (A, deterministic)
+
+- *Measure:* List the "obligations" as the key constraints the target platform does not enforce. The platform comes from `dialects.<glob>.enforces` in config. Built-in defaults:
+  - Snowflake enforces only `NOT NULL`, so every declared PK, UNIQUE, and FK is an obligation, with or without `RELY`.
+  - BigQuery requires PK/FK to be written `NOT ENFORCED`, so all of them are obligations.
+  - Databricks enforces `NOT NULL` and `CHECK` but treats PK/FK as informational.
+  - Redshift enforces only `NOT NULL`.
+  - In PostgreSQL 18+, a constraint written `NOT ENFORCED` is an obligation (pg_query `Constraint.is_enforced = false` on PG18-based releases).
+  - For dataframes and schemaless JSON stores, every PK, UNIQUE, FK, and `required`/`NOT NULL` is an obligation.
+
+  Then load dbt `models/**/*.yml` (`tests:` or, in dbt ≥ 1.8, `data_tests:` with `unique`, `not_null`, `relationships: {to: ref(...), field: ...}`, `dbt_utils.unique_combination_of_columns` for composite keys), Great Expectations suites (`gx/expectations/**/*.json`, or the older `great_expectations/expectations/`), and `mml.yaml` `tests:`. Join each obligation to a test on the same `{entity, column(s)}`.
+- *Fails when:* an obligation has no matching test.
+- *Suggestion:* "`{entity}.{column}` declares {constraint} but {platform} does not enforce it. Add to `{dbt_path}`: `- name: {column}\n  data_tests: [{test_kind}]` (for an FK: `- relationships: {to: ref('{target}'), field: {target_pk}}`), with `severity: error` so the load fails."
+- *Limits:* Only known test frameworks are recognized, and custom Go validation is credited only through Design C. Config: `test_sources:` globs and `dialects:` overrides.
+
+#### Design B — Test severity audit (A + S, deterministic)
+
+- *Measure:* For each test that A matched, parse its `config:` block: `severity: warn`, `warn_if`, and `error_if` (dbt's default `error_if` is `!= 0`).
+- *Fails when:* a test that covers a key obligation does not fail the run, either because its severity is `warn` or because `error_if` tolerates more than zero failures.
+- *Suggestion:* "The test `{test}` on `{entity}.{column}` is set to `{severity_or_threshold}`. Integrity tests on keys must block the load (§3.4); set `severity: error` and remove `{error_if}`."
+- *Limits:* Needs A's join first. Severity can also be set project-wide in `dbt_project.yml` (`data_tests: +severity:`); the audit has to read that file to avoid false passes.
+
+#### Design C — Loader-path enforcement (Q, heuristic)
+
+- *Measure:* In Go, find write paths for the entity: `(*bigquery.Inserter).Put`, `COPY INTO` and `INSERT` strings executed through `gosnowflake`, and `(*parquet.Writer).Write`/`parquet.GenericWriter[T].Write`. Using `go/ssa`, check whether every path from the function entry to the write call first calls a function annotated `//mml:validates {entity}`, or builds a dedup set (`map[{key}]struct{}`) over the rows. The validating call can be in the same function or in each caller.
+- *Fails when:* some path reaches the write with no validating call before it.
+- *Suggestion:* "`{func}` writes `{entity}` to {platform}, which does not enforce `{constraint}`, and no validation runs first. Call a `//mml:validates {entity}` function before {callsite}."
+- *Limits:* Heuristic, so it starts at `note`. The `//mml:validates` claim is taken on trust, and its body is not checked against the constraint.
+
+#### Design D — Test-result ingestion (A, deterministic; M4)
+
+- *Measure:* `check --results` ingests:
+  - dbt `target/run_results.json`: `results[].unique_id`, `status` (`pass|fail|warn|error|skipped`), `failures`, and the `relation_name` of the failing rows when `store_failures` is on;
+  - Great Expectations validation results: `results[].success`, `expectation_config.type`, `kwargs.column`, `result.unexpected_count`;
+  - JUnit XML from other SQL test runners.
+
+  Each result is mapped to the obligation that Design A matched. A test generated by `scaffold` carries `meta: {mml_rule: "§6.3", mml_entity: "{entity}", mml_obligation: "{constraint}"}`. A hand-written test is matched through the dbt manifest's `test_metadata.name` plus `attached_node` and `column_name`, which are the same keys A joins on.
+- *Fails when:*
+  - **An obligation's test failed:** `status ∈ {fail, error}` with `failures > 0`. This is a direct finding that the platform let a duplicate key, an orphan or a null through.
+  - **`mml/test-not-run`:** the test was matched in the manifest but is absent from the results, or its `status` is `skipped`. Typical causes are a `--select` that excluded it or a disabled test.
+  - **Stale results:** the results file is older than the manifest (`metadata.generated_at`), or comes from a different `invocation_id`.
+- *Suggestion:* For a failed test: "`{test}` failed on `{entity}.{column}`: {failures} {kind} rows ({relation_name}). {platform} does not enforce `{constraint}`, so the bad rows are now in `{entity}`. Fix the load at `{upstream_model}` and rerun." For `mml/test-not-run`: "The test `{test}` for obligation `{constraint}` on `{entity}` did not run in this CI job. Include it in the `dbt build` selector."
+- *Limits:* The linter sees only the outcomes CI produced. A warehouse checked on a schedule outside CI is invisible unless that job's results file is supplied. The failure count comes from the test framework. With `store_failures` off, the failing rows themselves are not named.
+
+**Recommendation:** Build A first; it is what most teams need. Fold B into A's output. Add D as soon as CI produces `run_results.json`, because it turns "a test exists" into "the data passed".
+
+**Residual limit:** violations in data that no CI-run test covers, such as constraints checked only in production or tables loaded outside the tested pipeline.
+
+### §6.4 — Promote relationships that carry data to entities `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔ (all three: self or peer refs with relationship attributes scattered on one side)
+**Checkability:** `direct` for fat junctions (B) and for relationship columns added since the lock (C); a satellite-name match alone is heuristic and needs a second signal (M5).
+
+#### Design A — Relationship-attribute satellites (S + L, heuristic; M5)
+
+- *Measure:* For each ref field `x_id` (or `x` in Go), find sibling fields that share its stem: `^{stem}_(since|from|to|on|date|start|end|role|terms|location|notes)$` or `^{stem}(Since|From|Role|Terms|...)$`. Example: `spouse_id` with `spouse_since` (the source's `married_on` needs the `relationship_terms` lexicon, `{married_on, hired_on, enrolled_on}`, in config).
+- *Fails when:* at least one ref has at least `promote.min_satellites` satellites (default 1). Per M5, the name match alone reports at `note`. The finding reaches full severity when two independent signals agree:
+  1. **Type (S):** the satellite's type matches its suffix: `_since|_from|_to|_on|_date|_start|_end` is a date or timestamp, and `_role` or `_terms` is an enum, CHECK or text.
+  2. **Graph (G):** the ref is a self-reference, or points to a peer entity of the same kind (`person.spouse_id`). A satellite on a ref to a master or reference entity, such as `product_since`, usually describes the source row and is not a relationship attribute.
+- *Suggestion:* "`{entity}.{ref}` carries relationship data ({satellites}). Promote it to an entity: `{rel_name}({rel_name}_id PK, {entity}_id, {target}_id, {satellites...})` (for a self-reference: `{entity}_a_id`, `{entity}_b_id`), and drop `{ref}` and its satellites from `{entity}`."
+- *Limits:* `{stem}_at`, `{stem}_type`, and `{stem}_status` are left out of the default pattern. `_at` timestamps are often ordinary event times, `_type` is usually the polymorphic pair from §6.2, and `_status` is usually a copied attribute of the target (§7.4).
+
+#### Design B — Fat junction without its own key (S + G, deterministic)
+
+- *Measure:* A junction is an entity whose PK, or a unique key, is made entirely of two or more FK columns. Count its non-key columns.
+- *Fails when:* the junction has at least `promote.junction_attrs` non-key columns (default 2), *and* another entity references it, or a query in the corpus filters on one of those columns. In other words, the relationship has become an entity without getting a surrogate key or a business name.
+- *Suggestion:* "`{entity}` has grown into a relationship entity ({n} attributes). Give it a surrogate key `{entity}_id`, keep `({fk_a},{fk_b})` as `UNIQUE`, and name it for the business relationship (e.g. `enrollment`, not `student_course`)."
+- *Limits:* `order_items` legitimately has attributes and is already an entity. Junctions with a name in the glossary are exempt. Without a query corpus, only the "referenced by another entity" condition is checked.
+
+#### Design C — Temporal-relationship growth since the lock (H, deterministic; M3)
+
+- *Measure:* Compare the current IR with `mml.lock.json` (M3), or with the base IR in diff mode. Flag changes that add a `{stem}_since`, `{stem}_until`, `{stem}_role` or `{stem}_terms` column next to an existing ref, or that turn a single ref into `{stem}_1_id`/`{stem}_2_id`.
+- *Fails when:* such a change appears in the lock diff. The change is visible in the working tree, so the check runs in the MVP without git history.
+- *Suggestion:* "This migration adds relationship data `{column}` to `{entity}`. Model the `{stem}` relationship as its own entity instead of widening `{entity}`."
+- *Limits:* It catches only changes since the last lock, not existing debt. A and B cover existing debt.
+
+**Recommendation:** B and C in the MVP; both are deterministic. A in the MVP under M5, so a name match alone is only a `note`.
+
+**Residual limit:** a relationship that carries data only as a free-text note, or as attributes named without its stem (`anniversary` beside `spouse_id`), matches neither the name, nor the junction shape, nor the lock diff.
+
+### §6.5 — Embed versus reference in document models `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ (nested struct and slice fields serialized to BSON/JSON) · SQL ◐ (`JSONB` columns holding sub-documents) · JSON ✔ (inline `properties`/`items` objects versus `$ref`)
+**Checkability:** `direct` with `declared` overrides. Embedding is the default and does not need justification. These designs fire only on the rule's three triggers for referencing: shared, changes independently, or grows without bound. An array of references across a many-to-many relationship read by shared or analytical consumers is reported by §6.1-A, not here.
+
+#### Design A — Shared-shape embedding detector (G, deterministic)
+
+- *Measure:* Compute a structural fingerprint for every inline object: the sorted field names and logical types, hashed. Cover Go nested structs, JSON Schema inline `object`s, and `$ref` targets that are inlined by value. Group fingerprints whose field-name sets have Jaccard similarity ≥ `embed.similarity` (default 0.8), or that exactly match a top-level entity.
+- *Fails when:* an embedded object matches a top-level entity or appears under two or more parent entities. That means the data is **shared** and should be referenced.
+- *Suggestion:* "`{parent}.{field}` embeds a copy of `{shared_entity}` (match {score}); the same shape is also embedded in {others}. Store `{shared_entity}_id` and reference the shared record instead."
+- *Limits:* Value objects such as `Address` or `Money` are legitimately repeated. Exempt them with `//mml:value-object` (Go), `-- mml:value-object` (SQL) or `"x-mml-value-object": true` (JSON). An intentional snapshot (the product as it was at purchase, §6.6) needs `waive §6.5 reason="snapshot"`.
+
+#### Design B — Unbounded-growth embedding (S, heuristic; M5)
+
+- *Measure:* For each embedded array (a Go `[]T` with a `bson`/`json` tag, or a JSON `type: array` of objects), read its declared bound: `maxItems` (JSON), `validate:"max=N"` (go-playground/validator, where `max` on a slice means length), or `x-mml-max-items`. Then look for signs of unbounded growth: a name matching `(?i)(history|events|log|orders|messages|transactions|activity)`, or an item type with a timestamp field, which suggests an append-only stream.
+- *Fails when:* there is no bound, or the bound is above `embed.max_items_ceiling` (default 100), *and* at least one growth sign is present. Per M5, a name or timestamp growth sign alone reports at `note`. It reaches full severity when an independent append signal (Q) agrees on the same path. Append signals are:
+  - a MongoDB update whose `bson.M`/`bson.D` literal has `$push` or `$addToSet` on `{field}`;
+  - Go `parent.{Field} = append(parent.{Field}, ...)` followed in the same function by a save of `parent`;
+  - SQL `jsonb_insert` or `||` concatenation on that path.
+- *Suggestion:* "`{parent}.{field}` embeds an unbounded list of `{item}`. Move it to a separate `{item}` collection keyed by `{parent}_id`, or declare `maxItems` (≤ {ceiling}) if the list is truly bounded."
+- *Limits:* The growth signs are guesses until an append is observed. A bounded `status_history` with a few entries stays at `note` until it declares `maxItems`. Appends made by code outside the corpus are not seen.
+
+#### Design C — Independent-change detection from writes (Q, deterministic)
+
+- *Measure:* In the code corpus, find writes that update a nested path without changing the parent's own fields. Examples are MongoDB update documents whose `bson.M`/`bson.D` literal keys contain a dotted or positional path (`"items.$.price"`), and SQL `jsonb_set`/`jsonb_set_lax(col, '{product,price}', ...)`.
+- *Fails when:* an embedded sub-object is updated independently at two or more distinct call sites.
+- *Suggestion:* "`{parent}.{path}` is updated independently of `{parent}` at {sites}. It changes on its own schedule, so reference it instead of embedding it."
+- *Limits:* Needs the code corpus. Detection is exact for constant update paths, which is why the label is deterministic. Update keys built at run time (`fmt.Sprintf("items.%d.price", i)`) are found only when the format string is constant. Other dynamic keys are missed (a false negative), never guessed.
+
+**Recommendation:** A and B in the MVP; A shares its fingerprint code with §4.10. In the MVP, B's findings stay at `note` until the Phase 2 append signal can confirm them. C is Phase 2.
+
+**Residual limit:** "changes independently" and "grows without bound" are facts about future use. The linter can see them only once code that does so exists in the corpus, or once a bound is declared.
+
+### §6.6 — Store transaction-time values on the line item `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔ (line-item entities with an FK to a priced master)
+**Checkability:** `direct` (structure) and `direct` (queries)
+
+#### Design A — Line item missing its price snapshot (G + L, heuristic; M5)
+
+- *Measure:* Identify line-item entities **structurally**. An entity is a line item when its PK or a UNIQUE key contains an FK to a header entity, as in `(order_id, line_no)` or `(order_id, product_id)`, and it has a second FK to a master entity. That check is deterministic. A name matching `(?i)(_items?|_lines?|_line_items?|LineItem|Item)$` is used only when the entity has no key. On the master, find "volatile value" fields with a decimal, int, or float type whose name matches `(?i)(price|cost|rate|fee|discount|tax_rate)`. Check whether the line item has a field with the same stem (`unit_price`, `price_at_purchase`).
+- *Fails when:* a volatile master field exists and the line item has no counterpart field. Per M5, a volatile field found only by its name reports at `note`. The finding reaches full severity when an independent signal shows the field is actually volatile:
+  - **Q:** a query or Go write updates it, through an `UpdateStmt` whose `targetList` sets `{master}.{price}` or an ORM `Update("{price}", ...)`;
+  - **G/S:** the master has validity columns (`valid_from`/`valid_to`, §9.5), so its values change over time by design.
+- *Suggestion:* "`{line}` references `{master}` but does not capture `{master}.{price}` when the transaction happens. Add `{line}.{price} {type} NOT NULL`, copied from `{master}` at insert, so historical totals do not change when prices do."
+- *Limits:* Volatility is judged by name until an update path or validity columns confirm it. A price changed only by a back-office tool outside the corpus stays at `note`. Config `snapshot.fields` lists the stems to check, and `snapshot.exempt` lists master fields that never change, such as a fixed `list_price` on a versioned price table.
+
+#### Design B — Query-side price derivation (Q, deterministic)
+
+- *Measure:* In query ASTs, find arithmetic expressions (pg_query `A_Expr` with `*` or `+`) where one operand resolves to a line-item column and the other to a volatile field on its master. Operands are resolved through `ColumnRef` and the `RangeVar` aliases in the `JoinExpr`.
+- *Fails when:* such an expression exists. It is reported at the rule's full severity when it sits inside `SUM()` or another aggregate.
+- *Suggestion:* "{file}:{line} computes `{expr}` from the current `{master}.{price}`. Use `{line}.{price}` captured at purchase, or add that column (§6.6)."
+- *Limits:* Needs a query corpus. It is exact when the aliases resolve; `SELECT *` through views is resolved only if the view definition is in the corpus.
+
+**Recommendation:** Both are cheap. A in the MVP, using structural line-item detection and the validity-column confirmation. B and A's update-path confirmation in Phase 2.
+
+**Residual limit:** a master value that is mutable in principle but never updated by code in the repo cannot be shown to be volatile. Without B's query evidence it stays a `note`.
+
+### §6.7 — Mark inferred relationships with confidence and a threshold `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔ (match, similarity, and recommendation entities)
+**Checkability:** `direct` (lexical trigger) plus `declared`
+
+#### Design A — Inferred-link field completeness (L + S, heuristic)
+
+- *Measure:* Identify inferred-relationship entities. Either the name matches `(?i)(match|similar|recommend|candidate|dedup|link_suggest|resolution)`, or the entity has a field named like `(?i)(score|similarity|cosine|distance|probability)` together with two refs to the same or related entities. Each such entity must have three fields:
+  - a confidence field (`confidence|score|probability`, numeric, NOT NULL);
+  - a method or version field (`match_method|model_version`);
+  - a decision field (`status|review_status|decision`) whose enum includes a review state such as `pending_review`.
+- *Fails when:* any of the three required fields is missing.
+- *Suggestion:* "`{entity}` records inferred links between `{a}` and `{b}` but lacks {missing}. Add `confidence NUMERIC NOT NULL`, `match_method TEXT NOT NULL`, and `review_status CHECK (review_status IN ('auto_applied','pending_review','rejected','confirmed'))`."
+- *Limits:* An entity not caught by the lexical trigger is missed unless it declares `inferred` (Design C). `distance` and `score` also appear in non-inferential contexts, such as delivery distance or a credit score with two refs, which are false positives to waive.
+
+#### Design B — Inferred refs must not feed enforced paths (G + Q, deterministic)
+
+- *Measure:* Tag entities as `inferred` (from A, or from `//mml:inferred threshold=0.9`). Tag entities as `consequential` through `//mml:consequential` or `x-mml-consequential`, or by default when the name matches `(?i)(invoice|payment|billing|ledger|compliance|payout)`. Then search queries and Go code for writes into a consequential entity whose key value comes from a column of an inferred entity. In SQL that is an `InsertStmt` whose `selectStmt` reads the inferred entity. In Go it is `go/ssa` dataflow from a scanned row into an insert parameter.
+- *Fails when:* such a flow exists without a predicate on `review_status = 'confirmed'` or `confidence >= {declared threshold}`.
+- *Suggestion:* "{site} writes `{consequential}.{key}` from inferred `{inferred}` with no confidence gate. Filter with `confidence >= {threshold}` and `review_status = 'confirmed'`, or use the enforced `{key}` from `{golden}`."
+- *Limits:* SQL `INSERT ... SELECT` flows are exact. Go dataflow is approximate, so findings that come only from SSA are reported one severity lower.
+
+#### Design C — Declared threshold contract (C, deterministic)
+
+- *Measure:* Every inferred entity, whether marked by A's trigger or by an `inferred` annotation, must declare `inferred: {confidence: <field>, threshold: <0..1>, review_queue: <entity>}`. The named field must exist and be numeric, and the named queue entity must exist.
+- *Fails when:* the declaration is missing, the threshold is not in (0, 1], the confidence field is missing or not numeric, or the review-queue entity does not resolve.
+- *Suggestion:* "Declare `//mml:inferred confidence={field} threshold=<agreed value> review_queue=<entity>` on `{entity}`."
+- *Limits:* The linter checks that a threshold exists, not that it was agreed with the business. Boilerplate such as `threshold=0.5` passes.
+
+**Recommendation:** A in the MVP. B is the high-value check for Phase 2.
+
+### §6.8 — Consider a graph store for many-hop traversal `[CONSIDER][ARCH]`
+
+**Applies to:** Go ◐ (recursive struct `Parent *Self`) · SQL ✔ (self-referencing FKs, recursive CTEs) · JSON ◐ (recursive `$ref`)
+**Checkability:** `direct` (queries), `note` severity
+
+#### Design A — Recursive-CTE depth and fan audit (Q, deterministic)
+
+- *Measure:* Find pg_query `WithClause{recursive: true}`. For each recursive `CommonTableExpr`, record the number of relations joined in its recursive term (the right arm of the `UNION`), whether it has a depth guard (a `WHERE` predicate on a counter column, such as `depth < N`), and which entity it traverses. Also count the recursive CTEs that traverse each entity across the corpus.
+- *Fails when:* an entity is traversed by at least `graph.recursive_ctes` recursive CTEs (default 3), *or* a recursive term joins at least 2 relations.
+- *Suggestion:* "`{entity}` is traversed recursively in {n} queries ({files}); {detail}. If many-hop traversal is a core use case, consider a graph store or a closure table `{entity}_closure(ancestor_id, descendant_id, depth)`."
+- *Limits:* Advisory only (`note`). A missing depth guard is mentioned in `{detail}` but does not trigger the finding by itself. Recursion done in Go loops instead of SQL is not seen.
+
+#### Design B — Self-reference topology (G + S, deterministic)
+
+- *Measure:* In the ref graph, find self-loops (`parent_id REFERENCES` the same table, Go `Parent *T` or `Children []T`, JSON `$ref: "#"`) and peer many-to-many self-junctions (`friendships(person_a_id, person_b_id)` where both columns reference the same table).
+- *Fails when:* a self-junction exists, which makes the data graph-shaped. A plain `parent_id` hierarchy is reported only when Design A also finds recursive traversal of it, because simple trees are common and fine in relational stores.
+- *Suggestion:* "`{junction}` models a graph over `{entity}` (self many-to-many). If questions need more than 2 hops (friend-of-friend), evaluate a graph store; otherwise ignore this note."
+- *Limits:* The structure shows that the data can be traversed as a graph, not that anyone does so. That is why the severity is `note`.
+
+**Recommendation:** A, since it measures real usage. Fold B in as context.
+
+## §7 — Grain
+
+### §7.1 — Document the grain of every table `[MUST][CODE]`
+
+**Applies to:** Go ✔ (`//mml:grain`) · SQL ✔ (`@grain:` in `COMMENT ON TABLE`; views and dbt models too) · JSON ✔ (`x-mml-grain`). This includes feature sets (`layer: feature`).
+**Checkability:** `declared` for the statement itself; `direct` for whether it agrees with the keys (M2), and for whether it is stale after a key change (M1).
+
+#### Design A — Grain-statement contract (C, deterministic)
+
+- *Measure:* Read the `grain` annotation and match it against `(?i)^one row per [a-z0-9_ ]+?( per [a-z0-9_ ]+?)*( \([^)]*\))?$` (config `grain.pattern`). The trailing group allows a qualifier such as "(UTC)". Tokenize the nouns after each "per" and resolve each one to an entity, a field, or a time unit (`calendar day`, `hour`, `snapshot date`, ...).
+- *Fails when:*
+  - the statement is missing, does not match the pattern, or names a noun that resolves to nothing;
+  - **(M1)** the statement's `fp=` no longer matches the entity's key fingerprint, the hash of its PK and UNIQUE column sets and their FK targets. The finding is `mml/stale-declaration`: "the key changed since this grain was written".
+
+  Entities with `lifecycle: scratch` are exempt (§1.7). Only key changes make a grain stale; adding a non-key column does not.
+- *Suggestion:* "`{entity}` has no grain statement. Run `mixedmodellint annotate --rule 7.1`, which writes `{syntax_for_source}` prefilled with the inferred `one row per {inferred}` and `fp={fp}`." The inference (M2) maps each PK column to its referenced entity name, or to its time unit for date columns, so PK `(product_id, sale_date)` → "one row per product per sale date". For a stale grain: "`{entity}`'s key changed from `({old})` to `({new})` since its grain was written. Confirm or correct `{grain}`, then run `annotate --refresh`."
+- *Limits:* A statement that restates the inferred key passes. That is intended, since the rule asks for the grain to be documented, and restating a correct key is documenting it. A wording that is accurate but unhelpful (`one row per row`) fails resolution. Design B catches statements that contradict the structure.
+
+#### Design B — Grain ⇔ key consistency (S + G, deterministic)
+
+- *Measure:* Map the grain nouns to columns: an entity noun maps to its FK/PK column, and a time unit maps to a date or timestamp field. Compare that set with the PK and each UNIQUE key.
+- *Fails when:* a grain is declared but no PK or unique key equals the grain column set. This covers a key with extra columns (the grain is coarser than the key) and a key that lacks grain columns (the grain is finer than the key). A declared grain on an entity that has **no** key at all is reported as `grain unverifiable: no key`, because a grain with nothing to enforce it is the §7.3 duplicate-row hazard. The suggestion is the inferred key.
+- *Suggestion:* "Grain `{grain}` implies key `({grain_cols})`, but `{entity}` has {pk_desc}. Add `UNIQUE ({grain_cols})` or correct the grain statement."
+- *Limits:* JSON documents rarely declare keys; there the check uses `x-mml-key`. On non-enforcing platforms, a declared `NOT ENFORCED` key still counts, and §6.3 checks that it is tested.
+
+#### Design C — Grain inferred from writes (Q, heuristic)
+
+- *Measure:* Find `INSERT ... ON CONFLICT (cols)` (pg_query `InsertStmt.onConflictClause.infer.indexElems`) and `MERGE ... ON` (`MergeStmt.joinCondition`, when it is a conjunction of column equalities) in the corpus. Their keys are the actual grain that the writers rely on.
+- *Fails when:* a declared grain exists and the inferred write key ≠ the declared grain key.
+- *Suggestion:* "Writers upsert `{entity}` on `({cols})` at {site}, but the declared grain implies `({grain_cols})`. Reconcile them."
+- *Limits:* Needs the query corpus. `ON CONFLICT ON CONSTRAINT name` has to resolve the constraint by name, and `MERGE` conditions that use expressions are skipped.
+
+**Recommendation:** A and B in the MVP, with M1 and M2 built in. The rest of §7 builds on them.
+
+**Residual limit:** a grain is a statement of meaning. The linter can check it against keys and writers, but not whether it is what consumers *believe* a row represents. A keyless JSON document's grain can be checked only against `x-mml-key`.
+
+### §7.2 — Annotate join grain effects; no fan-out aggregation `[MUST][CODE]`
+
+**Applies to:** Go ◐ (embedded SQL) · SQL ✔ (queries, views, dbt models) · JSON ✘
+**Checkability:** `direct` (with FK cardinality from the IR)
+
+#### Design A — Static fan-out analysis (Q + G, deterministic)
+
+- *Measure:* For each `SelectStmt`, build the join tree from `JoinExpr`/`FromExpr`. For each join edge, classify the equality columns in `JoinExpr.quals` against the IR. If the columns on one side cover that side's PK or a UNIQUE key, the edge is N:1 and **preserves** the grain of the other side. If they match only an FK pointing to the covered side, the edge is 1:N and **raises** the grain to the child. Then run two checks.
+  1. For each aggregate `FuncCall` (`sum`, `avg`, or `count` with `agg_distinct = false`, including `agg_star`) whose argument comes from relation R, check whether a join on the path raises the grain relative to R.
+  2. Check whether two or more distinct 1:N child branches hang off the same parent (the "chasm trap"), which the rule's parenthetical singles out.
+- *Fails when:* (1) a measure from R is aggregated after a grain-raising join outside R's subtree, or (2) two sibling 1:N branches feed the same `GROUP BY` without each first being aggregated in its own subquery or CTE (`CommonTableExpr` with a `groupClause` on the parent key).
+- *Suggestion:* "{file}:{line}: `SUM({col})` from `{R}` is computed after `JOIN {child}`, which raises grain to one row per {child}, so `{col}` is counted once per {child}. Aggregate `{child}` in a CTE grouped by `{key}`, then `LEFT JOIN` the result." For (2): "Aggregate `{c1}` and `{c2}` separately by `{parent_key}` and join the aggregates (§7.2)."
+- *Limits:* Joins on non-key columns are reported as `unknown` cardinality at warning severity. `COUNT(DISTINCT ...)` and `MAX/MIN` are immune to fan-out and are not flagged.
+
+#### Design B — Join-effect annotation contract (C, deterministic)
+
+- *Measure:* Every `JOIN` in a model file (`models/**/*.sql`, or other configured globs) must have an adjacent comment matching `--\s*grain:\s*(preserves|raises|lowers)\b(.*)`. Comments come from `pg_query.Scan` tokens of kind `SQL_COMMENT`, and each is matched to the nearest following `JOIN` keyword token by byte offset. The declared effect is compared with Design A's computed classification.
+- *Fails when:* the annotation is missing, or the declared effect ≠ the computed one.
+- *Suggestion:* "Annotate the join at {line}: `-- grain: {computed} ({detail})`." If the annotation disagrees: "Annotation says `preserves`, but `{right}.{col}` is not unique, so this join raises grain to one row per `{right}`."
+- *Limits:* This is noisy for large dbt projects, so it is opt-in (`rules.7_2.require_join_annotations`). Jinja-templated SQL has to be compiled first (`dbt compile`) before it can be scanned.
+
+#### Design C — Row-count assertion presence (A, deterministic)
+
+- *Measure:* For each model that contains a grain-raising join according to A, look for a row-count test: dbt `dbt_utils.equal_rowcount` or `dbt_utils.fewer_rows_than` comparing it with the parent model, `dbt_expectations.expect_table_row_count_to_equal_other_table`, or an `mml.yaml` `rowcount_checks` entry.
+- *Fails when:* no row-count test exists for that model.
+- *Suggestion:* "`{model}` changes grain at {line}. Add a row-count test comparing it with `{parent}`, e.g. `data_tests: [dbt_utils.fewer_rows_than: {compare_model: ref('{parent}')}]` (or `equal_rowcount` if the join should preserve grain)."
+- *Limits:* It checks only that a test exists, not that it compares the right models. Depends on A's classification.
+
+**Recommendation:** A is the core engine (Phase 2; it needs the query corpus). Treat B as opt-in for strict teams.
+
+### §7.3 — Idempotent incremental loads at the stated grain `[MUST][ARCH]`
+
+**Applies to:** Go ✔ (loader code and its SQL literals) · SQL ✔ (load scripts, dbt incremental models) · JSON ✘
+**Checkability:** `direct` (write-path shape)
+
+#### Design A — Write-statement idempotency classifier (Q, deterministic)
+
+- *Measure:* Classify each write to an entity that has a declared grain.
+  - **Non-idempotent:** a plain `InsertStmt` without `onConflictClause`, or a dbt `materialized='incremental'` model with `incremental_strategy='append'` (append ignores `unique_key`).
+  - **Idempotent:** `INSERT ... ON CONFLICT ({cols}) DO UPDATE|NOTHING`, `MergeStmt`, a `DELETE` with the same partition predicate followed by an `INSERT` in the same transaction, `INSERT OVERWRITE` (Spark, Databricks, Hive), `TRUNCATE` + `INSERT`, and dbt incremental models with a `unique_key` and an `incremental_strategy` of `merge`, `delete+insert`, or `insert_overwrite` (or the adapter's default when that is not `append`).
+
+  For idempotent writes, compare the conflict or merge key with the grain key from §7.1.
+- *Fails when:* the statement is non-idempotent, or it is idempotent on a key ≠ the grain key.
+- *Suggestion:* "{site} appends to `{entity}` with a plain INSERT, so a retry duplicates rows at grain `{grain}`. Use `INSERT ... ON CONFLICT ({grain_cols}) DO UPDATE` or `MERGE ... ON ({grain_cols})`, or replace the `{partition}` partition."
+- *Limits:* Append-only event tables are fine when a PK or UNIQUE on an event ID rejects duplicates; a plain INSERT into such a table, and `ON CONFLICT DO NOTHING` on that key, are treated as idempotent. A transaction that spans several Go calls can make the delete+insert pairing unrecognizable.
+
+#### Design B — Dedup-key structure (S + C, deterministic)
+
+- *Measure:* Select entities with `layer: event|analytical|feature` or an annotation `load: incremental`. For each, check whether a PK or UNIQUE exists that equals the grain columns, or that consists of an `event_id`/`idempotency_key` field.
+- *Fails when:* no such constraint exists. On a non-enforcing platform it also fails when the key is not covered by a §6.3 uniqueness test.
+- *Suggestion:* "`{entity}` is loaded incrementally but nothing rejects duplicates at grain `({grain_cols})`. Add `UNIQUE ({grain_cols})` or an `idempotency_key` with a unique test."
+- *Limits:* A unique key prevents duplicate rows but does not make a non-idempotent load succeed on retry: the retry fails instead. Design A is still needed to check the write path. Full-refresh tables (`load: full`) are exempt.
+
+#### Design C — Retry wrapper detection (Q on Go, heuristic)
+
+- *Measure:* Find Go retry loops (`for attempt :=` loops that `continue` on error, `backoff.Retry` from cenkalti/backoff, `retry.Do` from avast/retry-go) whose body reaches a write that Design A classifies as non-idempotent.
+- *Fails when:* a retry wraps a non-idempotent write.
+- *Suggestion:* "`{func}` retries `{stmt}` on error, which can insert duplicates. Make the write idempotent on `({grain_cols})` first."
+- *Limits:* Retries outside the process (job schedulers, Pub/Sub redelivery) are invisible. Starts at `warning`.
+
+#### Design D — Readers deduplicating at the grain (Q, deterministic; confirms §7.1-B under M5)
+
+- *Measure:* In the query corpus, find reads that remove duplicates from an entity E with a declared or inferred grain key K:
+  - `ROW_NUMBER()`, `RANK()` or `DENSE_RANK()` `OVER (PARTITION BY p ...)` compared `= 1` in an outer `WHERE`, or in `QUALIFY` on dialects that have it;
+  - `SELECT DISTINCT ON (p)` (pg_query `SelectStmt.distinctClause` with expressions);
+  - a plain `SELECT DISTINCT` (`distinctClause` holding a single `nil` entry) whose target list covers K;
+  - `GROUP BY p` with only `MAX`/`MIN`/`ANY_VALUE` aggregates, the hand-written form of the same deduplication.
+
+  Resolve `p` through `ColumnRef` to E's columns.
+- *Fails when:* `p` covers K, which means readers expect more than one row per grain value. Either E's grain key is not enforced (§7.1-B, §7.3-B) or the stated grain is wrong. A dedup on a set that does not cover K is not reported, because it changes grain on purpose (§7.2). Excluded:
+  - E is temporal or SCD (`time=valid_from|txn_from` fields, §9.5) and the window orders by that field descending, which is a latest-version read, not a repair;
+  - E has `layer: staging` and the query is the model that builds the next layer, since deduplicating raw input once, at the boundary, is where it belongs;
+  - E's key is `NOT ENFORCED` on a non-enforcing platform and §6.3 already reports the missing uniqueness test (one finding, not two).
+- *Suggestion:* "{file}:{line} deduplicates `{E}` on `({p})`, which is its grain key, so `{E}` holds duplicates at its stated grain `{grain}`. Make the load idempotent on `({p})` (§7.3-A) and add `UNIQUE ({p})` (or a uniqueness test on a non-enforcing platform), then drop the dedup. If several rows per `({p})` are expected, the grain is finer: correct the grain statement (§7.1)." With M4 results, a failing uniqueness test on the same key is cited as the evidence.
+- *Limits:* Needs the query corpus (Phase 2). Deduplication written in Go (a `map` keyed by ID before an insert) or in a dataframe library is not seen. One dedup in the staging model is acceptable, so the check counts reads outside that model; `rules.7_3.d.min_sites` (default 1) raises the threshold for teams that tolerate defensive dedups.
+
+**Recommendation:** B in the MVP (structure only). A in Phase 2; it is the real check. D in Phase 2 alongside A: it reports the symptom readers already work around, and it agrees with §7.1-B's key check under M5.
+
+### §7.4 — Columns must belong to the stated grain `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔
+**Checkability:** `direct` through copy-on-write evidence (D) and the mixed-grain contract (B); the name and dependency signals (A, C) are heuristic and reach full severity only together (M5). A rollup table that holds several levels is allowed when it has a `grain_level` column and every query filters on it.
+
+#### Design A — Coarser-grain column prefix detector (L + G, heuristic; M5)
+
+- *Measure:* Take a child entity C with a parent P, linked by an FK where C's grain is finer than P's. Flag fields of C whose name starts with the name of P or of another ancestor: `(?i)^({parent}|{ancestor})s?_` (`order_shipping_fee` on `order_lines`). As a weaker, note-level signal, also flag the tokens `(?i)(lifetime|header|overall)`, as in `customer_lifetime_value`.
+- *Fails when:* such a field exists and is not annotated `denormalized_for=<constraint>` (the §3.2 key). Per M5, A alone reports at `note`. The finding reaches full severity when C's dependency signal or D's copy-on-write evidence agrees on the same field.
+- *Suggestion:* "`{child}.{field}` describes `{parent}` (coarser grain), so it repeats per line and inflates sums. Move it to `{parent}`, or mark it `measure=non_additive` and document why it is denormalized."
+- *Limits:* Names that refer to the child's own grain (`line_total`, `{child}_total`) are excluded, and plain `total` is never a trigger. An FK such as `order_id` is excluded by definition.
+
+#### Design B — Mixed-grain discriminator contract (S + C, deterministic)
+
+- *Measure:* Detect a rollup or mixed-grain table. Signals: the grain statement contains "or"; a field named `(?i)^(grain_level|period_type|granularity|agg_level)$` exists; or nullable dimension keys appear together with a `total`/`rollup` table name. For such a table, require a `grain_level` field that is NOT NULL and constrained by an enum CHECK. With the query corpus, also require every query that aggregates the table to have a `WHERE grain_level =` predicate (an `A_Expr` on that `ColumnRef` in `whereClause`).
+- *Fails when:* mixed grain is detected without an enum-constrained `grain_level`, or a query aggregates the table without filtering on `grain_level`.
+- *Suggestion:* "`{entity}` mixes grains ({levels}). Add `grain_level TEXT NOT NULL CHECK (grain_level IN ({levels}))`, and filter it in {n} queries: {sites}. Better still, split it into one table per grain."
+- *Limits:* A mixed table with no discriminator column and no "or" in its grain is detected only through the nullable-keys signal, which is weak. The query half needs Phase 2.
+
+#### Design C — Functional-dependency check across linked entities (G, heuristic; M5)
+
+- *Measure:* For each child field, check whether an ancestor reachable by FK has a field with the same name and logical type, and whether the child has the FK to that ancestor. If both hold, the child's value presumably depends on the ancestor key.
+- *Fails when:* the dependency holds and the field is not annotated `denormalized_for=`. Per M5, C alone reports at `warning`; the same-name-and-type match is a stronger signal than A's prefix. It reaches full severity when A or D agrees.
+- *Suggestion:* "`{child}.{field}` duplicates `{ancestor}.{field}` and depends on `{fk}`, not on the grain `{grain}`. Read it with a join instead."
+- *Limits:* System and audit columns (`time=system`, `id`, `created_at`, `updated_at`, `deleted_at`, `_loaded_at`) and generic names (`name`, `status`, `description`) are excluded through `grain.fd_exclude`. A line-level `status` is legitimately its own attribute.
+
+#### Design D — Copy-on-write from the coarser grain (Q, deterministic)
+
+- *Measure:* In the query and code corpus, find writes to child C that take a field's value from an ancestor P.
+  - In SQL, an `InsertStmt` or `UpdateStmt` whose `ResTarget` for `C.{field}` resolves (via `ColumnRef` and the `JoinExpr` aliases) to `P.{field2}`. Typical forms are `INSERT INTO order_lines (... order_shipping_fee) SELECT ..., o.shipping_fee FROM orders o JOIN ...` and `UPDATE order_lines l SET order_shipping_fee = o.shipping_fee FROM orders o WHERE ...`.
+  - In Go, a `go/ssa` flow from a field load on a value of P's struct type into the field store on C's struct before C is saved.
+- *Fails when:* such a copy exists, the copied field is not part of C's grain key, and it is not annotated `denormalized_for=`. This is the dependency on a coarser grain observed directly, without relying on names.
+- *Suggestion:* "{site} copies `{parent}.{field2}` into every `{child}` row as `{field}`, so it repeats per line and is multiplied when summed. Read it from `{parent}` with a join, or declare `denormalized_for=<reason>` and mark it `measure=non_additive` (§7.4)."
+- *Limits:* Needs the query or code corpus (Phase 2). A copy made by an external ETL tool is not seen. Go data flow through interfaces or reflection-based ORMs is missed. A copy into a field that is legitimately the child's own snapshot (unit price, §6.6) is exempt when the field is named in `snapshot.fields`.
+
+**Recommendation:** C in the MVP (fewest false positives once audit columns are excluded), then A, then B. D and B's query part in Phase 2. D is the strongest evidence and confirms A and C under M5.
+
+**Residual limit:** a coarser-grain field that is neither named after its parent, nor shares a name with the parent's field, nor is written by code in the corpus cannot be told apart from a genuine line attribute without a declaration.
+
+### §7.5 — Store events at the lowest grain; keep paths to atomic data `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ · SQL ✔ · JSON ◐
+**Checkability:** `direct` (lineage, and data-removing changes against the `mml.lock.json` lock, M3, or in diff mode); `declared` for the recoverable-upstream exception
+
+#### Design A — Aggregate lineage completeness (G + Q, deterministic)
+
+- *Measure:* Classify aggregate entities by any of three signals:
+  - a name matching `(?i)^(agg_|daily_|weekly_|monthly_|summary_|rollup_)|_(daily|weekly|monthly|summary|totals?)$`;
+  - `layer: analytical` with a `grain` whose time unit is coarser than its source's;
+  - a view or model with a `groupClause`.
+
+  For each aggregate, resolve its source relations from the defining query (`CREATE VIEW`, or a dbt model's `FROM`/`ref()`). Then check two things: (a) every source still exists in the catalog and is not marked deprecated, or is dropped but declares a valid `recoverable_from=` (see B), and (b) the aggregate keeps the keys that lead back, meaning every `GROUP BY` column that maps to a source key or dimension FK appears in the target list.
+- *Fails when:* (a) an aggregate has no resolvable atomic source, or its source is deprecated or dropped without a valid `recoverable_from=`; or (b) a grouping key that leads back to the source is projected away.
+- *Suggestion:* "`{agg}` has no path back to atomic data ({reason}). Keep `{keys}` in `{agg}`, so totals can be drilled down and re-cut. Keep `{source}` too (cold storage is fine), or, if the upstream system still holds the same events, declare `@recoverable_from: {upstream}` on it (§7.5)."
+- *Limits:* An aggregate materialized by an external tool, with no defining query in the repo, is reported as unresolvable unless it declares `source` lineage in `mml.yaml`. Name-only classification has false positives (`daily_` config tables), so those findings start at `warning`.
+
+#### Design B — Drop or truncate after aggregation (H, deterministic; M3)
+
+- *Measure:* Compare the current IR with `mml.lock.json` (M3), or with the base IR in diff mode. Entities and columns that are in the lock but gone from the IR are removed. The check also scans the migration files in the working tree, in order, for statements that remove event-layer data: `DROP TABLE`, `TRUNCATE`, retention deletes (`DELETE ... WHERE event_time < ...`), a lowered partition expiry (BigQuery `OPTIONS(partition_expiration_days=...)`, Snowflake `DATA_RETENTION_TIME_IN_DAYS`), or a dropped column. Flag the change *when* an aggregate depending on that entity exists or is added in the same PR.
+- *Fails when:* atomic data is removed while a summary of it exists, and the removed entity has no valid `recoverable_from=` declaration. The revised rule allows dropping atomic data that the upstream source systems can still supply. The declaration is valid when it names a declared source (§3.6) or an entity with `source: legacy|third_party`, and that upstream entity has the same grain key columns as the dropped one, after linking. The grain keys must also stay on `{agg}`, which Design A checks: keys back to the atomic data are always required.
+- *Suggestion:* "This change deletes event-level `{entity}` data while `{agg}` summarizes it. Either archive `{entity}` to cold storage, or, if `{upstream_candidate}` still holds the same events, declare `@recoverable_from: {upstream_candidate}` on `{entity}` and keep `{keys}` on `{agg}` (§7.5)."
+- *Limits:* Without a lock or a base ref, only the migration scan runs. That still catches `DROP` and `TRUNCATE` in migration files, but not a table removed by deleting its DDL file. The linter verifies that the named upstream exists and has matching keys, not that its own retention is long enough. Teams can record that with `recoverable_until=` and an owner, and the H check reports it once that date passes. Retention applied outside migrations (lifecycle rules on object storage, scheduled jobs) is not seen. Snowflake's `DATA_RETENTION_TIME_IN_DAYS` controls Time Travel rather than live data, so it is reported only as a `note`.
+
+#### Design C — Pre-aggregated ingestion (S + L, heuristic)
+
+- *Measure:* Find event-layer entities (`layer: event`, or names `*_events`). Flag one when its only time column has type `date` (with no timestamp), or when it has a numeric field matching `(?i)^(count|total|sum)_|_(count|total)$` and no PK or UNIQUE on an `event_id`-like field.
+- *Fails when:* either condition holds, because the table is already aggregated at ingest.
+- *Suggestion:* "`{entity}` stores events as `{field}` counts per {time}. Store one row per event with `event_id` and `event_time` at source precision (§9.8), and derive the counts."
+- *Limits:* Some sources only ever deliver pre-aggregated data (a vendor's daily report). Waive those with `source: third_party`.
+
+#### Design D — Queries that ask for finer detail than the source holds (Q, deterministic)
+
+- *Measure:* A grain works in one direction: a query can aggregate up from a source but never recover detail below it. For each query in the corpus, take each source relation R and its time grain: the declared grain's time unit (§7.1-A), or the type of R's time columns (`date` means day; a timestamp truncated at write time to a unit, §9.8-B, means that unit). Then find expressions that need a finer grain than R has:
+  - `date_trunc(u, c)`, `EXTRACT(u FROM c)`, `date_part(u, c)` where `u` is finer than R's time unit in the lattice `second < minute < hour < day < week < month < quarter < year` (for example `date_trunc('hour', sale_date)` on a `date` column, which PostgreSQL accepts and answers with midnight every time);
+  - a time-of-day comparison (`c >= '2026-06-03 09:00'`) on such a column.
+- *Fails when:* any such expression exists. Each finding names the needed unit, the available unit and, through §7.5-A's lineage, the nearest source that has the detail.
+- *Suggestion:* "{file}:{line} asks for `{needed}` from `{R}`, but `{R}`'s grain is `{grain}`, so every value falls in the same {available} and the result looks valid while saying nothing. Read `{finer_source}` instead (its grain is `{finer_grain}`)." When lineage finds no finer source: "No source in the repo holds `{needed}`-level data for `{R}`. Store `{R}` at a finer grain (§7.5), or declare `@recoverable_from: {upstream}` if the upstream system still has it."
+- *Limits:* Needs the query corpus (Phase 2). A column whose name says `_at` but whose type is `date` is judged by its type. The time unit of a JSON `string` with `format: date` is a day; one with no `format` is unknown and is skipped. Questions that need finer *dimensions* rather than finer time, for example grouping a by-region summary by store, fail to parse against the catalog and are §1.11-A's job when they are competency questions; otherwise they are compile errors the linter does not repeat.
+
+**Recommendation:** B, since deletes are the irreversible harm, followed by A. With the M3 lock, B runs in the MVP without git history. D joins A in Phase 2, since both read the query corpus; it is the book's "can you aggregate up from this grain to answer all known questions?" test turned around, applied to the questions the code already asks. Both now accept `recoverable_from=`, so the revised rule's "unless it can still be recovered from the upstream source systems" passes when the upstream is real and keyed alike. A bare claim does not pass.
+
+**Residual limit:** deletion outside the repo (object-storage lifecycle rules, scheduled purge jobs, manual `DELETE`), and upstream retention shorter than claimed, are invisible. Only `recoverable_until=` makes the second one checkable, and only as a date.
+
+### §7.6 — Tag agent-exposed datasets with grain and roll-ups `[CONSIDER][ARCH]`
+
+**Applies to:** Go ◐ · SQL ✔ · JSON ✔ (any entity marked `//mml:agent_exposed` / `"x-mml-agent_exposed": true`, or listed in `semantic_layer/*.yml`)
+**Checkability:** `declared` for exposure; `direct` for whether the declared roll-ups agree with the aggregates that actually derive from the entity (M2), and for whether they are stale (M1).
+
+#### Design A — Agent-exposure contract (C, deterministic)
+
+- *Measure:* Each agent-exposed entity must declare `grain` (§7.1) and `rollups: [day, month, ...]`. Each roll-up must be coarser than the grain, either in the time lattice `event < second < minute < hour < day < week < month < quarter < year` or in a dimension hierarchy (§2.3), and must map to an existing entity or semantic-layer metric. RAG chunk schemas (names matching `(?i)chunk|embedding|document_segment`) must also declare the chunk size and overlap in `grain` (e.g. `one row per 512-token chunk, 64 overlap`). Stream-window outputs must declare `window: {type, size}`.
+- *Fails when:*
+  - a required annotation is missing, or a roll-up is not coarser than the grain or does not resolve;
+  - **(M2)** the declared `rollups` contradict the inferred ones. The inferred roll-ups are the aggregate entities whose lineage resolves to this entity (§7.5-A) and whose grain is coarser. A declared roll-up with no deriving aggregate or semantic-layer metric fails. An inferred roll-up missing from the declaration is a `note`, because agents would not be routed to it;
+  - **(M1)** the `rollups` declaration's `fp=` no longer matches the hash of the set of deriving aggregates (`mml/stale-declaration`).
+- *Suggestion:* "`{entity}` is exposed to agents without grain tags. Run `mixedmodellint annotate --rule 7.6`, which writes `x-mml-grain: \"{grain}\"` and `x-mml-rollups: [{inferred}]`, inferred from `{aggregates}`." For a contradiction: "`{entity}` declares roll-up `{r}`, but no aggregate derived from it has grain `{r}`. Remove `{r}` or point it at the aggregate that serves it."
+- *Limits:* An entity that is reachable by agents but not marked as agent-exposed is not checked. Exposure itself has to be declared, or inferred from the semantic layer in Design B.
+
+#### Design B — Semantic-layer artifact sync (A, deterministic)
+
+- *Measure:* Parse `semantic_layer/*.yml`: dbt/MetricFlow `semantic_models[]` (`entities`, `dimensions[].type_params.time_granularity`) or Cube `cubes[]` (`dimensions[].granularities`). Compare each model's declared granularity with the IR grain of the entity it maps to.
+- *Fails when:* the semantic layer omits the granularity or disagrees with `grain`.
+- *Suggestion:* "Semantic model `{sm}` declares `time_granularity: {g1}`, but `{entity}` grain is `{grain}`. Align them."
+- *Limits:* Only MetricFlow and Cube formats are parsed. The comparison is meaningful only for the time component of the grain.
+
+**Recommendation:** A, at `note` severity. The roll-up inference needs §7.5-A's lineage, so it comes in Phase 2.
+
+**Residual limit:** exposure to agents has to be declared or present in the semantic layer. An entity that an agent can reach through raw SQL access, with neither, is not checked. RAG chunk size and overlap can be checked only as declared values.
+
+## §8 — Counting and Aggregation
+
+### §8.1 — Define the counted instance before reporting a count `[MUST][METHOD]`
+
+**Applies to:** Go ◐ (a struct field or method returning a count, such as `ActiveUsers int`, or a metric struct) · SQL ◐ (a count column such as `active_user_count`, or a view or query that projects `COUNT(*)`) · JSON ◐ (an integer property whose name contains a count token, in a metric or event schema).
+**Checkability:** `declared` for the activity predicate, period and source system. `direct` for the counted instance, which M2 infers from the `COUNT(DISTINCT x)` key and lineage, and for mismatches between the declared and inferred instance. `proxy` only for counts reported from outside the repo, such as hand-built BI tiles.
+
+#### Design A — Count-field contract with an inferred instance (C+Q, deterministic)
+
+- *Measure:* A field is a *count field* when it is annotated `counts=`, or when lineage shows it is populated by a count. The lineage cases are: a view, `CreateTableAsStmt`, dbt model or `INSERT … SELECT` whose `ResTarget` for that column is a `FuncCall` with `funcname = count`, or a semantic-layer measure with `agg: count|count_distinct`. For each count field, **infer the instance (M2):**
+  - For `count(DISTINCT x)` (`agg_distinct = true`), resolve `x` through `ColumnRef` to its column. The instance is the entity whose PK is that column, or the FK target when the column is an FK. `count(DISTINCT logins.account_id)` therefore infers `account`.
+  - For `count(*)` (`agg_star = true`) or `count(col)`, the instance is the grain entity of the counted relation (its `RangeVar` resolved to the IR).
+
+  The field must then carry the declared keys `active=` (the predicate, or `all`), `period=` (for example `trailing_30d` or `as_of_snapshot`) and `count_source=` (the system of record). `counts=` may be omitted, because the inferred instance fills it. When `counts=` is present, it must equal the inferred instance.
+- *Fails when:*
+  - any of `active=`, `period=` or `count_source=` is missing
+  - a declared `counts=` disagrees with the inferred instance, for example `counts=account` on a field computed as `count(DISTINCT device_id)`
+  - a declared `counts=` does not resolve to a logical entity in the IR
+- *Suggestion:* "`{entity}.{field}` counts `{inferred}` (from `{count_expr}` at {file}:{line}) but does not say what counts as active, over what period, or from which system. Add `mml:\"active=<predicate>;period=<range>;count_source=<system>\"` (Go), `@active:`/`@period:`/`@count_source:` lines in `COMMENT ON COLUMN` (SQL), or `x-mml-active`/`x-mml-period`/`x-mml-count_source` (JSON) (§8.1)." For a mismatch: "`{entity}.{field}` declares `counts={declared}` but is computed as `{count_expr}`, which counts `{inferred}`. Fix the declaration, or count `DISTINCT {declared_key}` (§8.1)."
+- *Limits:* inference needs the populating query in the corpus. A count field written by application code (`orders.item_count = len(items)`) has no lineage, so it is found only by annotation or by the name hint below. **Name hint (M5):** an integer field whose `Canonical` name has a count token (`count`, `num`, `users`, `accounts`, `customers`, `active`) but no lineage and no annotation reports at `note` with an `annotate` stub. It is promoted to a full count field only when a second signal agrees: the field sits on an entity whose grain is coarser than its upstream, or a Go assignment from `len(...)` or a counter increment targets it. `total` is not a count token, because `total_amount` is a sum. Boilerplate `active=all` passes; Design B checks it against the actual queries.
+
+#### Design B — Bare-`COUNT` query audit (Q, heuristic)
+
+- *Measure:* Walk the query corpus for `FuncCall` nodes with `funcname = count` whose `ResTarget.name` (the alias) contains a token from `active|unique|distinct|users|customers|accounts|devices|sessions`. For each one, record whether `agg_distinct` is set, whether `SelectStmt.whereClause` has a predicate on a temporal column (one annotated `time=`, or named `*_at`/`*_date`), the grain entity of the counted rows (from `RangeVar` resolution), and, for `count(DISTINCT x)`, the instance inferred from `x` as in Design A (M2).
+- *Fails when:* any of these holds.
+  - (i) The alias names an activity or uniqueness concept (`active`, `unique`) and the query has no time predicate.
+  - (ii) The call is `count(*)` or `count(col)` without `agg_distinct`, and the alias names an instance type different from the grain entity (alias `accounts` on table `logins`).
+  - (iii) The call is `count(DISTINCT x)` and the alias's instance token names a different entity from the one inferred from `x` (alias `active_users` over `count(DISTINCT device_id)`).
+- *Suggestion:* "`{alias}` at {file}:{line} is `{expr}`, which counts `{inferred}`{, with no time range}. Use `COUNT(DISTINCT {instance_key})` with an explicit window, for example `WHERE {time_col} >= $1 AND {time_col} < $2`, and record the definition in the metric's description (§8.1)."
+- *Limits:* the alias token is a guess, so (ii) and (iii) report at full severity only under M5. A second signal must agree: the query feeds a stored count field or a semantic-layer metric (lineage), or the alias token resolves exactly to an entity's `Canonical` name. Otherwise they report at `note`. Condition (i) needs no second signal, because a missing time predicate is structural. Dashboards defined in BI tools outside the repo are invisible. A plain `COUNT(*) AS order_count FROM orders` is correct and is not flagged.
+
+#### Design C — Semantic-layer metric completeness (A, deterministic)
+
+- *Measure:* For each metric of `type: count`/`count_distinct` in `semantic_layer/*.yml` (MetricFlow, Cube or LookML, parsed into a metric IR), check that it has the counted entity (`entity`/`measure.expr`), an activity filter (`filter`, or a `description` that states the predicate), a `time_dimension`, and a source (`model`/`sql_table`). For a `count_distinct` measure, the counted entity is inferred from the `expr` column as in Design A (M2) and must match any declared entity.
+- *Fails when:* a count metric lacks any of the four elements, or its declared entity disagrees with the one inferred from its `expr`.
+- *Suggestion:* "Metric `{metric}` is missing {missing}. Each count metric must define the counted instance, the active filter, the time dimension, and the source system (§8.1)."
+- *Limits:* this design applies only when a semantic layer exists in the repo. The adapters for the three formats must track upstream schema changes, and MetricFlow, Cube and LookML each name these fields differently.
+
+**Recommendation:** Build B first (Phase 2). It uses real query evidence and catches the classic `COUNT(*) AS active_users`. Add A once lineage is available, because its M2 inference removes the need to declare the instance and turns a declaration check into a mismatch check. C costs little once the semantic layer is parsed for §2.6.
+
+**Residual limit:** whether the stated activity predicate and period are the ones the business agreed is not checkable (§1.2 covers agreement). Counts computed in application code with no annotation, and counts reported only from tools outside the repo, stay invisible.
+
+### §8.2 — Many-to-many relationships are aggregation hazards `[MUST][CODE]`
+
+**Applies to:** Go ◐ (`[]T` fields in both directions, or a junction struct) · SQL ✔ (junction tables, meaning tables with two FKs that together form the PK) · JSON ◐ (array-of-`$ref` properties on both sides).
+**Checkability:** `direct` for detecting the hazard, `declared` for the allocation policy.
+
+#### Design A — Junction-table hazard tagging (G, deterministic)
+
+- *Measure:* In the relationship graph, mark an entity as a *junction* when it has ≥2 outgoing FKs **and** either its PK (or a UNIQUE constraint) equals the union of those FK columns, or it has ≤2 non-key columns. Entities X and Y joined through a junction J are an M:N pair. A measure field on X is a field with `measure=additive`, or, at heuristic severity, a decimal or integer field named `amount|revenue|price|qty|total`. When X has a measure field, J must carry the annotation `m2m=overlapping|allocated(<weight_col>)|primary(<flag_col>)`.
+- *Fails when:* J has no `m2m` annotation and either side of the M:N pair carries a measure field. If the annotation names a `weight_col` or `flag_col` that does not exist on J, that also fails.
+- *Suggestion:* "`{junction}` links `{x}` and `{y}` many-to-many. Summing `{x}.{measure}` grouped by `{y}` counts each `{x}` once per `{y}`, so the groups overlap. Declare `@m2m: overlapping` and label reports as overlapping. Alternatively, add an allocation weight, `allocation_weight NUMERIC NOT NULL CHECK (allocation_weight BETWEEN 0 AND 1)`, that sums to 1 per `{x}`, or add an `is_primary BOOLEAN` with a partial unique index `ON {junction} ({x_fk}) WHERE is_primary` (§8.2)."
+- *Limits:* a measure stored on the junction itself is not a hazard when grouped by either side. For example, `order_items.quantity` grouped by product counts each line once. The hazard is a measure on X, such as `orders.order_total`, grouped by Y, such as a product category. Measure fields detected by name only are heuristic, so annotating `measure=additive` makes the check exact.
+
+#### Design B — Grouped-sum-across-junction detector (Q, deterministic)
+
+- *Measure:* For each `SelectStmt` with a `groupClause`, resolve every `RangeVar` in the `JoinExpr` tree to an entity. Flag the query when the join path crosses a junction entity (as defined in A) and the argument of a `FuncCall` `sum|avg|count` references a column from the side opposite the `GROUP BY` columns. Do not flag it when the junction's `allocation_weight` multiplies the argument (an `A_Expr` `*`), or when the `WHERE` clause pins the declared `primary` flag to true.
+- *Fails when:* a SUM over measure `m` of entity X is grouped by entity Y's columns through junction J, with no allocation weight and no primary-flag filter.
+- *Suggestion:* "{file}:{line} sums `{x}.{m}` grouped by `{y}.{col}` through `{junction}`. Each `{x}` contributes once per `{y}`, so the groups overlap and their sum exceeds the true total. Compute the total from `{x}` alone, multiply by `{junction}.allocation_weight`, or label the output as overlapping (§8.2)."
+- *Limits:* joins written with `USING`/`ON` on columns that are not FKs need inferred refs, which lowers confidence. A sum over `COUNT(DISTINCT x_id)` is still overlapping across groups, but it is reported only when the groups are themselves summed later (see §8.4 Design B).
+
+**Recommendation:** Build A first. It is an MVP check that works on DDL alone, and it points to where the policy should be declared. B finds actual double counts in queries.
+
+### §8.3 — Classify measures; never sum semi-additive measures over time `[MUST][CODE]`
+
+**Applies to:** Go ✔ (numeric fields on fact or snapshot structs) · SQL ✔ (numeric columns) · JSON ✔ (`number`/`integer` properties).
+**Checkability:** `declared` (classification), then `direct` (misuse).
+
+#### Design A — Measure-classification contract with lexical prefill (C+L, deterministic)
+
+- *Measure:* A field is in scope when it is numeric, is not a key (not in a PK or FK, not `*_id`, not an enum code), and sits on an entity with `layer ∈ {analytical, feature, obt, event}` or a `grain` annotation. Every in-scope field must carry `measure=additive|semi_additive|non_additive`. A `semi_additive` field must also carry `over=<dimension>`, the dimension it must not be summed across (usually `time`). A lexicon proposes a value for the suggestion:
+  - `balance|inventory|stock|level|headcount|on_hand|outstanding` → semi-additive
+  - `rate|ratio|pct|percent|avg|mean|median|p\d\d|margin|score|price` → non-additive
+  - `amount|revenue|qty|count|cost|fee` → additive
+- *Fails when:* the annotation is missing, or a `semi_additive` field has no `over=`. A declared value that contradicts the lexicon is a `note` asking for confirmation, and `waive` suppresses it.
+- *Suggestion:* "`{entity}.{field}` has no additivity class. Its name suggests `{guess}`. Add `measure={guess}` (with `over=time` if it is semi-additive) so the query checks can protect it (§8.3)."
+- *Limits:* the lexicon only proposes values; whether the check passes depends only on the annotation, which is why the design is deterministic. The lexicon is English-only and configurable in `mml.yaml` under `lexicons.measure`.
+
+#### Design B — SUM-over-time-of-semi-additive detector (Q, deterministic)
+
+- *Measure:* In each `SelectStmt`, find `FuncCall sum` whose argument resolves to a field with `measure=semi_additive`. Undeclared fields that match the semi-additive lexicon are also checked, at heuristic severity. Fail when the `groupClause` does not include the dimension named by `over=`, and the `WHERE` clause does not pin that dimension to a single value (`=` against a parameter or literal). The same check applies to window aggregates: `FuncCall sum` with `over` → `WindowDef` whose `orderClause` or frame runs along the `over=` dimension.
+- *Fails when:* SUM aggregates away the `over=` dimension of a semi-additive measure.
+- *Suggestion:* "{file}:{line} `SUM({field})` collapses `{time_col}`, but `{field}` is semi-additive over time. Sum across accounts for one date (`WHERE {time_col} = $1`), or take the end-of-period value per key (`DISTINCT ON ({key}) ... ORDER BY {key}, {time_col} DESC`, or `LAST_VALUE({field}) OVER (PARTITION BY {key} ORDER BY {time_col} ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)`) (§8.3)."
+- *Limits:* only SUM is flagged. `AVG`, `MIN`, and `MAX` of a balance over time (for example, average daily balance) are meaningful and allowed. Go-side aggregation loops are covered only by an optional `go/ssa` pass, which flags `+=` accumulation of a semi-additive field inside a `range` over a slice of snapshot structs.
+
+**Recommendation:** Ship A in the MVP, because B needs its annotations to be exact. Add B in Phase 2.
+
+### §8.4 — Never re-aggregate non-decomposable results `[MUST][CODE]`
+
+**Applies to:** Go ✔ (a stored `AvgOrderValue float64`, `FCRRate`, or `UniqueUsers` on a persisted struct) · SQL ✔ (a stored ratio, average, median, or distinct-count column at a coarser-than-atomic grain is an entity-level violation unless its components or a mergeable sketch are present) · JSON ✔ (the same, on schema properties).
+**Checkability:** `direct` (structure) plus `direct` (queries).
+
+#### Design A — Stored-ratio-without-components check (S+L, heuristic)
+
+- *Measure:* Tokenize each numeric field name. A field is *non-decomposable* if it has a token from `{avg, average, mean, rate, ratio, pct, percent, share, margin, median, p50, p90, p95, p99, percentile, unique, distinct, dau, wau, mau}`, or carries `measure=non_additive`. For each such field `f`, look on the same entity for one of two things:
+  - **Components:** either `numerator=X;denominator=Y` annotations naming existing additive fields, or, by name, a `*_count`/`*_sum`/`*_total` pair that shares the stem.
+  - **A mergeable sketch (for distinct counts and percentiles):** a column of the `hll` type (postgresql-hll extension) or the `tdigest` type (tdigest extension); a `bytea`/`[]byte` column, or a JSON property with the project-defined custom `format` `hll|tdigest|theta` (not a standard JSON Schema format); or a name ending `_hll|_sketch|_tdigest`.
+- *Fails when:* the entity's grain is coarser than atomic (`layer=analytical`, or grain text matching `per (day|week|month|store|region|...)`), and a non-decomposable field on it has neither components nor a sketch. Fields at atomic grain are not checked. A sketch is accepted only with an `approx_error=` annotation that records the bounded error the business accepted.
+- *Suggestion:* "`{entity}.{field}` stores a {kind} at grain '{grain}', and consumers will re-aggregate it incorrectly. Store `{guess_num}` and `{guess_den}` as additive columns and compute `SUM({guess_num})::numeric / NULLIF(SUM({guess_den}), 0)` at query time. The `::numeric` cast matters: with integer columns, PostgreSQL integer division truncates the ratio. For distinct counts or percentiles, recount from atomic data, or store a mergeable sketch (`{stem}_hll hll`, `{stem}_digest tdigest`) with `approx_error=` if the business accepts a bounded error (§8.4)."
+- *Limits:* matching on name tokens is heuristic. Fields with an explicit `measure=non_additive` annotation are reported at full severity, and name-only matches at heuristic severity. A stored ratio at atomic grain, such as a per-order discount pct, is legitimate and exempt. `reaggregate=forbidden` on a field records that consumers are told never to roll it up, and silences the check.
+
+#### Design B — Aggregate-of-aggregate query detector (Q, deterministic)
+
+- *Measure:* In the query AST, flag a `FuncCall` with `funcname ∈ {sum, avg}` whose argument column is either (a) a non-decomposable field, as in A, or (b) a projection from a subquery, CTE (`CommonTableExpr`), or view whose `ResTarget.val` is itself non-decomposable. Non-decomposable outputs are:
+  - `avg(...)`
+  - a `count` `FuncCall` with `agg_distinct = true`
+  - an ordered-set aggregate `percentile_cont`/`percentile_disc` (a `FuncCall` with `agg_within_group = true`; PostgreSQL has no built-in `median()`)
+  - an `A_Expr` with operator `/`
+
+  CTEs and views are resolved recursively.
+- *Fails when:* such a nesting exists. A sum of `count(DISTINCT x)` outputs across a coarser `GROUP BY` also fails.
+- *Suggestion:* "{file}:{line} `{outer}({inner_alias})` re-aggregates `{inner_expr}` from `{source}`. An average of averages weights every group equally, and summed distinct counts overcount. Use `SUM({num})::numeric / NULLIF(SUM({den}), 0)` (the cast avoids integer division) or `COUNT(DISTINCT {key})` over the atomic rows. If a bounded error is acceptable, merge sketches with `hll_union_agg({sketch})` (postgresql-hll) or `tdigest_percentile(...)` (tdigest) (§8.4)."
+- *Limits:* a weighted average written as `SUM(avg * n)::numeric / SUM(n)` is recognized and allowed: the outer `A_Expr` divides by a sum of the matching denominator. When both operands of a `/` between `SUM`s resolve to integer types and neither side has a `TypeCast` to `numeric`/`float8`, B adds a separate integer-division note. `MIN` and `MAX` of averages are not flagged. Sketch-merge functions are only recognized from a configurable list.
+
+#### Design C — Lineage contract on derived entities (G, deterministic)
+
+- *Measure:* For entities with `layer=analytical`, follow `Refs` and view lineage (`ViewStmt.query`) back to the atomic entity. Every non-decomposable field must trace to an expression over additive fields of an atomic entity, and the linter propagates `measure` metadata along that path.
+- *Fails when:* the lineage of a non-decomposable field ends at a non-decomposable field of another derived entity, meaning it is a rollup of a rollup.
+- *Suggestion:* "`{entity}.{field}` derives from `{upstream}.{field2}`, which is already a {kind}. Rebuild it from `{atomic}` using its additive components (§8.4)."
+- *Limits:* lineage is only visible for views and models in the repo. Tables filled by external jobs need a `derived_from=` sidecar entry. When an expression is not a plain column reference, the propagation is lost and reported as `unknown`, not as a failure.
+
+**Recommendation:** Build A in the MVP: it catches the entity-level smell in the rule's examples. B, in Phase 2, is the strongest evidence. C, also Phase 2, comes with the view-lineage work.
+
+### §8.5 — Bound every aggregation in time and dimension; no stale date literals `[MUST][CODE]`
+
+**Applies to:** Go ◐ (SQL in string literals; `time.Date(2023, ...)` constants passed into query filters) · SQL ✔ (views and queries) · JSON ◐ (metric schemas: `x-mml-period` on aggregate properties).
+**Checkability:** `direct` (queries), `declared` (stored aggregates).
+
+#### Design A — Date-literal and unbounded-aggregate scan (Q, deterministic)
+
+- *Measure:*
+  1. Find `A_Expr` comparisons (`>`, `>=`, `<`, `<=`) and `BETWEEN` (`AEXPR_BETWEEN`) where one side is a column of temporal `LogicalType` and the other is an `A_Const` string that parses as a date or timestamp. A `TypeCast` of such a const counts too; `DATE '2023-01-01'` parses to that shape.
+  2. Find `SelectStmt`s with an aggregate `FuncCall` over a table that has an event-time column (`time=event`) and no `WHERE`/`HAVING` predicate on any temporal column.
+  3. In Go, find a `time.Date(...)` call with all-constant arguments whose value reaches a `database/sql`/`pgx` query argument through `go/ssa`.
+
+  Expressions relative to `CURRENT_DATE`/`now()` and parameters (`ParamRef`) count as bounded.
+- *Fails when:* any of (1) through (3) holds. Literals inside migration or backfill files under `migrations/` are exempt.
+- *Suggestion:* For (1) and (3): "{file}:{line} filters `{col} {op} '{literal}'`. A hard-coded date goes stale silently. Pass the period as a parameter (`{col} >= $1 AND {col} < $2`), or compute it relative to `CURRENT_DATE` with an explicit window (§8.5)." For (2): "`{agg}` over `{table}` has no time bound. Add a `{time_col}` range predicate, and state the dimensional scope in the output label (§8.5)."
+- *Limits:* reference dates such as an epoch or a product-launch cutoff are legitimate; use `-- mml:waive §8.5 reason=...` or the `mml.yaml` `dates.allowed_literals` list. The SSA flow in (3) follows only direct data flow, not values stored in struct fields or globals. Dimensional bounds are not checked by this design; Design B checks them on stored aggregates.
+
+#### Design B — Stored-aggregate bound contract (C+S, deterministic)
+
+- *Measure:* An entity is an aggregate when `layer=analytical` or its grain mentions `per (day|week|month|quarter|year)`. Each aggregate entity must have two things:
+  1. A time-period column in its PK or a UNIQUE constraint: `calendar_date`, the pair `period_start`/`period_end`, or an FK to `dim_date`.
+  2. A `dimensions=` annotation listing the bounding dimensions, each of which resolves to a key column.
+
+  An aggregate measure that has its own time range, different from the entity period, must declare `period=`.
+- *Fails when:* the entity's key has no period column (for example, `total_revenue` in a single-row table), `dimensions=` is missing, or a listed dimension is not a key column.
+- *Suggestion:* "`{entity}` stores aggregates without a period in its key. Add `period_start DATE NOT NULL` and `period_end DATE NOT NULL` to the primary key, or reference `dim_date`, and declare `@dimensions: {candidate_dims}` (§8.5)."
+- *Limits:* a deliberate all-time aggregate, such as lifetime value, must say so explicitly with `period=all_time`, plus an `as_of` column that records when it was computed. Grain detection by text match misses aggregates whose grain annotation is missing (§7.1 catches those).
+
+**Recommendation:** Build A first. It catches the literal-date bug exactly and costs little. B is the MVP option for repos that have only DDL.
+
+### §8.6 — Streaming windows: no summing sliding windows; declare late-event policy `[MUST][CODE]`
+
+**Applies to:** Go ◐ (Apache Beam Go SDK pipelines using `window.NewSlidingWindows`/`NewFixedWindows`; config structs with `WindowSize`/`Slide` fields) · SQL ◐ (streaming SQL window functions such as `HOP`/`TUMBLE`/`SESSION`, and window-output tables) · JSON ✔ (event or aggregate schemas whose properties include `window_start`/`window_end`).
+**Checkability:** `direct` (queries and config), `declared` (output entities).
+
+#### Design A — Window-output entity contract (C+S, deterministic)
+
+- *Measure:* Treat an entity as a window output when it has the field pair `window_start`/`window_end` (field names configurable in `window_fields`). It must carry three annotations: `window=tumbling(<size>)|sliding(<size>,<slide>)|session(<gap>)`, `lateness=<duration>`, and `late_policy=drop|update|side_output`. If `window=sliding`, every measure must be `measure=non_additive`, because overlapping windows make it so.
+- *Fails when:* any of the three keys is missing, or a sliding-window output declares an `additive` measure.
+- *Suggestion:* "`{entity}` stores windowed aggregates but does not declare the window type or late-event handling. Add `x-mml-window: tumbling(5m)`, `x-mml-lateness: 10m`, and `x-mml-late_policy: update` (§8.6). If the window is sliding, mark `{measure}` as non-additive: each event is counted about {size/slide} times."
+- *Limits:* window outputs are recognized only by naming or annotation. The design checks declarations, not whether the pipeline honors them; Design B checks pipeline code.
+
+#### Design B — Sliding-window re-summation detector (Q, deterministic)
+
+- *Measure:*
+  1. **SQL:** the query must go through a dialect that parses the streaming grammar. RisingWave's `HOP(t, ts, slide, size)` in `FROM` parses under `pg_query` as a `RangeFunction`. Flink SQL's `TABLE(HOP(TABLE t, DESCRIPTOR(ts), slide, size))` needs the Flink `Dialect` implementation, because `pg_query` rejects it. Flag a hopping-window output that an outer `sum|count` consumes grouped by a coarser time bucket. Also flag `sum()` over an entity annotated `window=sliding`.
+  2. **Go:** with SSA, find calls to `window.NewSlidingWindows` from `github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/window` (the symbol list is configurable). Report whether the matching `beam.WindowInto` call has a `beam.AllowedLateness`/`beam.Trigger` option, and whether the windowed `PCollection` reaches `stats.Sum`/`stats.SumPerKey`.
+- *Fails when:* results of overlapping windows are summed, or a windowed pipeline has no allowed-lateness or trigger configuration.
+- *Suggestion:* "{file}:{line} sums results of `{window_fn}(size={s}, slide={d})`, which counts each event about {s/d} times. Use `TUMBLE`/fixed windows of `{d}` for additive totals, and declare an allowed lateness and an update rule (`beam.AllowedLateness({dur})`, or a Flink watermark) (§8.6)."
+- *Limits:* every streaming framework and dialect needs its own adapter, and frameworks without one are covered only by Design A. The Flink dialect has no Go parser, so its adapter is a token-level matcher for the window table-valued functions. That matcher does not resolve columns.
+
+**Recommendation:** Build A first. It is an MVP check and works on JSON event schemas, which are the common case. B is Phase 2 and needs one adapter per framework.
+
+### §8.7 — Check combined figures for Simpson's paradox `[SHOULD][METHOD]`
+
+**Applies to:** Go ✘ · SQL ◐ (rate and trend queries that combine groups) · JSON ◐ (metric schemas) · semantic-layer metric definitions ✔.
+**Checkability:** `direct` for whether every combined rate or trend has per-group counterparts and a direction-comparison test. A reversal is a property of the data, so it is `direct` only when CI supplies the test results (M4). Without results it is `proxy`.
+
+The revised rule asks for a comparison: whenever an aggregate combines groups, compare the combined trend with the trend inside each group. It no longer has a completion criterion, and it no longer requires the §2.6 breakdown list. Each design therefore finds its groups from structure, and declarations only refine them.
+
+#### Design A — Combined figure without per-group counterpart (Q+G, deterministic)
+
+- *Measure:* In the query corpus, find each *combined figure*. That is a `SelectStmt` whose target list has a ratio (an `A_Expr` `/` whose operands are aggregate `FuncCall`s) or an aggregate grouped only by a time column (a trend), and whose `FROM` relations have at least one *group column* that the `groupClause` leaves out. A group column is an enum- or `CHECK`-constrained column, or an FK to an entity with `layer=reference`, on any source relation. Declared `breakdowns=` replace the inferred set. For each combined figure, compute a normalized AST fingerprint of the measure expression (aliases stripped, commutative operands sorted). The figure *has a counterpart* for group column `g` when the corpus contains the same fingerprint grouped by `g` (plus the same time column, for a trend), or when the query itself uses `GROUPING SETS`/`ROLLUP`/`CUBE` containing `g` (a pg_query `GroupingSet` node in `groupClause`, with `kind` `GROUPING_SET_SETS`, `GROUPING_SET_ROLLUP` or `GROUPING_SET_CUBE`).
+- *Fails when:* a combined figure has no counterpart for at least one group column it combines across.
+- *Suggestion:* "{file}:{line} reports `{expr}` combined across `{g}` with no per-`{g}` version to compare trends against (§8.7). Add `GROUP BY GROUPING SETS (({time}), ({time}, {g}))` so the combined trend and each `{g}` trend come from one query, then compare directions."
+- *Limits:* the inferred group set over-requires breakdowns on columns nobody analyzes (`currency`, `locale`). Narrow it with `breakdowns=` on the metric or with `rules.8_7.ignore_columns`. A counterpart written with a different but equivalent expression is missed, because the fingerprint normalizes only aliases and operand order. Single-group sources, with no enum or reference FK, never fire.
+
+#### Design B — Direction-comparison test and its results (A+C, deterministic)
+
+- *Measure:* For each combined figure found by A that has its counterparts, and for each semantic-layer metric of `type: ratio` (MetricFlow) or each `measure=non_additive;numerator=;denominator=` field, look for a data test that declares what it checks. That is a dbt singular test under `tests/`, or a generic test named `simpson_direction`, carrying the header comment `-- mml:simpson {metric} by {g}`. `scaffold` writes that header, plus a `meta: {mml_rule: "§8.7", mml_entity: "{metric}", mml_by: "{g}"}` block in the test's YAML. Hand-written tests add the header themselves. The linter reads the header through `pg_query.Scan` comment tokens, and checks deterministically that the test's parsed SQL groups by `{g}` and references the metric's measure expression. It does not try to recognize a "sign comparison" in arbitrary SQL, because that would be heuristic.
+
+  **Results (M4):** with `check --results`, the linter maps each result back to the test, as follows.
+  - **dbt:** `target/run_results.json` `results[].unique_id` is joined to `target/manifest.json` `nodes[unique_id]`, and `config.meta.mml_rule` is read from the manifest node. `results[].status` is `pass`, `warn`, `fail` or `error`, and `results[].failures` gives the number of returned rows.
+  - **JUnit XML:** a `<testcase>` whose `name` equals the test's `unique_id`, with a `<failure>` child.
+
+  A scaffolded test returns one row per reversing group: `{g}`, the group's direction, the combined direction, and both deltas. A reversal is therefore a test with `status` `fail` or `warn`, or a JUnit `<failure>`.
+- *Fails when:* no test with a matching header exists, or the test's SQL does not group by the declared `{g}` or does not reference the metric's measure. With results, two more cases are reported:
+  - The test reported reversing rows. This produces `§8.7` `reversal` findings at the rule's `warning` severity. A reversal is something to report next to the combined figure, not a defect in the code.
+  - A test that the manifest lists has no entry in the results. This produces `mml/test-not-run`.
+- *Suggestion:* For a missing test: "No direction-comparison test for `{metric}` over `{g}`. Run `mixedmodellint scaffold simpson {metric} --by {g}` to generate one (§8.7)." For a reversal: "`{metric}` combined across `{g}` moves {combined_dir}, but {n} `{g}` group(s) move the other way ({groups, when the result format carries them}). Report the per-`{g}` figures alongside the combined one (§8.7)."
+- *Limits:* `run_results.json` carries a row count, not the rows. Group names appear in the finding only when the runner prints them (JUnit `<failure>` text), or when the test is configured with `store_failures` and a runner exports the audit table as JSON. A test that never ran on representative data proves nothing, and `mml/test-not-run` catches only tests that never ran at all. The periods or arms that are compared are configured per metric in `scaffold`, and reversals between other periods are not tested.
+
+#### Design C — Dashboard tile without breakdown (A, heuristic)
+
+- *Measure:* In committed dashboard-as-code artifacts (Looker `*.dashboard.lookml`, Lightdash/Evidence YAML or Markdown, Metabase exports), find tiles whose query is a combined figure (by A's definition, through the referenced explore or metric) and check whether the same dashboard has a tile, filter or pivot on a group column of that figure.
+- *Fails when:* the dashboard has no breakdown for any group column of a combined figure.
+- *Suggestion:* "Dashboard `{dash}` shows `{metric}` combined, with no `{g}` breakdown to compare it to. Add a pivot or companion tile by `{g}` (§8.7)."
+- *Limits:* exporting dashboards as code is optional, so coverage depends on the BI tool. Matching a tile to its metric goes through each tool's own model and is heuristic.
+
+**Recommendation:** A first (Phase 2, query corpus). It runs without any declarations, which removes the earlier dependency on the §2.6 breakdown list. Add B wherever A finds a counterpart. B is the only design that compares directions, which is the rule's actual check, and with M4 results it turns a reversal into a direct finding. C is optional, for teams that commit dashboards.
+
+**Residual limit:** a reversal is visible only for the groups and periods that a scaffolded test compares, and only when CI runs those tests on data that represents production. Combined figures computed outside the repo, such as ad-hoc BI queries, are not seen.
+
+### §8.8 — Don't average values whose average is meaningless `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ (fields typed as an ID, code, or enum, or a `[]float32` embedding) · SQL ✔ (columns: FK/PK, enum or `CHECK ... IN`, `zip|code|id`, pgvector `vector(n)`) · JSON ✔ (`format: uuid`, `enum`, string codes, arrays of numbers tagged `x-mml-embedding`).
+**Checkability:** `direct` (queries), `declared` (pooling policy for embeddings).
+
+#### Design A — Non-averageable domain marking (S+L, deterministic)
+
+- *Measure:* Classify a field as *nominal* when any of these holds: it is in a PK, FK, or UNIQUE constraint; it has an `Enum` or a `CHECK ... IN` list; its type is `uuid`; or, at heuristic severity, its name ends in `_id|_code|_key|zip|postal|sku|phone`. Classify it as an *embedding* when its type is `vector(n)`, a `[]float32` with the tag `mml:"embedding"`, or a JSON array of numbers with `x-mml-embedding`. Nominal numeric fields get `averageable=false` in the IR, which Design B and §8.4 reuse. An embedding field must declare `pooling=none|same_topic(<cluster_col>)`.
+- *Fails when:* an embedding field has no `pooling` declaration, or a nominal field is annotated `measure=additive|semi_additive|non_additive` (for example, a `zip_code INT` declared additive).
+- *Suggestion:* "`{entity}.{field}` is an identifier or code stored as `{type}`, so averaging it is meaningless. Store it as `TEXT`/`string` so arithmetic cannot apply, or mark it `measure=nominal` (§8.8)."
+- *Limits:* the rule is narrowed on purpose. Integer counts and ratios are not nominal, and their means are fine. Integer-coded ordinal or interval scales, such as 1–5 ratings, are legitimately averaged; mark them `scale=ordinal|interval` to exempt them. Matches on name suffix alone are heuristic.
+
+#### Design B — AVG-over-nominal query detector (Q, deterministic)
+
+- *Measure:* Find a `FuncCall` `avg|sum|stddev`, or an ordered-set `percentile_cont`, whose argument resolves to a field with `averageable=false`. Also find mean-pooling of embeddings: `avg(vector_col)` (pgvector provides `avg` and `sum` for `vector`), or a Go `go/ssa` loop that does element-wise `+=` over an embedding field and then divides. Either one is allowed only when grouped by the declared `same_topic` cluster column.
+- *Fails when:* either pattern occurs outside the allowed grouping.
+- *Suggestion:* "{file}:{line} `{fn}({field})`: `{field}` is {nominal|embedding}, so its average lies outside the domain. Use `COUNT`/`mode() WITHIN GROUP (ORDER BY {field})` for codes. For embeddings, pool only within `{cluster_col}`, or keep the chunks separate (§8.8)."
+- *Limits:* the Go pooling pattern recognizes only straightforward loops. Helper libraries such as `gonum/floats.Add` must be added to a configurable symbol list. The check only sees queries in the corpus.
+
+**Recommendation:** A is the MVP, and its classification is reused by B and by §8.4. B is Phase 2.
+
+### §8.9 — Reconcile key metrics two ways `[SHOULD][CODE]`
+
+**Applies to:** Go ◐ (an aggregate struct with a corresponding atomic struct) · SQL ✔ (an aggregate table or view with an upstream atomic table) · JSON ◐ (aggregate event schemas).
+**Checkability:** `direct` for whether a reconciliation is declared, has a test, and has a test wired to the right entities. The reconciliation itself runs on data, so a mismatch is `direct` only when CI supplies test results (M4). Without results it is `proxy`.
+
+#### Design A — Reconciliation-test coverage over lineage (G+A, deterministic)
+
+- *Measure:* For each aggregate entity (`layer=analytical`, or a grain coarser than its upstream), use `Refs`, view lineage, and `derived_from=` to find its atomic source and each additive measure `m`. Then search the test artifacts for a test that references both entities and both measure columns: dbt `schema.yml` `tests:` using `dbt_utils.equality`/`expression_is_true`, `tests/**/*.sql`, or Go tests that run the same queries. Parse SQL tests and look for `SUM(agg.m)` and `SUM(atomic.m')`, either in one statement or in two statements the test compares.
+- *Fails when:* a key metric (an entity or field marked `key_metric=true`, or by default every additive measure on an entity with `lifecycle=published`) has no reconciliation test.
+- *Suggestion:* "`{agg}.{m}` has no reconciliation against `{atomic}.{m2}`. Add a test asserting that `SELECT SUM({m}) FROM {agg} WHERE {period}` equals `SELECT SUM({m2}) FROM {atomic} WHERE {period}`. Run `mixedmodellint scaffold reconcile {agg}.{m}` to generate it (§8.9)."
+- *Limits:* lineage is only as good as the view definitions and FKs; a `derived_from:` sidecar entry fills the gaps. On its own, this design checks that a test exists, not that its period filters match. Design C reads the outcome.
+
+#### Design B — Reconciliation contract annotation (C, deterministic)
+
+- *Measure:* Each aggregate measure on a key-metric entity must declare `reconciles_with=<entity>.<field>`, with an optional `tolerance=`. The linter checks that the target exists, is `measure=additive`, has a compatible `unit`/`currency`, and sits upstream of the aggregate in the graph, meaning it has a finer grain.
+- *Fails when:* the declaration is missing, or the target is invalid: it does not exist, has the wrong unit, is not upstream, or is not additive.
+- *Suggestion:* "Declare `@reconciles_with: {atomic}.{m2}` on `{agg}.{m}` (`x-mml-reconciles_with` in JSON). The test generator and the data check in CI use it (§8.9)."
+- *Limits:* a declaration does not prove the reconciliation runs; Design A checks that. Non-additive measures cannot be reconciled by summing, so they are reconciled through their `numerator=`/`denominator=` components.
+
+#### Design C — Reconciliation results (A, deterministic)
+
+- *Measure:* With `check --results` (M4), map each reconciliation test to its declaration. A scaffolded test carries `meta: {mml_rule: "§8.9", mml_entity: "{agg}", mml_field: "{m}", reconciles_with: "{atomic}.{m2}", tolerance: "{tol}"}`. Read the outcome from the first format that applies:
+  - dbt `run_results.json`: `results[].status` and `results[].failures`. The scaffolded test returns one row per mismatched period, holding `period`, `agg_total`, `atomic_total` and `diff`, so `failures` is the number of mismatched periods.
+  - Great Expectations validation results: top-level `success`, and per expectation `results[].success`, `results[].expectation_config` (its type and `kwargs`), and `results[].result.observed_value` when the expectation reports one.
+  - JUnit XML: `<failure>` text.
+- *Fails when:* a reconciliation test for a key metric failed (`status` `fail`/`error`, `success: false`, or a JUnit `<failure>`). Separately, `mml/test-not-run` is reported when a declared `reconciles_with=` has a generated test that is absent from the results.
+- *Suggestion:* "`{agg}.{m}` does not reconcile with `{atomic}.{m2}` in {n} period(s){: observed {observed}}. A mismatch between an aggregate and its atomic source is a grain bug. Check the joins that build `{agg}` for fan-out (§7.2) and for dropped rows (§8.9)."
+- *Limits:* observed values appear only where the format carries them. GX reports `observed_value`, while dbt reports only a count. A pass shows only that the data CI tested reconciles, so a tolerance set too loosely hides real drift. The linter checks that `tolerance=` is declared, but not that the value is sensible.
+
+**Recommendation:** Build B first (MVP). It is a cheap declaration that also feeds the test generator. Add A in Phase 2 to check that the declared test exists, and C when CI publishes test results, so a mismatch becomes a finding.
+
+**Residual limit:** reconciliation is only as good as the data CI runs it on. Key metrics with no declaration and no lineage to an atomic source cannot be paired automatically.
+
+## §9 — Time
+
+### §9.1 — Separate event, ingestion and processing time `[MUST][CODE]`
+
+**Applies to:** Go ✔ (`time.Time` fields on event/fact structs) · SQL ✔ (temporal columns on `layer=event|analytical|staging` tables) · JSON ✔ (`format: date-time` properties on event schemas)
+**Checkability:** `direct` for presence, `declared` for the role of each column.
+
+#### Design A — Temporal role classifier (L + S, deterministic)
+
+- *Measure:* For each entity with `layer ∈ {event, staging, core, analytical}` (or name matching `(?i)(event|log|click|txn|transaction|fact_|fct_)`), take every field with `Type ∈ {timestamptz, timestamp_naive, date}`. A `time=` annotation wins; otherwise classify the name by token lexicon (`config: time.lexicon`): ingested = `ingest|loaded|received|arrived|landed`; processed = `processed|transformed|computed|etl|batch|run_at`; event = `occurred|event|happened|captured|placed|ordered|clicked` or any other `_at`/`_time` stem not in the first two lists. `created_at`/`inserted_at` are classified *ambiguous* (row-creation time in the store is processing time, not event time) unless annotated.
+- *Fails when:* the entity has an ingested or processed column but no event-class column ("only system time"); or has exactly one temporal field and it is lexically ingestion/processing/ambiguous; or one field matches two classes (`loaded_event_at`). On `layer ∈ {event, staging}` (landed data) a missing ingestion-time column is also reported, one severity lower.
+- *Suggestion:* `{entity} records time only as {field} ({class}). Add an event-time column (e.g. "{stem}_occurred_at timestamptz NOT NULL") populated from the source, and keep {field} as the ingestion/processing time; annotate each with @time({col}): event|ingested|processed.`
+- *Limits:* lexicon is English and misses `ts`, `dt`; a `//mml:time` / `x-mml-time` annotation always overrides the lexicon. OLTP tables (`layer=oltp`) are exempt by default (`time.exempt_layers`): there the write is the business event, so event time and write time coincide.
+
+#### Design B — Reporting predicate audit (Q, deterministic)
+
+- *Measure:* In the query corpus, find `GROUP BY`, `WHERE`, `date_trunc()`, `DATE()` and window `PARTITION BY/ORDER BY` expressions whose column resolves (via the catalog) to a field annotated or classified as `time=ingested|processed`.
+- *Fails when:* any aggregation query buckets or filters business measures on an ingestion/processing column while the same entity has an event-time column.
+- *Suggestion:* `Query {file}:{line} buckets by {table}.{col} (ingestion time). Late-arriving rows land in the wrong period; use {event_col} instead: date_trunc('day', {event_col}).`
+- *Limits:* legitimate on operational freshness dashboards; allow `-- mml:waive §9.1 reason="freshness monitor"` at query level. Incomplete if the query corpus is not configured.
+
+#### Design C — Cross-source time-role consistency (G, deterministic)
+
+- *Measure:* For each logical entity linked across Go/SQL/JSON, compare the multiset of time roles. A JSON event schema carrying `event_time` whose linked table carries only `loaded_at` (or a Go struct whose `EventTime` maps via tag to `loaded_at`) is a dropped role.
+- *Fails when:* a role present upstream (JSON payload / Go producer) is absent in the downstream store, or a Go tag maps an event-named field onto an ingestion-named column.
+- *Suggestion:* `The payload {json_id} carries event time "{json_field}" but table {table} stores only {cols}. Persist it as a separate column; do not overwrite it with load time.`
+- *Limits:* depends on cross-source linking quality.
+
+**Recommendation:** A first (works on DDL alone), then B where a query corpus exists; C is cheap once linking exists.
+
+### §9.2 — Native temporal types, absolute UTC, separate zone name `[MUST][CODE]`
+
+**Applies to:** Go ✔ (`time.Time` vs `string`/`int64` fields named like dates; `civil.Date` OK) · SQL ✔ (`DATE`/`TIMESTAMPTZ` vs `VARCHAR`/`TEXT`/`TIMESTAMP WITHOUT TIME ZONE`) · JSON ✔ (`type: string` with/without `format: date|date-time`)
+**Checkability:** `direct`.
+
+#### Design A — Type-vs-name structural check (S + L, deterministic)
+
+- *Measure:* Tokenize field names on `_`/case boundaries. A field is temporal-named if its last token is `at|on|date|time|ts|timestamp|dob|birthday|expires` or it matches `valid_(from|to)` (token match, so `candidate`, `runtime` and `lifetime` do not match). Exclude duration-named fields (`(?i)(duration|elapsed|latency|response_time|_ms|_secs?|_seconds)$`). Then: SQL fails if `RawType` is `CHAR/VARCHAR/TEXT/INT/BIGINT`; PG `TIMESTAMP`/`timestamp without time zone` fails for instants (naive); JSON fails if `type: string` without `format ∈ {date, date-time}` (or `time` for a time-of-day field) or `type: integer` without `x-mml-encoding: unix_s|unix_ms|unix_us`; Go fails if the field is `string`/`int64` unless tagged `mml:"encoding=unix_ms"` (`time.Time`, `*time.Time`, `sql.NullTime`, `civil.Date` pass). In SQL also check `DEFAULT` literals with `'\d{1,2}/\d{1,2}/\d{4}'` and `'YYYY-MM-DD HH:MM:SS'` without `Z|[+-]\d\d:?\d\d`.
+- *Fails when:* any of the above.
+- *Suggestion:* SQL: `{table}.{col} is {raw_type}; store it as {DATE|timestamptz}.` With fix: naive timestamp → `ALTER TABLE {table} ALTER COLUMN {col} TYPE timestamptz USING {col} AT TIME ZONE '{assumed_tz}';` (`timestamp AT TIME ZONE zone` yields `timestamptz`); string date → `... TYPE date USING to_date({col}, '{detected_format}')`; string timestamp → `... TYPE timestamptz USING to_timestamp({col}, '{detected_format}') AT TIME ZONE '{assumed_tz}'` after confirming the source zone. SARIF fix only for not-yet-applied DDL. JSON: `add "format": "date-time" (RFC 3339, requires Z or an offset)`.
+- *Limits:* MySQL `DATETIME` has no zone — dialect profile maps it to naive. Epoch integers are legal only when declared. In JSON Schema 2019-09/2020-12, `format` is an annotation and is not asserted by default; the suggestion also recommends enabling the format-assertion vocabulary in the validator (or adding a `pattern`), otherwise `"01/02/2025"` still validates.
+
+#### Design B — Local-time-needs-a-zone contract (C, deterministic)
+
+- *Measure:* Any field annotated `tz=local` or named `(?i)local_` must have a sibling field matching `(?i)(_tz|timezone|time_zone|_zone)$` with type string, constrained to IANA names by one of: an FK to a `time_zones` reference table (populated from `pg_timezone_names` or Go's `time/tzdata`), a JSON `enum` generated from tzdata, or at minimum a pattern `^(UTC|[A-Za-z]+(/[A-Za-z0-9_+-]+)+)$` (which admits `America/Argentina/Buenos_Aires`, `Etc/GMT+7`).
+- *Fails when:* local time without a zone column; a zone column with no constraint; or a zone column whose constraint/enum/sample default admits offsets (`^[+-]\d`, `UTC-7`) or abbreviations (`MST`, `EST`).
+- *Suggestion:* `{entity}.{field} is local time but has no IANA zone. Add "{stem}_tz text NOT NULL REFERENCES time_zones(name)" holding e.g. 'America/Denver'; abbreviations like MST and POSIX strings like 'UTC-7' (whose sign PostgreSQL inverts) are ambiguous. Keep {field} as an absolute timestamptz and derive local time with AT TIME ZONE {stem}_tz.`
+- *Limits:* only fires on declared/named local times. A pattern cannot prove a name exists in tzdata; the FK/enum forms are preferred.
+
+#### Design C — Write-path literal audit (Q, deterministic)
+
+- *Measure:* Go code corpus: calls `time.Time.Format(layout)` whose result flows (SSA) into a struct field or SQL parameter bound to a temporal or string date column, where `layout` lacks a numeric zone (`Z07:00`, `Z0700`, `-07:00`, `-0700`; `MST` abbreviations do not count); `time.Parse` with a zone-less layout feeding a stored value (`time.Parse` then silently assumes UTC, so a floating local string becomes a wrong instant); `time.Now()`/`.Local()` values bound to a `timestamp_naive` column. SQL corpus: `INSERT`/`UPDATE` string literals for temporal columns that fail ISO 8601 or lack `Z`/offset for `timestamptz`.
+- *Fails when:* any such flow exists.
+- *Suggestion:* `{file}:{line} formats {var} with layout "{layout}" (no zone) before storing in {col}. Pass the time.Time directly as a query parameter, or use time.RFC3339Nano; when parsing local input use time.ParseInLocation(layout, s, loc) with loc from time.LoadLocation("{zone}").`
+- *Limits:* dataflow is intra-procedural unless `go/ssa` + pointer analysis is enabled.
+
+**Recommendation:** A (MVP, highest yield), then B; C in Phase 2.
+
+### §9.3 — No custom time-zone conversion; durations in UTC; open ends explicit `[MUST][CODE]`
+
+**Applies to:** Go ✔ (code using the entity's time fields) · SQL ✔ (views, queries and stored transformations; DDL comments for inclusivity) · JSON ◐ (`x-mml-end-inclusive` on interval pairs)
+**Checkability:** `direct` for code patterns and `AT TIME ZONE` placement, `declared` for inclusivity and for which query files are presentation queries.
+
+#### Design A — Hand-rolled offset detector (Q, deterministic)
+
+- *Measure:* Go (`golang.org/x/tools/go/analysis` pass using `types.Info` to resolve `time` package calls): (1) `time.FixedZone(name, off)` with a non-zero constant `off`; (2) `t.Add(±c)` where `c` is a constant in `[-12h, +14h]` that is a multiple of 15 minutes **and** the receiver or result is also passed to `.UTC()`, `.In()`, or assigned to an identifier/field matching `(?i)(local|utc|tz|zone|offset)`; (3) `unix ± 3600*k`/`± k*3600` constant arithmetic on a value from `.Unix()`. SQL AST: `A_Expr` (`+`/`-`) of a temporal column and an `INTERVAL 'k hour(s)'` constant with `k ∈ 1..14` whose output alias or target column matches `(?i)(local|_tz|zone)`; and `AT TIME ZONE` (pg_query parses `x AT TIME ZONE z` as a `FuncCall` to `pg_catalog.timezone(z, x)`) whose zone argument is an `A_Const` string matching an offset (`^[+-]\d`, `^UTC[+-]`) rather than an IANA name.
+  Two more SQL checks cover the rule's example of converting a `timestamptz` column with `AT TIME ZONE` in the presentation query only. Each one resolves the `timezone()` argument through `ColumnRef` → IR field → `Field.Type`:
+  (4) **Naive input.** The converted value is a `timestamp_naive` column. PostgreSQL then reads the stored wall-clock value *as local time in* `z` and returns a `timestamptz`. That reinterprets the value rather than presenting it, and the result depends on the zone the data was written in.
+  (5) **Stored output.** The conversion of a `timestamptz` value sits outside a presentation query. That means any `ResTarget` of a `CreateTableAsStmt`, `ViewStmt` (other than views in `config: time.presentation_globs`, default `**/reports/**`, `**/bi/**`, `**/presentation/**`, or views annotated `layer=presentation`), `InsertStmt … SELECT`, `UpdateStmt.targetList`, `MergeStmt`, or a dbt model whose `materialized` is not `ephemeral` and whose path is outside the presentation globs. It also covers `CreateStmt` generated columns (`GENERATED ALWAYS AS (ts AT TIME ZONE 'America/Denver') STORED`). PostgreSQL accepts these, because `timezone(text, timestamptz)` with a constant zone is immutable, so the check is needed there too.
+- *Fails when:* any of (1), (3), (4), (5) or the SQL `AT TIME ZONE` offset case matches outside `*_test.go`; (2) and the SQL interval case are reported as heuristic (one severity lower) because the same arithmetic is legitimate for expiries.
+- *Suggestion:* (1)–(3): `{file}:{line} converts time zones by hand ({expr}). DST makes fixed offsets wrong twice a year. Use time.LoadLocation("{zone}") and t.In(loc) (Go) / "{col} AT TIME ZONE '{zone}'" in the presentation query only; keep stored and computed values in UTC.` (4): `{file}:{line} applies AT TIME ZONE '{zone}' to {entity}.{col}, which is timestamp without time zone, so PostgreSQL reinterprets the stored wall-clock value as {zone} local time instead of converting an instant. Migrate {col} to timestamptz (§9.2), then convert only for display.` (5): `{file}:{line} stores the local-time conversion {expr} in {target}. Store the UTC instant and convert with AT TIME ZONE '{zone}' in the presentation query only; if a local wall-clock column is truly needed, store the IANA zone in a separate column (§9.2) and derive it at read time.`
+- *Limits:* `Add(24*time.Hour)` is excluded (day arithmetic is a different hazard); `FixedZone("UTC", 0)` allowed. Go durations from `t2.Sub(t1)` are already zone-independent, so the residual Go risk is wall-clock values built from naive strings, which §9.2-C catches. Check (4) also fires on the one legitimate use of `naive AT TIME ZONE`: the one-time migration that turns legacy naive columns into `timestamptz`. Migration files (`config: migrations` globs) are exempt. Check (5) relies on the presentation globs or annotations. Without them, a BI view in an unconventional path is reported; add it to `time.presentation_globs`.
+
+#### Design B — Duration and open-end contract (C + S, deterministic)
+
+- *Measure:* Find interval pairs in each entity: `(X_start|X_from|created_at|opened_at, X_end|X_to|resolved_at|closed_at)` by stem matching or `time=valid_from/valid_to`. For each pair require: (1) end nullable ⇒ annotation `null=open` (still running / open-ended) or `null=not_applicable`; (2) an `end=exclusive|inclusive` annotation on the end field (for `DATE` pairs this states whether day counts include the end date); (3) both ends the same type (both `timestamptz` or both `date`, never one naive).
+- *Fails when:* any of the three is missing or violated.
+- *Suggestion:* `{entity} has interval ({start},{end}) but does not state {missing}. Add "@end({end}): exclusive" and "@null({end}): open", make both columns {type}, and compute durations as COALESCE({end}, CURRENT_TIMESTAMP) - {start} on UTC values.`
+- *Limits:* stem pairing can mis-pair; `//mml:interval start,end` overrides. A `tstzrange`/`daterange` column is one field: require its bounds be declared (`'[)'` canonical) instead of (2).
+
+#### Design C — Null-propagating duration query check (Q, deterministic)
+
+- *Measure:* SQL query ASTs: subtraction `end - start` or `age(end,start)`/`EXTRACT(EPOCH FROM end - start)` where `end` is nullable and not wrapped in `COALESCE`/`CASE`/filtered by `WHERE end IS NOT NULL`. Go: `nt.Time.Sub(start)` where `nt` is `sql.NullTime` (or `pgtype.Timestamptz`) read without a dominating `nt.Valid` check — an invalid value yields the zero time `0001-01-01` and a huge negative duration; `(*end).Sub` without a nil check is reported as a panic risk.
+- *Fails when:* such an expression feeds an aggregate, a stored column, or (Go) a returned/persisted value.
+- *Suggestion:* `Duration {expr} at {file}:{line} is NULL for open {entity} rows and is silently dropped by {agg}(). Use COALESCE({end}, CURRENT_TIMESTAMP) - {start}, or filter WHERE {end} IS NOT NULL and state so.`
+- *Limits:* needs query corpus.
+
+**Recommendation:** A first, as a Phase 2 design: checks (1)–(3) need the code and query corpus. Checks (4) and (5) on views, CTAS and generated columns need only the DDL already loaded in the MVP, so ship that subset early. Ship B in the MVP for interval DDL, and C in Phase 2. Trace: the ✗ `local_time = utc_time - INTERVAL '7 hours'` matches the SQL interval case (alias `local_time`) and is reported one severity lower as heuristic; the ✗ `resolved_at - created_at` with open tickets fails C when it feeds an aggregate. The ✓ `event_ts AT TIME ZONE 'America/Denver'` on a `timestamptz` column in a plain presentation `SELECT` passes (4) and (5).
+
+### §9.4 — Late-arriving files: creation time, ingestion time, no filename dedup `[MUST][CODE]`
+
+**Applies to:** Go ✔ (structs for photos/documents/uploads) · SQL ✔ (file-metadata tables) · JSON ✔ (file-manifest schemas)
+**Checkability:** `direct` once file entities are recognized; `declared` for which dedup method an entity uses.
+
+The rule requires two timestamps (creation time, such as the embedded EXIF time, and ingestion time) and forbids deduplication by file name. It allows either of two dedup methods: comparing content (for example by hash), or comparing the creation and ingestion times. A content hash is therefore one acceptable dedup key, not a requirement.
+
+#### Design A — File-entity shape check (S + L, deterministic)
+
+- *Measure:* An entity is a *file entity* if it has annotation `layer=unstructured` or `role=file`, or at least two signals: a location field (`(?i)(_uri|_url|s3_|gcs_|object_key|storage_path|file_path)$`) plus a file-descriptor field (`(?i)(filename|file_name|mime|content_type|size_bytes|byte_size|sha256|checksum)`). Require (1) a creation-time field (`(?i)(created|captured|taken|exif|recorded|authored|document_date)_?(at|time)?`, or `time=event`) distinct from (2) an ingestion-time field (`time=ingested` or `ingested_at|uploaded_at|received_at`), both temporal types (§9.2), and (3) a usable dedup basis: either a content-hash field (`(?i)(sha256|sha1|md5|content_hash|checksum)`; typed as hex `char(64)` for SHA-256, 40 for SHA-1, 32 for MD5, or `bytea`/`[32]byte`), or the creation and ingestion fields from (1) and (2) declared as the dedup key with `dedup=created_at,ingested_at` (field names as on the entity).
+- *Fails when:* (1) or (2) is missing; (1) and (2) are the same field; or (3) has neither a hash field nor a `dedup=` declaration over the creation and ingestion fields.
+- *Suggestion:* `{entity} is a file entity but lacks {missing}. Add "captured_at timestamptz" (from EXIF DateTimeOriginal combined with OffsetTimeOriginal, or document metadata) and "ingested_at timestamptz NOT NULL DEFAULT now()". For deduplication, add "content_sha256 char(64) NOT NULL", or declare @dedup: captured_at, ingested_at to compare by those times.`
+- *Limits:* not every file has embedded time; `//mml:waive §9.4 reason="generated reports have no capture time"`. EXIF `DateTimeOriginal` is local wall time with no zone; without `OffsetTimeOriginal` the extractor must record the assumed zone (see §9.2). `created_at` is ambiguous (§9.1): if it records row insertion, it is a system time, not the file's creation time; annotate `time=event` on the true creation field.
+
+#### Design B — Dedup-key structural check (S, deterministic)
+
+- *Measure:* Inspect PKs, unique constraints and unique indexes (`Constraint.contype = CONSTR_UNIQUE`, `IndexStmt.unique`) on file entities, plus `dedup=` (JSON Schema: `x-mml-dedup`, `x-mml-key`). The dedup key is the first that applies: the `dedup=` declaration; a UNIQUE/PK that covers the content-hash column (alone or scoped, e.g. `(owner_id, content_sha256)`); or a UNIQUE/PK that covers the creation-time column (alone or with the ingestion-time column or a scope column such as `device_id`).
+- *Fails when:* the only uniqueness on a descriptive name column is `filename|file_name|original_name` (deduplication by name), or `dedup=` names a filename column. When no dedup key is enforced at all, B reports a note only: Design A already requires a dedup basis, and dedup may live in ingestion code (Design C). The ✓ `photos(photo_id, captured_at_exif, ingested_at, content_sha256)` therefore passes A and B even without a UNIQUE constraint, and the ✗ "deduplicate synced photos by `filename`" fails B (UNIQUE on `filename`) or C (`ON CONFLICT (filename)`).
+- *Suggestion:* `{entity} enforces uniqueness on {name_cols}, so copies with different names will duplicate and different files with the same name will collide. Deduplicate by content, with UNIQUE ({hash_col}) (or UNIQUE ({scope_col}, {hash_col})), or by creation and ingestion times, with UNIQUE ({created_col}, {scope_col}) and @dedup: {created_col}, {ingested_col}. Keep object_key unique as a storage address if needed, but never use filename for deduplication.`
+- *Limits:* versioned files may legitimately repeat hashes across entity IDs; allow `UNIQUE (entity_id, hash)`. Time-based dedup is allowed by the rule but merges distinct files captured in the same second (burst photos). The check only notes this when the creation column has no sub-second precision (§9.8) and no scope column; it does not fail. Dedup done in application code, with no constraint, is found only by Design C or a `dedup=` declaration.
+
+#### Design C — Ingestion-code dedup audit (Q, deterministic)
+
+- *Measure:* In functions that write a file entity (found through `INSERT INTO {file_entity}`, an ORM `Create(&T{})`, or `bun`'s `NewInsert().Model(&T{})`), collect the dedup mechanism: `InsertStmt.onConflictClause.infer.indexElems`, `WHERE … = $n` existence lookups before the insert, and Go map keys used as a seen-set (`seen[key]` where `key` derives from a struct field). Also inspect the value assigned to the creation-time field.
+- *Fails when:* the conflict target, existence check or seen-set key uses a name column (`filename|file_name|original_name` or `filepath.Base(...)`), or the creation-time field is assigned from `time.Now()`. (Ingestion time from `time.Now()` is correct.)
+- *Suggestion:* `{func} at {file}:{line} checks for duplicates by {col}. Compare content instead: hash the bytes (sha256.Sum256) and use ON CONFLICT ({hash_col}), or compare the creation and ingestion times with ON CONFLICT ({created_col}, {scope_col}). Populate {capture_field} from EXIF DateTimeOriginal/OffsetTimeOriginal (e.g. github.com/rwcarlsen/goexif/exif), not time.Now().`
+- *Limits:* Phase 2 corpus needed. Name lookups used for display or for storage-path collisions, rather than dedup, are reported too; suppress with a waiver that gives the reason. Dedup in an external service (an object-store event filter) is invisible.
+
+**Recommendation:** A + B together in MVP (both DDL-only); C later.
+
+### §9.5 — Validity intervals and half-open point-in-time lookups `[SHOULD][CODE]`
+
+**Applies to:** Go ◐ (structs representing versioned facts) · SQL ✔ (history/SCD tables, policy tables) · JSON ✔ (document/chunk metadata schemas for RAG)
+**Checkability:** `direct` for queries, `declared` for which entities are lifespan facts.
+
+#### Design A — Lifespan-fact shape check (L + S, deterministic)
+
+- *Measure:* Candidate lifespan entities: name matches `(?i)(price|tier|address|policy|plan|tariff|_history|_versions?|_scd)` (config `time.lifespan_patterns`), annotation `lifespan=true`, or a composite key of `(business_key, *_from|effective_*)`. Require both `valid_from` and `valid_to` (role-annotated or by name) of the same temporal type with `valid_from NOT NULL` and `CHECK (valid_to > valid_from)`, **or** one `tstzrange`/`daterange` column (canonical `'[)'` bounds) — ideally with `EXCLUDE USING gist (key WITH =, valid_during WITH &&)` (needs `btree_gist`) or PostgreSQL 18 `PRIMARY KEY (key, valid_during WITHOUT OVERLAPS)`. Also flag `valid_to` sentinels (`DEFAULT '9999-12-31'`) mixed with nullable `valid_to` across entities in one model.
+- *Fails when:* missing one end, mismatched types, no ordering check, or inconsistent open-end convention model-wide.
+- *Suggestion:* `{entity} looks like a fact with a lifespan but has {present}. Add valid_from/valid_to ({type}) with CHECK (valid_to > valid_from) and pick one open-end convention project-wide (config: time.open_end = null|sentinel; currently {mix}).`
+- *Limits:* name heuristic (hence `dim_` tables are not matched by default — SCD1 dimensions have no lifespan); `lifespan=false` suppresses.
+
+#### Design B — Point-in-time predicate checker (Q, deterministic)
+
+- *Measure:* SQL ASTs: find predicates on an entity with `valid_from`/`valid_to`. Correct form is `valid_from <= X AND valid_to > X` (or `X <@ tstzrange(valid_from, valid_to, '[)')`, or `valid_to IS NULL OR valid_to > X` under null convention). Flag: only one bound referenced; `X BETWEEN valid_from AND valid_to` (closed); `valid_to >= X`; the inverted half-open form `valid_from < X AND valid_to >= X`; range forms built with `'[]'` bounds. Go: `squirrel`/`gorm.Where` strings parsed the same way.
+- *Fails when:* any query on a lifespan entity references a validity column with a non-half-open predicate.
+- *Suggestion:* `{file}:{line} filters {entity} with "{pred}", which returns multiple versions at boundaries. Use: {valid_from} <= {x} AND {valid_to} > {x}.`
+- *Limits:* only covers corpus queries.
+
+#### Design C — Retrieval-metadata contract for agent corpora (C, deterministic)
+
+- *Measure:* JSON Schemas / Go structs annotated `layer=rag` or named `(?i)(chunk|document|passage|embedding)` must carry `valid_from`/`valid_to` (or `x-mml-lifespan: none` with reason), and the retriever config (`semantic_layer/*.yml` or `retrieval.yml`) must list a validity filter for that corpus.
+- *Fails when:* corpus chunk schema has no validity fields, or retriever config has no `filter: valid_at` for it.
+- *Suggestion:* `Chunks in {schema} carry no validity; a superseded {entity} will be retrieved as current. Add "valid_from"/"valid_to" (format: date-time) and filter retrieval by the question's date.`
+- *Limits:* depends on a declared retriever config.
+
+**Recommendation:** B has the clearest wrong-answer signal (Phase 2); A in MVP for the DDL side.
+
+### §9.6 — Bitemporal where "what was known when" matters `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ · SQL ✔ · JSON ◐ (event-sourced document schemas)
+**Checkability:** `declared` (needs `audit`/`bitemporal` requirement) + `direct` for update paths.
+
+#### Design A — Declared-requirement shape check (C + S, deterministic)
+
+- *Measure:* Entities annotated `audit=bitemporal`, or matching config `time.bitemporal_entities` globs (e.g. `tickets`, `sla_*`, `*_corrections`), must have four fields with roles `valid_from, valid_to, txn_from, txn_to` (aliases `system_from/system_to`; or two range columns), a PK that includes `txn_from` (or a surrogate version ID plus a unique `(business_key, txn_from)`), and a constraint that prevents overlapping transaction-time ranges per business key: `EXCLUDE USING gist (key WITH =, tstzrange(txn_from, txn_to) WITH &&)` (requires the `btree_gist` extension for `=` on scalar keys), or PostgreSQL 18 `UNIQUE (key, txn_period WITHOUT OVERLAPS)`.
+- *Fails when:* any role is missing, or PK equals the business key alone (implies overwrite).
+- *Suggestion:* `{entity} is declared bitemporal but lacks {missing_roles}. Add txn_from/txn_to timestamptz, make the key ({business_key}, txn_from), add the no-overlap constraint, and close old rows instead of updating.`
+- *Limits:* only covers declared entities; the rule applies only where "what was known when" must be answerable, so nothing is required of undeclared entities.
+
+#### Design B — In-place update detector (Q, deterministic)
+
+- *Measure:* In query/code corpus, any `UPDATE {entity} SET` (or ORM `Save`/`Updates` on its Go struct) that assigns a non-`txn_to`/`valid_to` column on an entity that has `audit=bitemporal`, or that has `audit` unset but matches `(?i)(sla|priority|triage|correction|audit)` columns.
+- *Fails when:* an `audit=bitemporal` entity is mutated in place (deterministic). The name-matched case (audit-flavored columns, no declaration, no versioning) is reported as a heuristic note asking the owner to decide whether §9.6 applies.
+- *Suggestion:* `{file}:{line} overwrites {entity}.{cols}. This destroys what the system believed before. Close the current version (SET txn_to = now()) and INSERT a new row with the new {cols}, in one transaction.`
+- *Limits:* trigger-based versioning satisfies the rule — detect the `temporal_tables` extension's `versioning()` trigger on the table, or SQL:2011 `WITH SYSTEM VERSIONING`/`PERIOD FOR SYSTEM_TIME` in MariaDB/SQL Server/Db2 dialects, and skip. Only covers writes in the corpus.
+
+#### Design C — History-diff regression (H, deterministic)
+
+- *Measure:* Base vs head IR: an entity that had `txn_from/txn_to` (or a `_history` companion table referenced by FK) loses them, or its PK shrinks to exclude the version column.
+- *Fails when:* bitemporal capability removed in the PR.
+- *Suggestion:* `This change removes {cols} from {entity}, dropping transaction-time history. If intended, record the decision in an ADR and add @deviation: {adr}.`
+- *Limits:* needs `--base`.
+
+**Recommendation:** B (catches real overwrites), with A as MVP for declared entities.
+
+### §9.7 — One fiscal calendar dimension, reused `[SHOULD][ARCH]`
+
+**Applies to:** Go ✘ (except date-dimension structs) · SQL ✔ (`dim_date`, queries) · JSON ✘
+**Checkability:** `direct`.
+
+#### Design A — Date-dimension shape and uniqueness (S + G, deterministic)
+
+- *Measure:* Find entities whose name matches `(?i)^(dim_)?(date|calendar|fiscal_calendar)s?$` or annotation `layer=reference; role=calendar`. Require exactly one per model (config `calendar.entity`), with columns `calendar_date` (PK, DATE), `fiscal_year`, `fiscal_quarter`, `fiscal_month`, `fiscal_week`, `is_fiscal_year_end`. Also flag other entities that store `fiscal_quarter|fiscal_year` columns without an FK to the calendar.
+- *Fails when:* zero or >1 calendar entities, missing columns, or duplicated fiscal columns elsewhere.
+- *Suggestion:* `{entity} stores {fiscal_cols} independently of {calendar}. Drop them and JOIN {calendar} USING (calendar_date); fiscal periods should be defined once.`
+- *Limits:* periodic snapshot tables may legitimately carry `fiscal_month` as a grain key — allow if it has an FK.
+
+#### Design B — Recomputed-fiscal-period query check (Q, deterministic)
+
+- *Measure:* SQL ASTs: `EXTRACT(QUARTER|YEAR|WEEK FROM x)`, `date_part('quarter', x)`, `date_trunc('quarter'|'year', x)`, `to_char(x, 'Q')`, or `CASE WHEN EXTRACT(MONTH ...) >= {n}`. Such an expression is a candidate when its output alias matches `(?i)(fiscal|fy_|quarter)`, and always when `config: calendar.fiscal_year_start_month != 1`.
+- *Fails when:* any such expression appears outside the calendar entity's own build query.
+- *Suggestion:* `{file}:{line} derives {alias} with {expr}. The fiscal year starts in month {n}; JOIN {calendar} USING (calendar_date) and GROUP BY {calendar}.fiscal_quarter.`
+- *Limits:* calendar-year reporting is legitimate when FY = calendar year; rule muted then except for `fiscal`-named aliases.
+
+**Recommendation:** B (direct evidence of the error, Phase 2); A in MVP.
+
+### §9.8 — Finest available timestamp precision `[SHOULD][CODE]`
+
+**Applies to:** Go ◐ (truncation in code) · SQL ✔ (`timestamp(p)`, `DATE` vs timestamp) · JSON ✔ (`format: date` vs `date-time`, `pattern` restricting seconds)
+**Checkability:** `direct` (type), `declared` (source precision).
+
+#### Design A — Declared-precision type check (C + S, deterministic)
+
+- *Measure:* Event-time fields (role `event`, see §9.1-A) must have precision ≥ the source's. The source precision comes from `precision=` on the linked upstream field (`x-mml-precision: ms|us`, Go `mml:"precision=us"`), else `config.time.min_precision` (default `us`, PostgreSQL's maximum). SQL: an explicit `timestamptz(p)`/`timestamp(p)` with `p` below the required digits fails (no `p` means 6 in PostgreSQL and passes); in MySQL `DATETIME`/`TIMESTAMP` without `(fsp)` defaults to whole seconds and fails. `DATE` used for an event-time field named `*_at` fails. JSON: `format: date` on an `_at` field fails, as does a `pattern` forbidding fractional seconds (`:\d\dZ$` with no `\.\d+`, or minute-only `T\d\d:\d\dZ$`).
+- *Fails when:* stored precision is coarser than declared/default.
+- *Suggestion:* `{entity}.{field} is {raw_type} (precision {p}) but the source provides {src_p}. Use timestamptz (default precision 6) / DATETIME(6) and truncate in queries instead.`
+- *Limits:* business dates (`order_date`) are intentionally DATE; only event-time role fields checked. Go `time.Time` carries nanoseconds but PostgreSQL stores microseconds; that platform limit is not reported unless `precision=ns` is declared upstream.
+
+#### Design B — Truncate-on-write audit (Q, deterministic)
+
+- *Measure:* Go: `t.Truncate(d)` / `t.Round(d)` with constant `d ≥ time.Second` (or `≥ time.Millisecond` when `precision=us` is declared), `time.Unix(t.Unix(), 0)`, `time.UnixMilli(t.UnixMilli())` under a `us` requirement, or `Format` with a layout lacking fractional seconds (note `time.RFC3339` drops them; `time.RFC3339Nano` keeps them), on a value flowing into a store of an event-time field. SQL: `INSERT ... SELECT date_trunc('minute'|'second'|'hour', x)` / `::date` / `::timestamp(0)` targeting event-time columns.
+- *Fails when:* truncation happens on the write path.
+- *Suggestion:* `{file}:{line} truncates {field} to {unit} before storage; that precision cannot be recovered. Store the original and apply date_trunc('{unit}', ...) at read time.`
+- *Limits:* requires corpus; reads are fine.
+
+**Recommendation:** A in MVP; B Phase 2.
+
+## §10 — Metadata, Semi-/Unstructured Data and ML/AI Artifacts
+
+### §10.1 — Label metadata attributes as business or system `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ (struct fields for timestamps and audit columns, ORM `autoCreateTime`/`autoUpdateTime` tags) · SQL ✔ (columns, `COMMENT ON COLUMN`) · JSON ✔ (properties and their `description`)
+**Checkability:** `declared` (the business or system class), `direct` (contradictions between the class and how the field is written or linked).
+
+The revised rule only asks that metadata be treated as a distinct, deliberate category of attributes, with each metadata attribute labelled as describing either the business event or the system that processed it. It no longer requires datasets, pipeline runs, schemas, lineage, quality scores or access logs to be modeled as entities. The earlier "operational-domain graph presence" design is retired. §10.7-A still requires training runs and datasets wherever ML signals exist. Synthetic-data marking moved to §10.9.
+
+#### Design A — Metadata classification contract (C + L, deterministic)
+
+- *Measure:* A field is a *metadata attribute* when it is temporal, or when its name matches the metadata lexicon (`config: metadata.lexicon`, default: a leading `_`; `(?i)(^|_)(created|updated|modified|changed|deleted|loaded|synced|ingested|processed|extracted)_(at|on|by|ts|time)$`; `(?i)(^|_)(last_updated|etl_\w+|batch_id|run_id|source_system|record_source|row_hash|etag|version)$`). Business event times that are the entity's subject (`order_date`, `shipped_at` on `shipments`) are excluded unless they also match the lexicon. Each metadata attribute must resolve to a class: `time=business|system` (or the finer `time=event|ingested|processed`, where `event` counts as business and the others as system) for temporal fields, and `meta=business|system` for the rest. The class comes from an annotation, or from an unambiguous name: system for a leading `_` or `(?i)(_loaded|_etl|_ingested|_synced|_dbt_|_batch|_run)`; business for an entity-prefixed stem such as `customer_updated_at` on `customer`. The ✓ example also asks for each attribute to be "described as such in the catalog", so the field's `Doc` must be non-empty and contain the class word (`business|system|pipeline|load`) or an `@time:`/`@meta:` line.
+- *Fails when:* a metadata attribute has no class, or its doc is empty. Ambiguous names (`(?i)^(last_updated|updated_at|modified|changed_at|ts|timestamp|updated_by|version)$`) never classify by name alone.
+- *Suggestion:* `{entity}.{field} is a metadata attribute with no stated meaning: is it a business change or a load artefact? Rename to "{entity}_updated_at" (business: when the {entity} changed) or "_loaded_at" (system: when the pipeline wrote the row), or annotate @time({field}): business|system, and add a column description saying which.`
+- *Limits:* high initial volume on brownfield schemas; baseline it. The lexicon decides which non-temporal fields count as metadata, so a project-specific audit column (`ingest_lsn`) is missed until it is added to `metadata.lexicon`. The design checks that a class is declared, not that it is true; Designs B and C check consistency.
+
+#### Design B — Cross-form and lineage class consistency (G, deterministic)
+
+- *Measure:* Gather every occurrence of a metadata attribute in the graph: members of the same logical entity (Go struct, table, JSON Schema) that share the field after name folding, and downstream projections of it (view `ResTarget`s whose expression is a bare `ColumnRef` to the field, dbt models through `manifest.json` `depends_on` plus column lineage when compiled SQL is available). Compare the resolved classes.
+- *Fails when:* two occurrences resolve to different classes (the Go struct says `time=business` on `UpdatedAt`, the table comment says `system`), or a system-class field is projected downstream under a business-looking name (`_loaded_at AS customer_updated_at`), or a business-class field is projected as a leading-`_` system name.
+- *Suggestion:* `{field} is labelled {class_a} in {member_a} but {class_b} in {member_b}. Decide which it records and make every form agree; if both meanings exist, split it into "{entity}_updated_at" (business) and "_loaded_at" (system).`
+- *Limits:* needs cross-source linking and, for dbt, compiled SQL for column lineage; renamed projections through expressions (`COALESCE(_loaded_at, …)`) are not followed. It cannot catch a field that is wrongly labelled consistently everywhere.
+
+#### Design C — Write-path evidence check (Q, heuristic)
+
+- *Measure:* Find where each classified metadata attribute is written. Go: struct tags `gorm:"autoUpdateTime"`/`autoCreateTime`, bun `,default:current_timestamp`, and assignments of `time.Now()` in packages listed under `config: metadata.pipeline_packages` (loaders, ETL jobs). SQL: `DEFAULT now()`/`CURRENT_TIMESTAMP`, triggers calling `moddatetime`, and `UpdateStmt.targetList` setting the field to `now()` inside pipeline query files. Writes in a pipeline package are *system evidence*. So are `DEFAULT now()` and `moddatetime`-style triggers on entities whose `layer` is `staging|core|analytical|obt|feature`. On an OLTP entity the same trigger records when the business object changed, so it counts as neither. Assignments from request or domain inputs in application packages are *business evidence*.
+- *Fails when:* a field labelled `business` has only system evidence (for example, written only by the loader with `now()`), or a field labelled `system` is set from domain input.
+- *Suggestion:* `{entity}.{field} is labelled {class} but is only written by {writer} at {file}:{line}, which records {other_class} time. Relabel it, or add a separate {suggested_field} so each column has one meaning.`
+- *Limits:* heuristic: an application setting `now()` when a customer edits their details is a business-event time, so evidence from application packages is never counted as system. The design depends on `metadata.pipeline_packages` being configured. Without it, only trigger and `DEFAULT` evidence is used, which reports at note level.
+
+**Recommendation:** A in MVP (most actionable, and the only design that needs no corpus); B once cross-source linking is stable; C in Phase 2 with the code corpus.
+
+### §10.2 — Shred stable fields; schema-enforced semi-structured shape `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ (`json.RawMessage`, `map[string]any`, `datatypes.JSON`) · SQL ✔ (`JSON/JSONB/VARIANT` columns) · JSON ✔ (`additionalProperties`, `type` unions)
+**Checkability:** `direct`.
+
+#### Design A — Raw-blob ratio check (S, deterministic)
+
+- *Measure:* For each entity count fields with `Type=json` (SQL `json/jsonb/VARIANT`; Go `json.RawMessage`, `map[string]any`, `any`, `datatypes.JSON`, `[]byte` tagged as JSON). Fail if (a) the only non-key, non-time fields are JSON ("payload-only table"); (b) a JSON column is named `(?i)(payload|data|body|raw|blob|doc|json)` and the entity has < `config.semi.min_typed_cols` (default 3) typed non-key columns; or (c) the "shred everything" opposite: the entity is linked to a JSON Schema that declares an extension point (`x-mml-extension`, or `additionalProperties` not `false`) but has no JSON column to hold the remainder.
+- *Fails when:* (a), (b) or (c).
+- *Suggestion:* (a)/(b) `{entity} stores everything in {json_col}. Shred stable fields into typed columns (e.g. {top_keys}) and keep only the variable remainder in "{json_col}" as properties.` where `{top_keys}` come from a linked JSON Schema's `required` list if present. (c) `{entity} has no column for {schema}'s variable "{extension}" fields; every new payload key will need a migration. Add "{extension} jsonb" for the remainder.`
+- *Limits:* landing/raw tables (`layer=staging`, `source=third_party`) exempt from (a)/(b).
+
+#### Design B — Shape-consistency check on JSON Schema (S, deterministic)
+
+- *Measure:* For each JSON Schema property that is `required` or carries a core concept (name in glossary / `x-mml-core: true`): fail if its `type` is a union of incompatible kinds (`["array","object","string"]`), if `oneOf/anyOf` branches give different primitive types, if it has no `type`, or if the root object has `additionalProperties` unset/true without a named extension point (`x-mml-extension: attributes` pointing at an object property).
+- *Fails when:* any of the above.
+- *Suggestion:* `"{prop}" in {schema} can be {types}. Give it one shape ({suggested_type}, e.g. category_id: string) and move variable fields under a declared extension object "attributes" with "additionalProperties": false at the root.`
+- *Limits:* polymorphic events legitimately use `oneOf` with a discriminator — allow if each branch has `const` discriminator and core fields agree.
+
+#### Design C — Query-driven shredding candidates (Q, deterministic)
+
+- *Measure:* Count JSON path extractions in the query corpus: PostgreSQL `col->>'k'`, `col->'k'`, `col #>> '{a,b}'` (pg_query `A_Expr` with operator name `->>`/`->`/`#>>`), `jsonb_extract_path[_text]`, `JSON_VALUE` (`FuncCall`), Snowflake `col:k` (dialect parser), and Go `gjson.Get`. A key extracted in ≥ `config.semi.shred_threshold` (default 3) distinct queries, or used in `WHERE`/`JOIN`/`GROUP BY`, is a shredding candidate. Infer `{inferred_type}` from the cast applied at the extraction site (`::numeric`, `::int`), else from the linked JSON Schema property type.
+- *Fails when:* any candidate exists without a typed column of that name.
+- *Suggestion:* `{json_col}->>'{key}' is extracted in {n} queries ({files}) and used in {clause}. Promote it: ALTER TABLE {table} ADD COLUMN {key} {inferred_type} GENERATED ALWAYS AS (({json_col}->>'{key}')::{inferred_type}) STORED;` (or populate it in the ingest pipeline).
+- *Limits:* Phase 2. PostgreSQL generated columns require an immutable expression: casts to `numeric`/`int`/`text`/`boolean` qualify, but a cast to `timestamptz` does not (it depends on the `TimeZone` setting), so time keys get a pipeline-populated column instead.
+
+#### Design D — Schema-enforcement presence (A, deterministic)
+
+- *Measure:* Each SQL JSON column and Go raw field must name a schema (`@schema: schemas/x.json` / `mml:"schema=..."` / `x-mml-schema`) whose file exists in the repo and parses as JSON Schema (or an `.avsc` Avro schema registered for the topic), and enforcement must be evidenced by one of: a `CHECK (jsonb_matches_schema('{...}', col))` (pg_jsonschema extension), a Go call to `(*jsonschema.Compiler).Compile` + `(*jsonschema.Schema).Validate` (santhosh-tekuri/jsonschema) referencing that schema file, or a schema-registry compatibility setting in repo config.
+- *Fails when:* no schema is named, the named file is missing or invalid, or no enforcement evidence exists.
+- *Suggestion:* `{entity}.{col} has no {missing}. Add @schema: {path} and validate on write (CHECK (jsonb_matches_schema(...)) or jsonschema Validate before insert); give variable fields a declared extension object.`
+- *Limits:* proves enforcement is wired somewhere, not that every write path calls it; Go evidence is per-package, not per-call-site.
+
+**Recommendation:** A + B in MVP; C is the most actionable later (Phase 2).
+
+### §10.3 — Unstructured content in object storage; extract once; derived features modeled `[SHOULD][ARCH]`
+
+**Applies to:** Go ✔ (`[]byte` content fields) · SQL ✔ (`BYTEA/BLOB/LONGTEXT`, views) · JSON ✔ (`contentEncoding: base64`)
+**Checkability:** `direct`.
+
+#### Design A — Inline-binary detector (S, deterministic)
+
+- *Measure:* (1) Inline content: fields of type `bytes` (SQL `BYTEA`, `BLOB`, `LONGBLOB`, `IMAGE`, `VARBINARY(MAX)`; Go `[]byte` not named `(?i)(hash|sha|key|nonce|salt|signature|token|iv)`; JSON `contentEncoding: base64` / `contentMediaType` set) or `TEXT` with name `(?i)(image|photo|video|audio|pdf|file|attachment)_?(data|content|blob)?`. (2) Reference metadata: an entity with a content reference field (`(?i)(_uri|_url|object_key)$`) must have metadata siblings for who (`uploaded_by|owner_id`), when (`uploaded_at|created_at`), what (`content_type|mime`) and version (`version|content_sha256`).
+- *Fails when:* (1) any inline-content field exists, or (2) a reference field lacks one of the four metadata kinds.
+- *Suggestion:* `{entity}.{field} stores file bytes in the row. Store the object in object storage and keep "{stem}_id uuid PRIMARY KEY" (§4.7), "{stem}_uri text NOT NULL", "uploaded_at", "uploaded_by", "content_type", "content_sha256" here.`
+- *Limits:* small thumbnails may be deliberate; waive with reason.
+
+#### Design B — LLM-in-query detector (Q, deterministic for SQL; heuristic for Go)
+
+- *Measure:* View definitions (`ViewStmt`; materialized views — `CreateTableAsStmt` with `objtype = OBJECT_MATVIEW` — are exempt when a pipeline refreshes them, since they extract once per refresh rather than per read) and the read-query corpus: `FuncCall` nodes whose qualified name matches config `llm.functions`. Defaults: Databricks `ai_query`, `ai_classify`, `ai_extract`, `ai_gen`, `ai_analyze_sentiment`; BigQuery `ML.GENERATE_TEXT`, `AI.GENERATE*`; Snowflake `SNOWFLAKE.CORTEX.*`, `AI_COMPLETE`, `AI_CLASSIFY`, `AI_FILTER`; PostgreSQL pgai `ai.*` (e.g. `ai.openai_chat_complete`); Azure `azure_ai` extension `azure_openai.*`, `azure_cognitive.*`. Go: calls into LLM SDKs (`github.com/anthropics/anthropic-sdk-go`, `github.com/openai/openai-go`) inside functions reachable (static call graph, `golang.org/x/tools/go/callgraph/vta`) from HTTP read handlers or repository `Get*`/`List*`/`Find*` methods.
+- *Fails when:* an LLM function appears inside a non-materialized view or a read query (deterministic); a Go SDK call is reachable from a read path (heuristic, one severity lower).
+- *Suggestion:* `View {view} calls {fn}() on {col} for every read. Extract once in a pipeline into {entity}_attributes({entity}_id, {outputs}, extracted_at, model_version) when each {entity} lands, and select from that.`
+- *Limits:* Go reachability is approximate (interface dispatch over-approximates); the function list needs vendor updates, so it is configurable.
+
+#### Design C — Derived-feature placement (G + L, deterministic)
+
+- *Measure:* Derived-feature fields: names matching `(?i)(embedding|vector|sentiment|keywords|detected_|predicted_|_prob(ability)?$|_score$)`, or vector types (pgvector `vector(n)`/`halfvec(n)`, Go `pgvector.Vector` or fixed arrays `[N]float32` with N ≥ 64, JSON `type: array` of `number` with `minItems ≥ 64`). Flag those that sit on a core/OLTP entity (not `layer=feature` and not a dedicated `*_attributes|*_features|*_embeddings` entity keyed by the parent ID), or that lack lineage siblings (`model_version`, `computed_at`).
+- *Fails when:* a derived feature sits on the source entity or has no lineage siblings.
+- *Suggestion:* `{entity}.{col} is a derived feature stored on the source row, losing its lineage. Move it to {entity}_features({entity}_id, {col}, model_version, computed_at) or the vector store, keyed by {entity}_id.`
+- *Limits:* `_score` also matches source facts (`credit_score` supplied by a bureau); annotate `derived=false` or waive. Go slices (`[]float32`) have no static length and are matched by name only.
+
+**Recommendation:** A in MVP; B is high value and cheap for views (Phase 2).
+
+### §10.4 — Per-aspect sentiment, not one blended score `[SHOULD][CODE]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔
+**Checkability:** `direct`.
+
+#### Design A — Blended-score name check (L + S, deterministic)
+
+- *Measure:* Fields matching `(?i)^(overall_|total_|avg_|blended_)?(sentiment|polarity|tone)(_score)?$` (no aspect token) of numeric type. Pass if the same entity (or a child `*_sentiment(aspect, score)` table) has aspect fields `sentiment_{aspect}` with ≥2 aspects.
+- *Fails when:* only a blended field exists.
+- *Suggestion:* `{entity}.{field} blends all aspects into one score. Store one score per aspect, e.g. sentiment_product, sentiment_shipping, or a child table {entity}_aspect_sentiment({entity}_id, aspect, score) with aspect constrained to an enum.`
+- *Limits:* a blended field kept *alongside* aspects is allowed.
+
+#### Design B — Aspect-taxonomy contract (C + G, deterministic)
+
+- *Measure:* Entities with any sentiment field must declare `@aspects: product, shipping, service` (or reference an aspects taxonomy entity). Check that every declared aspect has a field/row representation, and that an aspect child table's `aspect` column is FK/enum-constrained to the taxonomy (ties to §2.3).
+- *Fails when:* no declared aspects, or declared aspects without storage.
+- *Suggestion:* `{entity} has sentiment but no declared aspects. Add @aspects: ... and a column or row per aspect; currently missing: {missing}.`
+- *Limits:* the aspect list is a team declaration; the check verifies storage matches it, not that the aspects are the right ones.
+
+#### Design C — Aspect-blending write detector (Q, deterministic)
+
+- *Measure:* In pipeline/INSERT/UPDATE/`CREATE TABLE AS` queries and Go write paths, find a value written to a blended-named field (Design A's pattern) that is computed by combining aspects: arithmetic over ≥2 `sentiment_*` columns (`(a + b) / 2`, `GREATEST(a, b)`), or `AVG(score)` over an aspect child table grouped by the parent key; or a sentiment model's per-aspect output (Go struct with ≥2 aspect fields) reduced to one value before storage.
+- *Fails when:* such a blend is written and the per-aspect values are not also persisted.
+- *Suggestion:* `{file}:{line} averages aspects {aspects} into {target}, cancelling opposing signals. Persist each aspect score; compute any blend at query time.`
+- *Limits:* needs the query/code corpus; a blend stored alongside persisted aspects is allowed.
+
+**Recommendation:** A in MVP.
+
+### §10.5 — Training sets at label grain, point-in-time correct `[MUST][ARCH]`
+
+**Applies to:** Go ◐ (feature/training row structs) · SQL ✔ (training views, feature tables) · JSON ◐ (feature-set schemas)
+**Checkability:** `declared` + `direct` for joins.
+
+#### Design A — Training-set contract (C + S, deterministic)
+
+- *Measure:* Entities with `layer=training` (or name `(?i)(training|train_|_labels?|_examples?)`) must declare `@grain` and `@label: {col}` and `@observation_time: {col}`. Check: PK/unique == the grain key columns; `observation_time` field exists and is `NOT NULL` temporal; label column exists. Feature entities (`layer=feature`) used by it must carry an `as_of`/`valid_from` temporal field.
+- *Fails when:* any declaration missing or inconsistent with keys.
+- *Suggestion:* `{entity} is a training set but declares no {missing}. Add @label: churned, @observation_time: snapshot_date, @grain: one row per customer per snapshot_date, and make (customer_id, snapshot_date) the key.`
+- *Limits:* proves the declarations agree with the keys, not that the build query honours them (Design B).
+
+#### Design B — Point-in-time join analyzer (Q, deterministic)
+
+- *Measure:* In the SQL that builds a training entity (dbt model / view / `INSERT ... SELECT`), for each `JoinExpr` (or `LATERAL` subquery in `fromClause`) to a feature entity: require a temporal predicate `feature.ts <= label.observation_time` in the join qual or the lateral subquery's `WHERE`, where `feature.ts` has role `event`/`valid_from` (or `valid_from <= obs AND valid_to > obs` on lifespan facts, §9.5). Accepted forms: that predicate, `LATERAL (... WHERE f.ts <= l.obs ORDER BY f.ts DESC LIMIT 1)`, or a dialect `ASOF JOIN` (DuckDB, Snowflake `MATCH_CONDITION`, ClickHouse — parsed by the dialect parser, as PostgreSQL has no `ASOF`). Flag joins to entities lacking any temporal column (current-state tables like `accounts.balance`). Also check grain: if the join is to the many side (feature FK → label key) without aggregation or `LIMIT 1` per label key, grain is raised (reuse §7.2 fan-out analysis).
+- *Fails when:* a feature join lacks the time bound, bounds the wrong way (`>`/`>=`), joins a current-state table, or raises grain.
+- *Suggestion:* `{model} joins {feature_entity} on {keys} without bounding {feature_ts} <= {obs_time}; training sees future values. Rewrite as a point-in-time join: LEFT JOIN LATERAL (SELECT ... FROM {feature_entity} f WHERE f.{key} = l.{key} AND f.{feature_ts} <= l.{obs_time} ORDER BY f.{feature_ts} DESC LIMIT 1) ON true.`
+- *Limits:* Python feature pipelines and feature-store SDK calls (`get_historical_features`) are not SQL and are covered only via Design C. Event time ≠ availability time: if features land late, require `ingested_at <= obs_time` too (configurable `training.pit_column: event|ingested`).
+
+#### Design C — Feature-store definition audit (A, deterministic)
+
+- *Measure:* Feast feature views are Python, not YAML (`feature_store.yaml` holds only repo config), so parse `feature_repo/**/*.py` with a tree-sitter Python grammar (`github.com/tree-sitter/go-tree-sitter`) and extract keyword arguments of `FeatureView(...)`, `Entity(...)` and source constructors (`FileSource`, `BigQuerySource`, `SnowflakeSource`, ...): every source must set `timestamp_field`; every feature view should set `ttl`; the view's entity `join_keys` must equal the training entity's grain key columns.
+- *Fails when:* a source lacks `timestamp_field`, or join keys differ from the training grain; missing `ttl` is reported one severity lower.
+- *Suggestion:* `Feature view {fv} has no timestamp_field on {source}; point-in-time joins are impossible. Set timestamp_field="{candidate_col}" and join on {grain_keys}.`
+- *Limits:* only literal keyword arguments are read; values built dynamically in Python are reported as unresolved. Other stores (Tecton, Hopsworks) need their own extractors.
+
+**Recommendation:** B (direct leak detection, Phase 2); A in MVP.
+
+### §10.6 — Persist agent input context with each action `[MUST][ARCH]`
+
+**Applies to:** Go ✔ · SQL ✔ · JSON ✔
+**Checkability:** `direct` once agent-action entities are identified.
+
+#### Design A — Agent-action shape check (L + S, deterministic)
+
+- *Measure:* Agent-action entities: name `(?i)(agent|llm|assistant|copilot|bot)_?(actions?|steps?|calls?|decisions?|runs?)` or `actor_type` enum containing `agent|ai|llm`, or `@actor: agent`. Require fields matching `prompt|input_context|messages` (text/json), `tools_available|tool_manifest` (json/array), `model_version|model_id|model` (string, `NOT NULL`). In JSON Schema, these must be `required`.
+- *Fails when:* any missing or nullable.
+- *Suggestion:* `{entity} records agent actions without {missing}. Add prompt jsonb NOT NULL, tools_available jsonb NOT NULL, model_version text NOT NULL so each action can be replayed and debugged.`
+- *Limits:* prompt storage may be restricted by privacy; allow `prompt_ref` (URI + hash) as an alternative.
+
+#### Design B — Polymorphic-actor audit (G, deterministic)
+
+- *Measure:* Event entities with `actor_id`/`actor_type` (from §3.1) whose `actor_type` enum includes an agent value: require an FK or join path from the event to an `agent_runs`/`agent_context` entity carrying the context fields.
+- *Fails when:* agents act in an event table with no path to context.
+- *Suggestion:* `{events} allows actor_type='{agent_value}' but has no link to agent context. Add agent_run_id REFERENCES agent_runs(agent_run_id) where agent_runs stores prompt, tools, model_version, plus CHECK (actor_type <> '{agent_value}' OR agent_run_id IS NOT NULL).`
+- *Limits:* requires the actor type to be an enum/CHECK; free-text actor types are first reported under §5.4.
+
+#### Design C — Write-site audit (Q, heuristic)
+
+- *Measure:* Go functions that call an LLM SDK (anthropic-sdk-go `client.Messages.New(ctx, anthropic.MessageNewParams{...})`, openai-go `client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{...})`) and, in the same function or a callee within N=3 call-graph hops, write an agent-action entity (sqlc `Insert*`/`Create*` call, ORM `Create(&T{})`, or `INSERT INTO {entity}`). Check the written struct literal or parameter set populates the context fields, and that their values flow from the request params' `Model`, `Tools` and `Messages`/`System` fields.
+- *Fails when:* the write omits a context field or sets it from a constant unrelated to the request.
+- *Suggestion:* `{func} records the action in {entity} but never sets {fields}; pass params.Model, params.Tools and the prompt (params.System + params.Messages) through.`
+- *Limits:* bounded call-graph depth and struct-literal matching miss context threaded through builders; reported one severity lower.
+
+**Recommendation:** A in MVP; B where §3.1 events exist.
+
+### §10.7 — ML and agent artifacts modeled as data `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ · SQL ✔ · JSON ✔
+**Checkability:** `direct` for whether artifact entities exist with the right shape, and whether training lineage resolves to datasets in the IR (M2). The logging practice is `direct` only where a second signal confirms it (M5), and it is otherwise a `note`.
+
+#### Design A — Artifact-entity graph check (G + S, deterministic)
+
+- *Measure:* Detect signals: ML (`mlflow`/`wandb` config, `layer=training|feature`, `*.onnx`/`*.pt` artifacts) and agent (LLM SDK imports, tool-dispatch code). With ML signals require role entities `model_version` (FKs to `training_dataset`/`dataset` and to the training `run`, `hyperparameters` json, and a link to the feature definitions/steps used — FK to a `feature_set`/`feature_step` entity or a declared feature-store reference). With agent signals require `agent_run`, `tool_call` (`call_id` PK, FK to `agent_run`, `tool_name`, `arguments`, `result`, `called_at`) and, when the agent keeps memory, `agent_memory` (`memory_id`, FK to `agent_run` or owner, `content`, `created_at`, `valid_to`). Check the FK edges exist in the graph.
+- *Fails when:* signals are present but a required role entity or edge is missing.
+- *Suggestion:* `This repo {trains models|runs agents} but {role} is not modeled. Add {ddl_skeleton} and link it to {targets}.`
+- *Limits:* signal detection decides applicability. A repo that only calls a hosted model for one-shot classification may get `model_version` demands it does not need; the `ml.signals` config narrows them. Presence alone does not show that the links point anywhere real; Design C checks that.
+
+#### Design B — Unstructured-trace detector (Q, heuristic)
+
+- *Measure:* In Go, find calls to `log/slog`, `zap`, `logrus` or `fmt.Printf` whose message or attributes mention `tool`, `tool_call`, `agent`, `prompt` or `completion`, inside functions that also call an LLM SDK or a tool dispatcher, where the same function has no DB or event write of a `tool_call` entity.
+- *Fails when:* the traces go only to logs. **Under M5,** a lexical match alone reports at `note`. It reaches the rule's `warning` only when a second, structural signal agrees: the same function, or its callers in the `callgraph/vta` graph, reads tool-use results from an SDK response, such as the Anthropic Go SDK's `ToolUseBlock` content or the OpenAI Go SDK's `ChatCompletionMessageToolCall` (the type names are configured in `agents.tool_result_types`, because SDK versions rename them).
+- *Suggestion:* "`{func}` logs tool calls as text at {file}:{line}. Persist them as rows in `tool_calls(call_id, agent_run_id, tool_name, arguments, result, called_at)` (§10.7)."
+- *Limits:* OpenTelemetry GenAI spans with a structured exporter satisfy the rule. The detector finds `go.opentelemetry.io/otel` spans with `gen_ai.*` attributes and passes them. Tool calls dispatched through reflection or a generic message bus have no structural signal, so they stay at `note`.
+
+#### Design C — Training-lineage resolution (G+A, deterministic)
+
+- *Measure:* **(M2)** Collect every place an ML artifact names its training data, then resolve each name against the IR and the configured dataset catalog. The places are:
+  - `model_version` rows' FK targets in the IR
+  - DVC `dvc.yaml` `stages.<name>.deps` and `outs` paths
+  - training configs matched by `ml.training_configs` globs, read at the keys in `ml.dataset_keys` (for example `data.train_path`, `dataset`)
+  - Feast `FeatureService` definitions (parsed as in §10.5 C)
+
+  A reference resolves when it names an entity with `layer=training|feature`, a path declared as that entity's `location=`, or a DVC output that another stage produces.
+- *Fails when:* a referenced training dataset does not resolve; a `training_dataset` entity is referenced by no `model_version` (an unlinked artifact); or a `model_version` FK targets an entity whose `layer` is not `training`/`feature` (for example, a model linked straight to the OLTP `orders` table).
+- *Suggestion:* "`{artifact}` trains on `{ref}`, which matches no modeled dataset. Model it as an entity with `@layer: training`, `@grain:` and `@location: {ref}`, and reference it from `model_versions.training_dataset_id` (§10.7)."
+- *Limits:* references kept only in a tracking server, such as MLflow runs, are invisible unless CI exports them, for example to a committed `ml/registry.json` that is added to `ml.training_configs`. Paths built at runtime from parameters resolve only when the parameter has a literal default.
+
+**Recommendation:** A (MVP, once signals are detected), then C in Phase 2, because a modeled artifact whose lineage points nowhere is the gap A cannot see. B (Phase 2) needs the code corpus and stays at `note` until M5 confirms it.
+
+**Residual limit:** whether every runtime tool call or training run is actually recorded cannot be seen statically; only the modeled path and its code-level writes can. Lineage that exists only in an external tracking server is invisible without an export.
+
+### §10.8 — Track feature distributions and alert on drift `[SHOULD][ARCH]`
+
+**Applies to:** Go ✘ · SQL ◐ (feature tables) · JSON ◐ (feature-set schemas)
+**Checkability:** `direct` for monitor coverage and for new features without a monitor. The lock diff (M3) replaces git history. Whether monitors run and what they found is `direct` when their outputs are ingested (M4), and otherwise `proxy`.
+
+#### Design A — Monitoring-coverage artifact check (A, deterministic)
+
+- *Measure:* Enumerate features: columns of `layer=feature` entities (excluding keys and time columns) and Feast feature-view fields. Parse monitoring config (`config: drift.configs` globs, e.g. `monitoring/*.yml`, Great Expectations suite JSON, Evidently/WhyLabs configs where declarative, dbt tests such as `elementary.column_anomalies` or `dbt_expectations.expect_column_quantile_values_to_be_between` / `expect_column_mean_to_be_between`). A feature counts as monitored only if a monitor names it **and** compares against a training reference (snapshot ID or reference dataset), not just fixed bounds. Compute coverage = monitored features / total.
+- *Fails when:* coverage < `drift.min_coverage` (default 1.0), or a monitor lacks a reference (training snapshot ID) or an alert threshold.
+- *Suggestion:* `{n} of {total} features in {entity} have no drift monitor ({unmonitored}). Add a distribution test comparing against training snapshot {snapshot} with threshold, e.g. PSI > 0.2 alerts.`
+- *Limits:* this design checks that each monitor is declared, not that it runs. Design D reads its output.
+
+#### Design B — Distribution-stats entity contract (C + G, deterministic)
+
+- *Measure:* Require an entity `feature_stats(feature_name, stat_date, mean, stddev, null_rate, quantiles json, ...)` with an FK/enum from `feature_name` to declared features, and a `training_snapshot_stats` reference linked from `model_version` (§10.7). Each feature entity must annotate `@monitored_by: feature_stats`.
+- *Fails when:* stats entity absent or features not covered by its enum/FK.
+- *Suggestion:* `Feature {feature} has no stored distribution statistics. Record daily stats in feature_stats and link the training snapshot via model_versions.training_stats_id.`
+- *Limits:* proves the stats are modeled, not that they are computed or alerted on; pairs with Design A for the alert threshold.
+
+#### Design C — New-feature lock gate (H, deterministic)
+
+- *Measure:* **(M3)** Compare the current IR with the committed `mml.lock.json` instead of base against head. A feature column present in the current IR on a `layer=feature` entity, or in a Feast feature-view field, that is absent from the lock is a *new feature*. Check that the current monitoring config has a monitor for it, with a training reference and an alert threshold. When `--base` is given, base against head is used as well, which also catches a lock updated in the same PR.
+- *Fails when:* a new feature has no monitor in the current monitoring config.
+- *Suggestion:* "This change adds feature `{entity}.{col}` without a drift monitor. Add it to `{monitor_file}` with a reference to training snapshot `{snapshot}` and an alert threshold (§10.8)."
+- *Limits:* a feature added and locked in an earlier commit without a monitor is no longer "new"; Design A catches it in its repo-wide coverage. Without a lock file and without `--base`, the design is skipped.
+
+#### Design D — Drift-monitor results (A, deterministic)
+
+- *Measure:* **(M4)** With `check --results`, ingest monitor outputs and map them to features through the `meta` that `scaffold` or the monitor config records (`mml_rule: "§10.8"`, `mml_entity`, `mml_field`). The adapters are as follows.
+  - **dbt or GX drift tests:** read the dbt `results[].status` and `failures`, and from GX, `success`, plus `results[].expectation_config.kwargs.column` and `results[].result.observed_value`.
+  - **Evidently:** read a saved report JSON. The report layout differs between Evidently versions, so the adapter is versioned. The legacy `Report` JSON (0.4–0.6) carries `metrics[].metric` = `DataDriftTable` with `result.drift_by_columns.<column>.drift_detected` and `drift_score`. Newer releases restructure the output, so those paths are set in `drift.evidently.paths`, not hard-coded.
+
+  Freshness of each output comes from dbt `metadata.generated_at`, the GX run time, or an Evidently report timestamp when present. Otherwise it comes from the file's mtime.
+- *Fails when:*
+  - a monitored feature reports drift (`drift_detected: true`, or a drift test with `status` `fail`/`warn`), which becomes a `§10.8 drift` finding with the observed score
+  - a declared monitor has no output newer than `drift.max_result_age` (default `7d`), which is `mml/test-not-run`
+- *Suggestion:* For drift: "Feature `{entity}.{col}` drifted from training snapshot `{snapshot}` ({stattest}: {score}, threshold {threshold}). Investigate the source, and retrain or recalibrate (§10.8)." For a stale result: "The drift monitor for `{entity}.{col}` has produced no output since {last_run}. A monitor that does not run tracks nothing (§10.8)."
+- *Limits:* drift monitors usually run on a schedule in production, not on every PR. CI must fetch the latest outputs, for example as a stored artifact from the scheduled job, before `check` runs, and freshness depends on that step. The Evidently adapter must track output changes between releases.
+
+**Recommendation:** C first. It is cheap, it prevents new gaps, and it no longer needs git history (M3). Add A for repo-wide coverage, and D once the scheduled monitor's output is available to CI, so that "tracked and alerted" is checked, not only declared.
+
+**Residual limit:** whether the reference snapshot and thresholds are the right ones is not checkable. Drift between monitor runs, or on features whose monitor output CI never receives, stays invisible.
+
+### §10.9 — Distinguish real from synthetic records `[MUST][ARCH]`
+
+**Applies to:** Go ✔ (record structs written by generators) · SQL ✔ (tables, and views and models derived from them) · JSON ✔ (event and record schemas)
+**Checkability:** `declared` (which datasets "may contain synthetic data"), then `direct` (the markers and their propagation).
+
+#### Design A — Synthetic-data marker check (S + C, deterministic)
+
+- *Measure:* An entity *may contain synthetic data* when it is annotated `synthetic=possible`, has `layer ∈ {feature, training}` (`config: synthetic.default_layers`), or is a target of Design B's generator writes. Such an entity must carry three signals. Lineage and provenance: `is_synthetic boolean NOT NULL` (JSON: required `boolean`), `generator_version` (required when `is_synthetic` is true; SQL `CHECK (NOT is_synthetic OR generator_version IS NOT NULL)`; JSON `"if": {"properties": {"is_synthetic": {"const": true}}, "required": ["is_synthetic"]}, "then": {"required": ["generator_version"]}`), and `source_dataset_id` (an FK to a `dataset` entity when one exists, otherwise a non-null identifier). Quality: a field with `role=quality_result` or a name matching `(?i)(quality|fidelity|validation)_(score|status)`, or a `quality=` reference to a test or validation artifact.
+- *Fails when:* `is_synthetic`, `generator_version`, `source_dataset_id` or the CHECK is missing. A missing quality signal is reported as a note, because the rule's ✓ example names only the three marker fields; the ✓ example therefore passes with one note, and the ✗ "synthetic transactions appended to `transactions` with no marker" fails once `transactions` is declared `synthetic=possible` or Design B finds the generator write.
+- *Suggestion:* `{entity} may contain synthetic records but has no {missing}. Add is_synthetic boolean NOT NULL DEFAULT false, generator_version text, source_dataset_id {id_type} NOT NULL{fk}, and CHECK (NOT is_synthetic OR generator_version IS NOT NULL); record a quality signal such as {entity}_quality_score or @quality: {test_path}.`
+- *Limits:* OLTP tables need an explicit `synthetic=possible`, so a production table that silently receives synthetic rows is caught only by Design B. `synthetic=never` with a reason opts a feature or training entity out. The check proves the markers exist, not that writers set them correctly.
+
+#### Design B — Generator write-path detector (Q, deterministic)
+
+- *Measure:* In the code corpus, find values built by synthetic-data generators. These are calls into `github.com/brianvoe/gofakeit/v7`, `github.com/go-faker/faker/v4` or `github.com/jaswdr/faker/v2`, plus functions in `config: synthetic.generator_funcs` (default: names matching `(?i)(generate|synth|augment|simulate)\w*` in non-test packages; matches found only by this name pattern are heuristic and report one severity lower). Follow them with `go/ssa` data flow into an insert of a persisted entity (`db.Create`, `sqlx.NamedExec`, `pgx` `Exec`/`CopyFrom`, `bun` `NewInsert`). In the query corpus, find `InsertStmt`s whose `selectStmt` reads from an entity annotated `synthetic=only` (a generator output table) into a different entity.
+- *Fails when:* synthetic values reach an entity that is not marked `synthetic=possible`, or the write does not set `is_synthetic` to true, or it sets no `generator_version` (in Go, the struct literal or the column list leaves the field at its zero value).
+- *Suggestion:* `{func} at {file}:{line} writes generated records from {generator} into {entity}, which has no synthetic marker. Mark {entity} @synthetic: possible, set is_synthetic = true and generator_version = "{version_source}" on these writes, or write them to a separate {entity}_synthetic table.`
+- *Limits:* only generators in the configured list are recognized. Synthetic data produced outside the repo (a vendor file, a Python notebook) is invisible; declare the receiving entity `synthetic=possible` instead. Test fixtures in `*_test.go` and `testdata/` are excluded.
+
+#### Design C — Marker propagation through lineage (G, deterministic)
+
+- *Measure:* For each entity that may contain synthetic data, walk downstream through view definitions (`ViewStmt.query`), `CreateTableAsStmt`, `InsertStmt … SELECT`, and dbt `manifest.json` `depends_on`. Each downstream entity either projects `is_synthetic` (and `source_dataset_id`), or filters synthetic rows out with `WHERE NOT is_synthetic` / `is_synthetic = false` on the upstream relation.
+- *Fails when:* a downstream entity reads a synthetic-possible source but neither projects the marker nor filters it, so real and synthetic rows can no longer be told apart.
+- *Suggestion:* `{downstream} reads {source}, which may contain synthetic records, but drops is_synthetic. Project {source}.is_synthetic (and source_dataset_id), or filter WHERE NOT {alias}.is_synthetic and state that {downstream} is real-only.`
+- *Limits:* aggregates that mix both kinds need a per-group marker (`bool_or(is_synthetic)` or a separate count); the design accepts any projected expression over `is_synthetic`. Lineage through Go code or external tools is not followed.
+
+**Recommendation:** A in MVP for declared entities; C as soon as view lineage exists, because it catches the loss of markers that A cannot see; B in Phase 2 to find undeclared targets.
+
+### §10.10 — Knowledge graphs: no orphans or dangling edges; an extensible ontology `[SHOULD][ARCH]`
+
+**Applies to:** Go ◐ (node and edge structs, such as `Edge{From, To, Type}`; integrity comes from the linked SQL entity or graph store) · SQL ✔ (node tables, edge tables with endpoint FKs, edge-type reference tables) · JSON ◐ (ontology and edge schemas: relationship types as `enum`, endpoints as `$ref` or ID strings). Graph artifacts in the repo, when present, are also loaded: Cypher constraint and migration files (`*.cypher`), and RDF/OWL ontologies and SHACL shapes (`*.ttl`, `*.owl`, `*.rdf`, `*.jsonld`).
+**Checkability:** `direct` for dangling-edge prevention, for structural tightness, and for graph data committed to the repo as RDF files. Orphan nodes in a live store are a data condition. They are `direct` when the orphan check's results are ingested (M4), and `proxy` otherwise.
+
+An entity takes part in this rule when it is annotated `graph=node|edge|ontology`, or when it is an *edge table*: at least two FK or ID fields pointing to node entities, plus a relationship-type field (`(?i)^(rel|relationship|edge|predicate|link)_?(type|kind|name)$`) or a name matching `(?i)(edges?|relationships?|triples?|links?)$`. A *node entity* is any target of an edge table.
+
+#### Design A — Edge endpoint integrity (S, deterministic)
+
+- *Measure:* For each edge table, inspect both endpoint fields: an enforced FK (`Constraint.contype = CONSTR_FOREIGN`, not `NOT ENFORCED`), `NOT NULL`, and `fk_del_action`. A polymorphic endpoint (`target_id` plus `target_type` with no FK, because the target can be any of several tables) counts as unenforced. In JSON Schema, an endpoint must be a `$ref` to a node definition or carry `x-mml-ref`; a bare `string` ID has no integrity. In Go, the edge struct is checked through its linked SQL entity; a Go-only edge type with no linked table is reported as unenforced.
+- *Fails when:* an endpoint has no enforced FK, is nullable, or uses `ON DELETE SET NULL`/`SET DEFAULT`. Any of these lets a node deletion leave a dangling or half-attached edge.
+- *Suggestion:* `{edge}.{endpoint} can point at a {node} that no longer exists. Make it {endpoint} {type} NOT NULL REFERENCES {node}({pk}) ON DELETE CASCADE (or ON DELETE RESTRICT if deletes must re-point edges first). For polymorphic endpoints, reference one shared nodes(node_id) table and keep the kind as a node attribute.`
+- *Limits:* graph stores without referential constraints, such as an RDF triple store, cannot be checked this way; Design C covers them. In Neo4j a node with relationships cannot be deleted without `DETACH DELETE`, so dangling relationships are prevented natively there; this design applies only to relational and document representations. `ON DELETE CASCADE` stops dangling edges but can leave orphan nodes behind, which Design C checks.
+
+#### Design B — Ontology extensibility check (G, deterministic)
+
+- *Measure:* Find where relationship types live, across all graph entities.
+  1. *Types as structure:* two or more edge tables with the same shape (two endpoint FKs to the same node entities, after removing audit columns), where the table name is the relationship (`works_at`, `advises`); or a node entity with two or more FK columns to node entities named after relationships (`employer_id`, `advisor_id`); or a JSON ontology whose relationships are fixed properties under `additionalProperties: false`.
+  2. *Types as a closed list:* a relationship-type field constrained by `CHECK (… IN (…))`, a `CreateEnumStmt` type, or a JSON `enum`.
+  3. *Types as data:* a relationship-type field that is an FK to an edge-type reference table (`relationship_types(type_id, name, …)`), or a JSON `$ref` to a vocabulary schema that allows new values.
+- *Fails when:* pattern 1 is found (`config: graph.max_typed_edge_tables`, default 1), because a new relationship type then means a new table, column or property, which is the redesign the rule forbids. Pattern 2 is reported as a note, because adding `ADVISES` still needs a schema migration. Pattern 3 passes.
+- *Suggestion:* `Relationship types in {scope} are encoded as {structure} ({examples}), so adding a type such as ADVISES requires a new {table|column|property}. Use one edge table edges(edge_id, from_node_id, to_node_id, relationship_type_id REFERENCES relationship_types, …) and add new types as rows in relationship_types.`
+- *Limits:* some typed edge tables are deliberate, because their relationships carry different attributes (a `marriages` table, §6.4). `graph.typed_edge_allow` lists them. The design cannot judge whether an open ontology is too loose. A closed `CHECK` list on a small, stable vocabulary is a legitimate design choice, so it stays a note.
+
+#### Design C — Orphan and dangling-reference check presence (A, deterministic)
+
+- *Measure:* For each graph, look for a check that runs on data, in one of these forms:
+  - **SQL graphs:** a dbt test or `.sql` assertion that selects node rows with no incident edge (`NOT EXISTS (SELECT 1 FROM {edge} WHERE {edge}.from_node_id = n.{pk} OR {edge}.to_node_id = n.{pk})`), plus a `relationships` test on each unenforced endpoint.
+  - **Cypher repos:** a query file matching `MATCH (n) WHERE NOT (n)--()` (or `NOT EXISTS { (n)--() }`), referenced from a CI job or test.
+  - **RDF/OWL repos:** a SHACL shape for each `owl:ObjectProperty` with `sh:class` (or `sh:node`), so an object that has no type triple fails validation, and a shape with `sh:minCount 1` on at least one relationship path for node classes that must be connected. Parse Turtle, N-Triples or RDF/XML with `github.com/knakk/rdf`, and JSON-LD with `github.com/piprate/json-gold`, and check that a SHACL validator runs in CI (`pyshacl` or `jena shacl` in a workflow file).
+- *Fails when:* a graph has no orphan check, or, for RDF, an object property has no SHACL shape constraining its object. With `check --results` (M4), the linter also reads the outcomes:
+  - **dbt orphan or `relationships` tests:** `results[].status`, mapped through the manifest node's `config.meta.mml_rule`.
+  - **Cypher orphan queries:** JUnit XML from whichever runner wraps them, with a `<failure>` carrying the returned count or IDs.
+  - **SHACL validation reports:** read as RDF. `sh:conforms false` fails, and each `sh:result` gives `sh:focusNode`, `sh:resultPath` and `sh:sourceShape`, so a finding can name the offending node.
+
+  A failed check becomes an orphan or dangling-reference finding. A wired check missing from the results is `mml/test-not-run`.
+- *Suggestion:* `The {graph} graph has no check for {orphan nodes|dangling references}. Add {test_template} to {test_dir} and run it in CI so a deleted {node} with leftover edges, or a node with no edges, fails the build.`
+- *Limits:* on its own, the check proves that the test exists and is wired into CI. Its outcome is read with M4 (below). Nodes that are allowed to have no edges (a newly created entity awaiting links) need `graph.orphans_allowed` per node type. Detecting graphs held only in an external store with no repo artifacts is out of reach.
+
+#### Design D — Orphans and dangling references in committed RDF data (G, deterministic)
+
+- *Measure:* Some repos commit graph *data*, not only an ontology: reference vocabularies, taxonomies and seed graphs as `*.ttl`, `*.nt`, `*.rdf` or `*.jsonld` under `graph.data_globs`. Parse them with the same libraries as Design C, together with the ontology. Then compute:
+  - *dangling:* the object of a triple whose predicate is a declared `owl:ObjectProperty` (or is listed in `graph.object_properties`) is an IRI that is neither the subject of an `rdf:type` triple in the data nor declared external (`graph.external_namespaces`)
+  - *orphan:* a subject with an `rdf:type` of a node class that appears in no other triple as subject or object of an object property, and whose class is not in `graph.orphans_allowed`
+
+  For each `owl:ObjectProperty`, also compare its `rdfs:range` with the object's `rdf:type`.
+- *Fails when:* any dangling object or orphan subject exists, or an object's type is outside the property's range.
+- *Suggestion:* "`{file}`: `{subject} {property} {object}` points at `{object}`, which has no type triple in this graph{; it was likely deleted}. Remove or re-point the triple, or declare `{namespace}` external (§10.10)." For an orphan: "`{subject}` (a `{class}`) has no relationships. Link it, or allow unlinked `{class}` nodes in `graph.orphans_allowed` (§10.10)."
+- *Limits:* only data committed to the repo is checked, not a live triple store. Without OWL reasoning, a type that is implied rather than asserted (through `rdfs:subClassOf` or `owl:sameAs`) can cause false dangling reports. The linter follows `rdfs:subClassOf` chains for range checks, but does no full inference. Very large dumps should be excluded with `graph.data_globs` and checked by the M4 path.
+
+**Recommendation:** A in the MVP, because it is exact on SQL graphs and prevents the dangling edge in the ✗ example. B in the MVP, because it needs only the IR. D in Phase 2, once RDF files are loaded, because it finds both failure kinds directly in committed data. C in Phase 2 for live stores, with M4 results turning its presence check into an outcome check.
+
+**Residual limit:** orphans and dangling edges in a live graph store are seen only through the results of a check that CI runs. Whether the ontology is too *loose*, the opposite of too tight, is a judgment the linter does not make.
+
+## Summary Matrix
+
+Family codes: **S**tructural, **L**exical, **G**raph, **C**ontract, **Q**uery/usage,
+**H**istory, **A**rtifact (see [Design families](#4-design-families)). The
+phase column is for the **recommended first design**: *MVP* needs only the
+entity IR and annotations, inline or in the `mml.yaml` sidecar; *Phase 2* needs
+the query/code corpus or other repo artifacts (CODEOWNERS, glossary, ADRs, dbt
+files, contracts); *Phase 3* needs base-vs-head history or is
+proxy-only.
+
+| Rule   | Strength | Designs (family)        | Build first                                                                        | Phase   |
+| ------ | -------- | ----------------------- | ---------------------------------------------------------------------------------- | ------- |
+| §1.1   | MUST     | A(C) B(H) C(A+S)        | B: new-table gate (lock-based)                                                     | MVP     |
+| §1.2   | MUST     | A(C) B(A) C(A)          | A: definition/owner/escalation contract                                            | MVP     |
+| §1.3   | MUST     | A(C) B(L+A)             | A: process descriptor contract                                                     | Phase 2 |
+| §1.4   | MUST     | A(S+C) B(A+Q)           | A: unhappy-path coverage in state model                                            | Phase 2 |
+| §1.5   | MUST     | A(G+C) B(L+S) C(H) D(Q) | A: conceptual-model conformance of new entities                                    | Phase 2 |
+| §1.6   | MUST     | A(Q) B(G)               | B: normalization-depth graph metric                                                | MVP     |
+| §1.7   | MUST     | A(L+G) B(C+A)           | B: hardening checklist on promoted entities                                        | Phase 2 |
+| §1.8   | SHOULD   | A(L) B(C) C(H)          | A: physical-vocabulary lint on upper-level models                                  | Phase 2 |
+| §1.9   | SHOULD   | A(S+G) B(L+A) C(H)      | B: undocumented-shortcut check                                                     | MVP     |
+| §1.10  | SHOULD   | A(C) B(H+L)             | A: scope declaration contract                                                      | Phase 2 |
+| §1.11  | SHOULD   | A(Q+C) B(G)             | A: competency-question test harness                                                | Phase 2 |
+| §1.12  | SHOULD   | A(H) B(C+A)             | A: breaking-change classifier (lock-based) with documented-authority approval gate | Phase 2 |
+| §1.13  | MUST     | A(C) B(A) C(H)          | A: ownership-record contract                                                       | MVP     |
+| §1.14  | SHOULD   | A(C) B(H) C(A+S)        | A: requirements-record contract                                                    | Phase 2 |
+| §2.1   | MUST     | A(L) B(S+G) C(S)        | A: glossary term resolution                                                        | Phase 2 |
+| §2.2   | MUST     | A(G+C) B(Q) C(S)        | A: boundary-crossing translation contract                                          | MVP     |
+| §2.3   | SHOULD   | A(L+S) B(G+L) C(S) D(A) | A: classification-field type check                                                 | MVP     |
+| §2.4   | MUST     | A(C+A) B(Q) C(C+Q)      | A: agent-exposed metadata completeness                                             | Phase 2 |
+| §2.5   | SHOULD   | A(C) B(L) C(A)          | A: metadata coverage and quality scoring                                           | MVP     |
+| §2.6   | SHOULD   | A(Q) B(A+C)             | B: semantic-layer completeness contract                                            | Phase 2 |
+| §2.7   | SHOULD   | A(L) B(S+L)             | B: enum overlap with standard value sets                                           | MVP     |
+| §2.8   | CONSIDER | A(S+G) B(Q)             | A: state machine and permitted operations as data                                  | MVP     |
+| §2.9   | SHOULD   | A(A+C) B(Q+S) C(H)      | A: contract registry and completeness                                              | Phase 2 |
+| §3.1   | MUST     | A(C+G) B(Q)             | A: history-required contract                                                       | MVP     |
+| §3.2   | SHOULD   | A(G+S) B(Q) C(S) D(Q+A) | A: copied attribute without stated reason                                          | MVP     |
+| §3.3   | SHOULD   | A(Q+G) B(C+S)           | B: layer contract on wide tables                                                   | MVP     |
+| §3.4   | SHOULD   | A(S) B(Q) C(A)          | A: write-time enforcement audit                                                    | MVP     |
+| §3.5   | SHOULD   | A(H+S) B(A) C(Q)        | A: foreign-schema mutation detector                                                | MVP     |
+| §3.6   | SHOULD   | A(Q) B(A+G)             | A: hard-coded upstream location scan                                               | Phase 2 |
+| §4.1   | MUST     | A(S) B(G) C(Q)          | A                                                                                  | MVP     |
+| §4.2   | MUST     | A(C) B(G) C(S) D(A)     | A                                                                                  | MVP     |
+| §4.3   | SHOULD   | A(H) B(S+L)             | A (lock-based)                                                                     | MVP     |
+| §4.4   | SHOULD   | A(S) B(S) C(G)          | A+B                                                                                | MVP     |
+| §4.5   | SHOULD   | A(L+S) B(G)             | A                                                                                  | MVP     |
+| §4.6   | MUST     | A(S+L) B(C)             | A                                                                                  | MVP     |
+| §4.7   | SHOULD   | A(S+L) B(G) C(Q)        | A                                                                                  | MVP     |
+| §4.8   | SHOULD   | A(S) B(L+G) C(C+L)      | B                                                                                  | MVP     |
+| §4.9   | SHOULD   | A(S+C) B(Q+G)           | A                                                                                  | MVP     |
+| §4.10  | SHOULD   | A(L+S) B(Q) C(G)        | A                                                                                  | MVP     |
+| §4.11  | SHOULD   | A(G+S) B(C+H)           | A+B                                                                                | MVP     |
+| §5.1   | MUST     | A(L) B(S+L) C(Q)        | A+B                                                                                | MVP     |
+| §5.2   | SHOULD   | A(S+L) B(L) C(A+L)      | A+B                                                                                | MVP     |
+| §5.3   | MUST     | A(C) B(Q) C(G)          | A                                                                                  | MVP     |
+| §5.4   | SHOULD   | A(S+L) B(G+L) C(Q)      | A                                                                                  | MVP     |
+| §5.5   | SHOULD   | A(L+S) B(H)             | A                                                                                  | MVP     |
+| §6.1   | MUST     | A(S) B(S+Q) C(Q)        | A                                                                                  | MVP     |
+| §6.2   | MUST     | A(S+L) B(C) C(G)        | A+B                                                                                | MVP     |
+| §6.3   | SHOULD   | A(A) B(A+S) C(Q) D(A)   | A, then D                                                                          | Phase 2 |
+| §6.4   | SHOULD   | A(S+L) B(S+G) C(H)      | B+C                                                                                | MVP     |
+| §6.5   | SHOULD   | A(G) B(S) C(Q)          | A+B                                                                                | MVP     |
+| §6.6   | SHOULD   | A(G+L) B(Q)             | A                                                                                  | MVP     |
+| §6.7   | SHOULD   | A(L+S) B(G+Q) C(C)      | A                                                                                  | MVP     |
+| §6.8   | CONSIDER | A(Q) B(G+S)             | A                                                                                  | Phase 2 |
+| §7.1   | MUST     | A(C) B(S+G) C(Q)        | A+B                                                                                | MVP     |
+| §7.2   | MUST     | A(Q+G) B(C) C(A)        | A                                                                                  | Phase 2 |
+| §7.3   | MUST     | A(Q) B(S+C) C(Q) D(Q)   | B                                                                                  | MVP     |
+| §7.4   | SHOULD   | A(L+G) B(S+C) C(G) D(Q) | C                                                                                  | MVP     |
+| §7.5   | SHOULD   | A(G+Q) B(H) C(S+L) D(Q) | B (lock-based)                                                                     | MVP     |
+| §7.6   | CONSIDER | A(C) B(A)               | A                                                                                  | MVP     |
+| §8.1   | MUST     | A(C+Q) B(Q) C(A)        | B: bare-`COUNT` query audit                                                        | Phase 2 |
+| §8.2   | MUST     | A(G) B(Q)               | A: junction-table hazard tagging                                                   | MVP     |
+| §8.3   | MUST     | A(C+L) B(Q)             | A: measure-classification contract with lexical prefill                            | MVP     |
+| §8.4   | MUST     | A(S+L) B(Q) C(G)        | A: stored-ratio-without-components check                                           | MVP     |
+| §8.5   | MUST     | A(Q) B(C+S)             | A: date-literal and unbounded-aggregate scan                                       | Phase 2 |
+| §8.6   | MUST     | A(C+S) B(Q)             | A: window-output entity contract                                                   | MVP     |
+| §8.7   | SHOULD   | A(Q+G) B(A+C) C(A)      | A: combined figure without per-group counterpart                                   | Phase 2 |
+| §8.8   | SHOULD   | A(S+L) B(Q)             | A: non-averageable domain marking                                                  | MVP     |
+| §8.9   | SHOULD   | A(G+A) B(C) C(A)        | B: reconciliation contract annotation                                              | MVP     |
+| §9.1   | MUST     | A(L+S) B(Q) C(G)        | A                                                                                  | MVP     |
+| §9.2   | MUST     | A(S+L) B(C) C(Q)        | A                                                                                  | MVP     |
+| §9.3   | MUST     | A(Q) B(C+S) C(Q)        | A                                                                                  | Phase 2 |
+| §9.4   | MUST     | A(S+L) B(S) C(Q)        | A+B                                                                                | MVP     |
+| §9.5   | SHOULD   | A(L+S) B(Q) C(C)        | B (A in MVP)                                                                       | Phase 2 |
+| §9.6   | SHOULD   | A(C+S) B(Q) C(H)        | B (A in MVP)                                                                       | Phase 2 |
+| §9.7   | SHOULD   | A(S+G) B(Q)             | B (A in MVP)                                                                       | Phase 2 |
+| §9.8   | SHOULD   | A(C+S) B(Q)             | A                                                                                  | MVP     |
+| §10.1  | SHOULD   | A(C+L) B(G) C(Q)        | A                                                                                  | MVP     |
+| §10.2  | SHOULD   | A(S) B(S) C(Q) D(A)     | A+B                                                                                | MVP     |
+| §10.3  | SHOULD   | A(S) B(Q) C(G+L)        | A                                                                                  | MVP     |
+| §10.4  | SHOULD   | A(L+S) B(C+G) C(Q)      | A                                                                                  | MVP     |
+| §10.5  | MUST     | A(C+S) B(Q) C(A)        | B (A in MVP)                                                                       | Phase 2 |
+| §10.6  | MUST     | A(L+S) B(G) C(Q)        | A                                                                                  | MVP     |
+| §10.7  | SHOULD   | A(G+S) B(Q) C(G+A)      | A                                                                                  | MVP     |
+| §10.8  | SHOULD   | A(A) B(C+G) C(H) D(A)   | C: new-feature lock gate                                                           | Phase 2 |
+| §10.9  | MUST     | A(S+C) B(Q) C(G)        | A                                                                                  | MVP     |
+| §10.10 | SHOULD   | A(S) B(G) C(A) D(G)     | A+B                                                                                | MVP     |
+
+## Build Roadmap (fitted to the existing climax CLI)
+
+The binary already has the climax layout: one package per command under
+`cmd/`, registered in `cmd/cmd.go`, with `root.Config` threaded through. The
+plan adds these commands and internal packages:
+
+| Command                                   | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mixedmodellint check [paths...]`         | Loads sources into the IR, runs every enabled design, and writes text, JSON, or SARIF. Exit code 1 on any `error` finding. `--base <ref>` turns on diff mode and the H-family designs. `--results <file>...` ingests data-test outcomes (dbt `run_results.json`, JUnit XML, Great Expectations results, SHACL reports) and maps them to rules and entities (M4). `--baseline mml-baseline.json`                                                                                                          |
+| `mixedmodellint extract`                  | Writes the merged IR (entities, fields, links, annotations) as JSON, for debugging links and annotations                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `mixedmodellint explain 8.4`              | Prints the rule text, the designs implemented for it, and examples of a passing and a failing case. Accepts `8.4` or `§8.4`                                                                                                                                                                                                                                                                                                                                                                              |
+| `mixedmodellint scaffold <kind> <target>` | Generates data-test files for designs whose fix is a test, not a schema change: `scaffold reconcile agg.m` (§8.9), `scaffold simpson metric --by group` (§8.7), `scaffold competency` (§1.11), `scaffold dupes entity` (§4.2), `scaffold acyclic entity` (§2.3) and `scaffold reject entity` (§3.4). Each generated test carries `meta: {mml_rule, mml_entity}` so that `check --results` can map its outcome back (M4). Output is a dbt `data_tests:` entry or a `.sql` assertion, chosen by `--format` |
+| `mixedmodellint lock`                     | Writes `mml.lock.json`, the normalized IR with fingerprints (M3). `check` reports `mml/lock-stale` when the working tree no longer matches it, and the H-family designs diff lock against current without git history                                                                                                                                                                                                                                                                                    |
+| `mixedmodellint catalog pull`             | Runs the configured `catalog.export_cmd` and commits `catalog/export.json` plus `catalog/export.lock.json` (fingerprints at export time), so SaaS-hosted metadata can be checked offline (§2.5)                                                                                                                                                                                                                                                                                                          |
+| `mixedmodellint baseline`                 | Writes the fingerprints of current findings so a brownfield adoption can start                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `mixedmodellint annotate --rule §7.1`     | Writes stub annotations (`//mml:grain TODO`, `x-mml-grain`, a `mml.yaml` entry) for every entity missing one, so the team only has to fill in the values. A value of `TODO` still counts as missing. `annotate --refresh <entity>` rewrites `fp=` after a reviewed change (M1)                                                                                                                                                                                                                           |
+
+Internal packages: `internal/ir` (types, linking, annotation merge),
+`internal/source/{gosrc,sqlsrc,jsonschema}`, `internal/corpus/{query,code,artifact,history}`,
+`internal/rules/s<N>` (one file per rule, with each design registered as
+`Design{ID:"8.4-A", Family:Structural, Needs: Needs{IR:true}}`), and
+`internal/report/{text,json,sarif}`. The engine computes only the corpora that
+the enabled designs declare in `Needs`, which keeps MVP runs fast.
+
+### Phase Plan
+
+1. **MVP (IR only).** Build the three loaders, cross-source linking, the
+   annotation merge, SARIF output, and baseline/waiver handling. Then add the
+   designs marked *MVP* above. Most of §4, §5, §6, §9 and §10 are direct
+   structural or lexical checks, and they give the most findings per line of
+   code. During adoption, `severity_overrides: {family: C, max: warning}` in
+   config caps the Contract-family designs at `warning`, so that adopting the
+   linter does not turn CI red overnight. Remove the override once `annotate`
+   stubs have been filled in. Severity then goes back to the rule's strength.
+   Build M1 (fingerprints, `mml/stale-declaration`), M2 (inference
+   cross-checks, which `annotate` prefill also uses), M3 (`lock`) and M5
+   (two-signal promotion) here, because they need only the IR. Building them
+   early means the Contract-family designs never accept free text that is
+   merely present.
+2. **Phase 2 (corpora).** Build M4 result ingestion together with `scaffold`,
+   since every scaffolded test carries the `meta.mml_rule` and `mml_entity`
+   tags that ingestion maps back. Add the query corpus (sqlc query files, views, Go
+   SQL literals through `go/analysis`, and dbt models). dbt models are Jinja
+   templates that `pg_query` cannot parse as written, so the loader reads the
+   compiled SQL from `target/compiled/**` or `target/manifest.json` after a
+   `dbt compile` CI step, and takes model-to-model lineage from the manifest's
+   `depends_on`. Then add the code corpus (`go/ssa` for write paths
+   and time handling), and the artifact loaders (CODEOWNERS, glossary,
+   semantic layer, dbt `schema.yml`, ADRs). This opens up the grain/join
+   rules (§7.2), the aggregation rules (§8.1, §8.5 and §8.7), the
+   semantic-layer and glossary rules (§2.x), and the revision's query- and
+   artifact-based rules: data contracts (§2.9), source definitions (§3.6), the
+   `AT TIME ZONE` placement checks (§9.3) and the requirements record (§1.14).
+3. **Phase 3 (git history).** The M3 lock now handles structural change:
+   breaking changes (§1.12), identifier refactors (§4.3), dropped atomic data
+   (§7.5), new-entity gates (§1.1), pattern re-evaluation (§4.11) and new
+   features (§10.8). Those designs therefore ship in the MVP or Phase 2, and no
+   rule's *recommended* design needs git. Phase 3 adds only the secondary
+   designs that ask *who* or *when*, which a lock cannot answer:
+   - approval history against documented authority (§1.13 C)
+   - whether Who/Why were recorded before What/How (§1.14 B)
+   - whether a physical format predates the logical model (§1.8 C)
+   - contract version bumps over time (§2.9 C)
+
+   These read `git log` or the PR API, and they need `actions/checkout` with
+   `fetch-depth: 0`.
+
+**Testing the linter itself:** for each design, keep a golden-file fixture
+directory (`testdata/<rule>/<design>/{pass,fail}/` holding a matching `.go`,
+`.sql` and `.json` example for each entity kind the rule applies to). The ✗/✓ examples in
+`revised_data_model_rules.md` are the first seed cases. Add property-based tests with
+`pgregory.net/rapid` for the name folder and linker, which must give the same
+`Canonical` for a name regardless of case style or plural form.
