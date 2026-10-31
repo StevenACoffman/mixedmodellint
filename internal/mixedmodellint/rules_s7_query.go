@@ -15,6 +15,14 @@ type scope struct {
 	entities map[string]*Entity // by lowercase alias
 }
 
+// ancestorCopy is an origin of a written value that is a field of an
+// ancestor of the entity written.
+type ancestorCopy struct {
+	parent *Entity
+	field  string
+	at     Position
+}
+
 // section7QueryDesigns are the §7 designs that read the query corpus.
 func section7QueryDesigns() []design {
 	return []design{
@@ -33,6 +41,10 @@ func section7QueryDesigns() []design {
 			title:    "Mixed-grain discriminator contract",
 			strength: Should,
 			check:    check74BQuery,
+		},
+		{
+			id: "7.4-D", title: "Copy-on-write from the coarser grain",
+			strength: Should, check: check74D,
 		},
 		{
 			id: "7.5-D", title: "Query asks for finer detail than the source holds",
@@ -397,8 +409,9 @@ func check75D(c *catalog) []issue {
 }
 
 // finerThanGrain reports a time expression that asks for a finer unit than
-// its column can hold: a date column holds days, so date_trunc('hour', d) is
-// midnight for every row. A grain works in one direction (rule_plan.md
+// its column can hold. A date column holds days, so date_trunc('hour', d) is
+// midnight for every row; a timestamp that every write truncates to the
+// minute (§9.8-B) holds minutes. A grain works in one direction (rule_plan.md
 // §7.5-D).
 func finerThanGrain(c *catalog, s scope, te *TimeExpr) (issue, bool) {
 	e := s.entity(te.Column.Relation)
@@ -406,24 +419,50 @@ func finerThanGrain(c *catalog, s scope, te *TimeExpr) (issue, bool) {
 		return issue{}, false
 	}
 	f, ok := e.Field(te.Column.Column)
-	if !ok || f.Type != TypeDate {
+	if !ok {
+		return issue{}, false
+	}
+	held, at, truncatedOnWrite, ok := c.heldUnit(e, f)
+	if !ok {
 		return issue{}, false
 	}
 	need := timeUnitRank(te.Unit)
-	if need == 0 || need >= timeUnitRank("day") {
+	if need == 0 || need >= timeUnitRank(held) {
 		return issue{}, false
 	}
 	asked := te.Unit
 	if te.Func == "compare" {
 		asked = "a time of day"
 	}
-	return issue{
-		entity: e, field: f.Name, pos: te.Pos,
-		measured: fmt.Sprintf("a query asks for %s from %s.%s, a date column whose finest unit is "+
-			"a day, so every value falls on midnight and the result looks valid while saying "+
-			"nothing", asked, e.Name, f.Name),
-		suggestion: finerSourceHint(c, e),
-	}, true
+	is := issue{entity: e, field: f.Name, pos: te.Pos}
+	if !truncatedOnWrite {
+		is.measured = fmt.Sprintf("a query asks for %s from %s.%s, a date column whose finest "+
+			"unit is a day, so every value falls on midnight and the result looks valid while "+
+			"saying nothing", asked, e.Name, f.Name)
+		is.suggestion = finerSourceHint(c, e)
+		return is, true
+	}
+	is.measured = fmt.Sprintf("a query asks for %s from %s.%s, but every write truncates it to "+
+		"the %s (as at %s), so every value within a %s is the same and the result looks valid "+
+		"while saying nothing", asked, e.Name, f.Name, held, at, held)
+	is.suggestion = fmt.Sprintf("Store %s.%s at full precision and truncate when reading "+
+		"(§9.8-B), or ask for the %s or coarser.", e.Name, f.Name, held)
+	return is, true
+}
+
+// heldUnit returns the finest time unit f can hold: a day for a date, or the
+// unit every write truncates a timestamp to, with where one does. ok is false
+// when f holds full precision or is not temporal.
+func (c *catalog) heldUnit(e *Entity, f *Field) (unit string, at Position, onWrite, ok bool) {
+	switch f.Type {
+	case TypeDate:
+		return "day", Position{}, false, true
+	case TypeTimestamptz, TypeTimestampNaive:
+		unit, at, ok = c.writtenUnit(e, f.Name)
+		return unit, at, true, ok
+	default:
+		return "", Position{}, false, false
+	}
 }
 
 // finerSourceHint names a source with timestamps that e is built from, when
@@ -451,4 +490,60 @@ func hasTimestamp(e *Entity) bool {
 	return slices.ContainsFunc(e.Fields, func(f Field) bool {
 		return f.Type == TypeTimestamptz || f.Type == TypeTimestampNaive
 	})
+}
+
+func check74D(c *catalog) []issue {
+	var out []issue
+	seen := map[string]bool{}
+	for _, w := range c.writes() {
+		if w.field == nil || ownColumn(c, w.entity, w.field) {
+			continue
+		}
+		for _, cp := range c.ancestorCopies(w) {
+			key := fmt.Sprintf("%s|%s|%s|%s", cp.at, w.entity.ID, w.field.Name, cp.parent.ID)
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, copiedFromAncestor(w, cp))
+			}
+		}
+	}
+	return out
+}
+
+// ancestorCopies returns the origins of w's value that copy a field of an
+// entity w's entity references, directly or through others.
+func (c *catalog) ancestorCopies(w write) []ancestorCopy {
+	var out []ancestorCopy
+	ancestors := c.ancestors(w.entity)
+	for i := range w.assignment.Origins {
+		o := &w.assignment.Origins[i]
+		if o.From.Entity == "" {
+			continue
+		}
+		if p := c.lookup(o.From.Entity, w.entity.Source); slices.Contains(ancestors, p) {
+			out = append(out, ancestorCopy{parent: p, field: o.From.Field, at: w.at(o)})
+		}
+	}
+	return out
+}
+
+// ownColumn reports whether a child may legitimately hold a value copied
+// from an ancestor: it is a key, a reference or part of the grain key, it is
+// declared denormalized_for=, or it is a snapshot taken when the transaction
+// happened (§6.6), such as a line's unit price.
+func ownColumn(c *catalog, e *Entity, f *Field) bool {
+	return isKeyOrRef(e, f.Name) || containsFold(c.grainKey(e), f.Name) ||
+		f.Annotations.Has("denormalized_for") || f.Annotations.Has("captured_at_transaction")
+}
+
+func copiedFromAncestor(w write, cp ancestorCopy) issue {
+	child, field, parent, from := w.entity.Name, w.field.Name, cp.parent, cp.field
+	return issue{
+		entity: w.entity, field: field, pos: cp.at,
+		measured: fmt.Sprintf("a write copies %s.%s into every %s row as %s, so the value "+
+			"repeats per row and is multiplied when summed", parent.Name, from, child, field),
+		suggestion: fmt.Sprintf("Read %s from %s with a join instead, or declare "+
+			"denormalized_for=<reason> on %s.%s and mark it measure=non_additive (§7.4).",
+			from, parent.Name, child, field),
+	}
 }

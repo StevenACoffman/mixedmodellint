@@ -96,15 +96,17 @@ func classifyName(name string) nameClass {
 // rank 0.
 func timeUnitRank(unit string) int {
 	ranks := map[string]int{
-		"microsecond": 1, "microseconds": 1, "millisecond": 1, "milliseconds": 1,
-		"second": 2, "seconds": 2, "epoch": 2,
-		"minute": 3, "minutes": 3,
-		"hour": 4, "hours": 4,
-		"day": 5, "days": 5, "dow": 5, "doy": 5, "isodow": 5, "date": 5,
-		"week": 6, "weeks": 6,
-		"month": 7, "months": 7,
-		"quarter": 8,
-		"year":    9, "years": 9, "decade": 9, "century": 9, "millennium": 9,
+		"nanosecond": 1, "nanoseconds": 1,
+		"microsecond": 2, "microseconds": 2,
+		"millisecond": 3, "milliseconds": 3,
+		"second": 4, "seconds": 4, "epoch": 4,
+		"minute": 5, "minutes": 5,
+		"hour": 6, "hours": 6,
+		"day": 7, "days": 7, "dow": 7, "doy": 7, "isodow": 7, "date": 7,
+		"week": 8, "weeks": 8,
+		"month": 9, "months": 9,
+		"quarter": 10,
+		"year":    11, "years": 11, "decade": 11, "century": 11, "millennium": 11,
 	}
 	return ranks[strings.ToLower(strings.TrimSpace(unit))]
 }

@@ -46,6 +46,9 @@ type Query struct {
 	FromSelect bool
 	// Filters are the columns the WHERE clause tests.
 	Filters []ColumnRef
+	// Assignments are the columns an INSERT with a column list or an UPDATE
+	// sets, in statement order, with what is known of each value's origin.
+	Assignments []Assignment
 }
 
 // QueryKind is the statement type.
@@ -118,4 +121,34 @@ type TimeExpr struct {
 	Unit   string
 	Column ColumnRef
 	Pos    Position
+}
+
+// Assignment is one column a write sets. Origins holds every way the written
+// value is known to arise; it is empty when nothing is known, which every
+// design treats as no evidence either way.
+type Assignment struct {
+	Column  string
+	Origins []Origin
+	Pos     Position
+}
+
+// Origin is one way a written value arises: as a copy of a stored field, as a
+// time truncated to a unit, or both (date_trunc('day', o.placed_at)).
+type Origin struct {
+	// From is the stored field the value copies; zero when it is not a copy.
+	From FieldRef
+	// Truncate is the time unit the value was truncated to before the write,
+	// such as "second"; empty when it was not truncated.
+	Truncate string
+	// Pos is where the copy or truncation happens, which for Go code is a line
+	// of Go rather than the SQL. Zero means the write itself.
+	Pos Position
+}
+
+// FieldRef names a stored field by its entity and column name. Unlike a
+// ColumnRef, whose Relation is an alias that only means something inside one
+// query, Entity is a name the catalog can look up.
+type FieldRef struct {
+	Entity string
+	Field  string
 }

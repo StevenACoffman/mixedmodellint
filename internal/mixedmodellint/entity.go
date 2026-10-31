@@ -10,7 +10,10 @@
 // in this package carries the ID it has there, such as "7.1-B".
 package mixedmodellint
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Source kinds.
 const (
@@ -143,6 +146,21 @@ type Source struct {
 	Entities []Entity
 	Queries  []Query
 	Problems []Problem
+}
+
+// String formats p as file:line:col, leaving out what is unknown, and as
+// <input> when even the file is.
+func (p Position) String() string {
+	switch {
+	case p.File == "":
+		return "<input>"
+	case p.Line == 0:
+		return p.File
+	case p.Col == 0:
+		return fmt.Sprintf("%s:%d", p.File, p.Line)
+	default:
+		return fmt.Sprintf("%s:%d:%d", p.File, p.Line, p.Col)
+	}
 }
 
 // Field returns the field with the given name and true, or nil and false. Names compare

@@ -8,6 +8,7 @@ import (
 func section9Designs() []design {
 	return []design{
 		{id: "9.2-A", title: "Native temporal types", strength: Must, check: check92A},
+		{id: "9.8-B", title: "Truncate-on-write audit", strength: Should, check: check98B},
 	}
 }
 
@@ -103,4 +104,36 @@ func fieldAnnotationHint(e *Entity, f *Field, key, value string) string {
 	default:
 		return fmt.Sprintf("COMMENT ON COLUMN %s.%s IS '@%s: %s'", e.Name, f.Name, key, value)
 	}
+}
+
+func check98B(c *catalog) []issue {
+	var out []issue
+	seen := map[string]bool{}
+	for _, w := range c.writes() {
+		if w.field == nil || !eventTime(w.field) {
+			continue
+		}
+		kept := timeUnitRank(finestKept(w.field))
+		for i := range w.assignment.Origins {
+			o := &w.assignment.Origins[i]
+			if timeUnitRank(o.Truncate) <= kept {
+				continue
+			}
+			at := w.at(o)
+			key := fmt.Sprintf("%s|%s|%s", at, w.entity.ID, w.field.Name)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, issue{
+				entity: w.entity, field: w.field.Name, pos: at,
+				measured: fmt.Sprintf("%s.%s is event time, and this write truncates it to the "+
+					"%s before it is stored, so the precision the source had cannot be recovered",
+					w.entity.Name, w.field.Name, o.Truncate),
+				suggestion: fmt.Sprintf("Store the original value and truncate when reading, "+
+					"with date_trunc('%s', %s).", o.Truncate, w.field.Name),
+			})
+		}
+	}
+	return out
 }

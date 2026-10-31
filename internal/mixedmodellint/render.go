@@ -44,7 +44,7 @@ func WriteText(w io.Writer, r Report) error {
 	var b strings.Builder
 	for i := range r.Findings {
 		f := &r.Findings[i]
-		fmt.Fprintf(&b, "%s: %s: [%s] %s\n", location(f.Pos), f.Severity, f.Design, f.Measured)
+		fmt.Fprintf(&b, "%s: %s: [%s] %s\n", f.Pos, f.Severity, f.Design, f.Measured)
 		fmt.Fprintf(&b, "    suggestion: %s\n", f.Suggestion)
 	}
 	s := summarize(r)
@@ -59,19 +59,6 @@ func WriteText(w io.Writer, r Report) error {
 		return fmt.Errorf("write text report: %w", err)
 	}
 	return nil
-}
-
-func location(p Position) string {
-	switch {
-	case p.File == "":
-		return "<input>"
-	case p.Line == 0:
-		return p.File
-	case p.Col == 0:
-		return fmt.Sprintf("%s:%d", p.File, p.Line)
-	default:
-		return fmt.Sprintf("%s:%d:%d", p.File, p.Line, p.Col)
-	}
 }
 
 func summarize(r Report) jsonSummary {
