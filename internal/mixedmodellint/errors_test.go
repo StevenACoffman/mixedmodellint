@@ -2,6 +2,7 @@ package mixedmodellint_test
 
 import (
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -13,26 +14,20 @@ type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
 
-func TestRenderErrors(t *testing.T) {
+func TestWriteErrors(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct {
-		format   m.Format
-		wantCode string
-		wantText string
+		write func(io.Writer, m.Report) error
 	}{
-		"text write fails":  {m.FormatText, m.EINTERNAL, "disk full"},
-		"json write fails":  {m.FormatJSON, m.EINTERNAL, "disk full"},
-		"sarif write fails": {m.FormatSARIF, m.EINTERNAL, "disk full"},
-		"unknown format":    {m.Format(99), m.EINVALID, "unknown format"},
+		"text write fails": {m.WriteText},
+		"json write fails": {m.WriteJSON},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			err := m.Render(failingWriter{}, goldenReport(), tc.format, m.Tool{})
-			equals(t, tc.wantCode, m.ErrorCode(err))
-			if !strings.Contains(err.Error(), tc.wantText) ||
-				!strings.HasPrefix(err.Error(), "mixedmodellint.Render: ") {
-				t.Fatalf("error %q lacks op prefix or %q", err, tc.wantText)
+			err := tc.write(failingWriter{}, goldenReport())
+			if err == nil || !strings.Contains(err.Error(), "disk full") {
+				t.Fatalf("error %v does not report the write failure", err)
 			}
 		})
 	}

@@ -1,0 +1,230 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "addresses": [],
+      "graphs": [],
+      "invocations": [],
+      "language": "en-US",
+      "logicalLocations": [],
+      "newlineSequences": [
+        "\r\n",
+        "\n"
+      ],
+      "policies": [],
+      "redactionTokens": [],
+      "results": [
+        {
+          "partialFingerprints": {
+            "mixedmodellint/v1": "2ec844bb6d720171"
+          },
+          "attachments": [],
+          "codeFlows": [],
+          "fixes": [],
+          "graphTraversals": [],
+          "graphs": [],
+          "kind": "fail",
+          "level": "error",
+          "locations": [
+            {
+              "annotations": [],
+              "id": -1,
+              "logicalLocations": [],
+              "physicalLocation": {
+                "artifactLocation": {
+                  "index": -1,
+                  "uri": "db/schema.sql"
+                },
+                "region": {
+                  "byteOffset": -1,
+                  "charOffset": -1,
+                  "startColumn": 3,
+                  "startLine": 10
+                }
+              },
+              "relationships": []
+            }
+          ],
+          "message": {
+            "arguments": [],
+            "text": "grain does not match the key. Add UNIQUE (order_id)."
+          },
+          "rank": -1,
+          "relatedLocations": [],
+          "ruleId": "7.1-B",
+          "ruleIndex": 0,
+          "stacks": [],
+          "taxa": []
+        },
+        {
+          "partialFingerprints": {
+            "mixedmodellint/v1": "8bea3623f307fd37"
+          },
+          "attachments": [],
+          "codeFlows": [],
+          "fixes": [],
+          "graphTraversals": [],
+          "graphs": [],
+          "kind": "fail",
+          "level": "warning",
+          "locations": [
+            {
+              "annotations": [],
+              "id": -1,
+              "logicalLocations": [],
+              "physicalLocation": {
+                "artifactLocation": {
+                  "index": -1,
+                  "uri": "db/schema.sql"
+                },
+                "region": {
+                  "byteOffset": -1,
+                  "charOffset": -1,
+                  "startLine": 17
+                }
+              },
+              "relationships": []
+            }
+          ],
+          "message": {
+            "arguments": [],
+            "text": "amount is generic. Rename amount."
+          },
+          "rank": -1,
+          "relatedLocations": [],
+          "ruleId": "5.1-A",
+          "ruleIndex": 1,
+          "stacks": [],
+          "taxa": []
+        },
+        {
+          "partialFingerprints": {
+            "mixedmodellint/v1": "33dc3336c208ed61"
+          },
+          "attachments": [],
+          "codeFlows": [],
+          "fixes": [],
+          "graphTraversals": [],
+          "graphs": [],
+          "kind": "fail",
+          "level": "note",
+          "locations": [
+            {
+              "annotations": [],
+              "id": -1,
+              "logicalLocations": [],
+              "physicalLocation": {
+                "artifactLocation": {
+                  "index": -1,
+                  "uri": "db/schema.sql"
+                }
+              },
+              "relationships": []
+            }
+          ],
+          "message": {
+            "arguments": [],
+            "text": "kind is weakly ambiguous. Rename kind."
+          },
+          "rank": -1,
+          "relatedLocations": [],
+          "ruleId": "5.1-A",
+          "ruleIndex": 1,
+          "stacks": [],
+          "taxa": []
+        },
+        {
+          "partialFingerprints": {
+            "mixedmodellint/v1": "811449832854ab7c"
+          },
+          "attachments": [],
+          "codeFlows": [],
+          "fixes": [],
+          "graphTraversals": [],
+          "graphs": [],
+          "kind": "fail",
+          "level": "error",
+          "locations": [],
+          "message": {
+            "arguments": [],
+            "text": "no position at all. Fix it."
+          },
+          "rank": -1,
+          "relatedLocations": [],
+          "ruleId": "mml/parse-error",
+          "ruleIndex": 2,
+          "stacks": [],
+          "taxa": []
+        }
+      ],
+      "runAggregates": [],
+      "taxonomies": [],
+      "threadFlowLocations": [],
+      "tool": {
+        "driver": {
+          "contents": [
+            "localizedData",
+            "nonLocalizedData"
+          ],
+          "informationUri": "https://github.com/StevenACoffman/mixedmodellint",
+          "isComprehensive": false,
+          "language": "en-US",
+          "locations": [],
+          "name": "mixedmodellint",
+          "notifications": [],
+          "rules": [
+            {
+              "defaultConfiguration": {
+                "enabled": true,
+                "level": "error",
+                "rank": -1
+              },
+              "id": "7.1-B",
+              "name": "Grain and key consistency",
+              "relationships": [],
+              "shortDescription": {
+                "text": "§7.1: Grain and key consistency"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "enabled": true,
+                "level": "note",
+                "rank": -1
+              },
+              "id": "5.1-A",
+              "name": "Reserved-word and bare-type lexicon",
+              "relationships": [],
+              "shortDescription": {
+                "text": "§5.1: Reserved-word and bare-type lexicon"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "enabled": true,
+                "level": "error",
+                "rank": -1
+              },
+              "id": "mml/parse-error",
+              "name": "Source could not be read",
+              "relationships": [],
+              "shortDescription": {
+                "text": "mixedmodellint: Source could not be read"
+              }
+            }
+          ],
+          "supportedTaxonomies": [],
+          "taxa": [],
+          "version": "test"
+        },
+        "extensions": []
+      },
+      "translations": [],
+      "versionControlProvenance": [],
+      "webRequests": [],
+      "webResponses": []
+    }
+  ],
+  "properties": {}
+}

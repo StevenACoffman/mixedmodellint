@@ -79,7 +79,7 @@ func (cfg *Config) exec(_ context.Context, args []string) error {
 			Err: fmt.Errorf("check: unexpected argument %q (use --dir)", args[0]),
 		}
 	}
-	format, err := mml.ParseFormat(cfg.Format)
+	format, err := lint.ParseFormat(cfg.Format)
 	if err != nil {
 		return &root.UsageError{Err: fmt.Errorf("check: --format: %s", mml.ErrorMessage(err))}
 	}
@@ -118,13 +118,13 @@ func (cfg *Config) exec(_ context.Context, args []string) error {
 	return nil
 }
 
-func (cfg *Config) render(report mml.Report, format mml.Format) error {
-	tool := mml.Tool{
+func (cfg *Config) render(report mml.Report, format lint.Format) error {
+	tool := lint.Tool{
 		Name: "mixedmodellint", Version: moduleVersion(),
 		URI: "https://github.com/StevenACoffman/mixedmodellint",
 	}
 	write := func(w io.Writer) error {
-		if err := mml.Render(w, report, format, tool); err != nil {
+		if err := lint.Render(w, report, format, tool); err != nil {
 			return fmt.Errorf("render: %w", err)
 		}
 		return nil

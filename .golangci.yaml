@@ -310,7 +310,7 @@ linters:
         #
         # internal/mixedmodellint is the domain: the pure core. It holds the IR,
         # annotation parsing, linking, every rule design, waivers, the baseline
-        # and the renderers. Its only import outside the standard library is
+        # and the text and JSON renderers. Its only import outside the standard library is
         # github.com/jinzhu/inflection, a pure text algorithm with no I/O; every
         # library that does I/O or carries a heavy dependency tree is denied
         # below and lives in an adapter named after it.
@@ -336,6 +336,8 @@ linters:
             desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/sidecar"
             desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
+          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/sarif"
+            desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/lint"
             desc: "internal/lint is the shell above the domain; it imports the domain, never the reverse — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/cmd"
@@ -346,6 +348,8 @@ linters:
             desc: "parse-tree types belong to the postgres adapter; the domain sees only its own query model — summary_rules §1"
           - pkg: "github.com/goccy/go-yaml"
             desc: "reading mml.yaml is the sidecar adapter's job — summary_rules §1"
+          - pkg: "github.com/owenrumney/go-sarif"
+            desc: "SARIF output is the internal/sarif adapter's job — summary_rules §1"
         # The layers are: internal/mixedmodellint (domain) <- internal/postgres,
         # internal/goast, internal/jsonschema and internal/sidecar (adapters, one
         # per external dependency) <- internal/lint (the composition shell) <-
@@ -359,6 +363,7 @@ linters:
           - "**/internal/goast/**"
           - "**/internal/jsonschema/**"
           - "**/internal/sidecar/**"
+          - "**/internal/sarif/**"
           deny:
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/postgres"
             desc: "adapters import internal/mixedmodellint only, never each other; internal/lint composes them — summary_rules §1"
@@ -367,6 +372,8 @@ linters:
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/jsonschema"
             desc: "adapters import internal/mixedmodellint only, never each other; internal/lint composes them — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/sidecar"
+            desc: "adapters import internal/mixedmodellint only, never each other; internal/lint composes them — summary_rules §1"
+          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/sarif"
             desc: "adapters import internal/mixedmodellint only, never each other; internal/lint composes them — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/lint"
             desc: "internal/lint is the shell above the adapters; it imports them, never the reverse — summary_rules §1"
@@ -386,6 +393,8 @@ linters:
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/jsonschema"
             desc: "commands call internal/lint, which composes the adapters — summary_rules §18"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/sidecar"
+            desc: "commands call internal/lint, which composes the adapters — summary_rules §18"
+          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/sarif"
             desc: "commands call internal/lint, which composes the adapters — summary_rules §18"
     # ── forbidigo ────────────────────────────────────────────────────────────
     # spec.md: commands write to cmd.Stdout/cmd.Stderr; only main may call os.Exit.

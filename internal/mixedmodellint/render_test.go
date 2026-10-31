@@ -3,6 +3,7 @@ package mixedmodellint_test
 import (
 	"bytes"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,23 +75,17 @@ func goldenReport() m.Report {
 func TestRender(t *testing.T) {
 	t.Parallel()
 	cases := map[string]struct {
-		format m.Format
-		file   string
+		write func(io.Writer, m.Report) error
+		file  string
 	}{
-		"text":  {m.FormatText, "report.txt"},
-		"json":  {m.FormatJSON, "report.json"},
-		"sarif": {m.FormatSARIF, "report.sarif"},
-	}
-	tool := m.Tool{
-		Name:    "mixedmodellint",
-		Version: "test",
-		URI:     "https://github.com/StevenACoffman/mixedmodellint",
+		"text": {m.WriteText, "report.txt"},
+		"json": {m.WriteJSON, "report.json"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			var buf bytes.Buffer
-			ok(t, m.Render(&buf, goldenReport(), tc.format, tool))
+			ok(t, tc.write(&buf, goldenReport()))
 			golden := filepath.Join("testdata", "render", tc.file)
 			if *update {
 				ok(t, os.MkdirAll(filepath.Dir(golden), 0o750))
@@ -100,30 +95,6 @@ func TestRender(t *testing.T) {
 			ok(t, err)
 			if !bytes.Equal(buf.Bytes(), want) {
 				t.Errorf("output mismatch for %s\ngot:\n%s\nwant:\n%s", golden, buf.Bytes(), want)
-			}
-		})
-	}
-}
-
-func TestParseFormat(t *testing.T) {
-	t.Parallel()
-	cases := map[string]struct {
-		in      string
-		want    m.Format
-		wantErr bool
-	}{
-		"text":    {"text", m.FormatText, false},
-		"upper":   {"SARIF", m.FormatSARIF, false},
-		"unknown": {"xml", 0, true},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			got, err := m.ParseFormat(tc.in)
-			equals(t, tc.want, got)
-			equals(t, tc.wantErr, err != nil)
-			if err != nil {
-				equals(t, m.EINVALID, m.ErrorCode(err))
 			}
 		})
 	}
