@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OrderPlaced",
+  "description": "The event published when an order is placed.",
+  "type": "object",
+  "x-mml-grain": "one row per order placed",
+  "x-mml-key": ["event_id"],
+  "required": ["event_id", "order_id", "placed_at"],
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid" },
+    "order_id": { "type": "integer" },
+    "placed_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,4 @@
+entities:
+  orders:
+    owner: team-orders
+    definition: A customer's request to buy one or more products.
