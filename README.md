@@ -32,12 +32,18 @@ mixedmodellint check [--dir DIR] [--format text|json|sarif] [--output FILE]
 
 ### What is read
 
-| Source      | Files                                     | Entities                                                                                                                                                                                  |
-| ----------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SQL         | `*.sql`, replayed in path order           | `CREATE TABLE` and `CREATE VIEW` after every `ALTER` and `DROP`. Other statements form the query corpus.                                                                                  |
-| Go          | `*.go` except tests                       | Structs with a storage tag (`db`, `gorm`, `bun`, `sql`, `bson`, `parquet`, `avro`), an `mml` tag, or an `//mml:` directive. A struct with only `json` tags is a payload, not stored data. |
-| JSON Schema | `*.schema.json`, or JSON with `"$schema"` | The root object and each object in `$defs` or `definitions`                                                                                                                               |
-| Sidecar     | `mml.yaml` at the root                    | Annotations for any entity                                                                                                                                                                |
+| Source      | Files                                                     | Entities                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SQL         | `*.sql`, replayed in path order                           | `CREATE TABLE` and `CREATE VIEW` after every `ALTER` and `DROP`. Other statements form the query corpus.                                                                                                                                                                                                                                                                                                  |
+| Go          | Each Go module (a `go.mod`), loaded with type information | Structs with a storage tag (`db`, `gorm`, `bun`, `sql`, `bson`, `parquet`, `avro`), an `mml` tag, or an `//mml:` directive, including fields embedded from other packages. A struct with only `json` tags is a payload, not stored data. SQL passed to `database/sql`, pgx, sqlx or gorm, and to any interface method named like a `database/sql` method (such as sqlc's `DBTX`), joins the query corpus. |
+| JSON Schema | `*.schema.json`, or JSON with `"$schema"`                 | The root object and each object in `$defs` or `definitions`                                                                                                                                                                                                                                                                                                                                               |
+| Sidecar     | `mml.yaml` at the root                                    | Annotations for any entity                                                                                                                                                                                                                                                                                                                                                                                |
+
+SQL in Go is found by building SSA for the module, so a query assembled from
+constants (`"SELECT ... FROM " + table`) or chosen in an `if` is read in each
+of its forms. SQL built at run time, such as with `fmt.Sprintf`, is not.
+Findings in that SQL point at the Go call. Loading Go needs the `go` command
+and the module's dependencies.
 
 The walk skips hidden directories and directories whose names start with
 `_`. It also skips `vendor`, `node_modules`, `testdata`, `bin`, `dist` and
@@ -97,9 +103,20 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 9.2-A   | Naive timestamps, and dates or times stored as strings or undeclared integers                      |
 | `mml/*` | Parse errors, unknown annotation keys, inline/sidecar conflicts, waivers without a reason          |
 
-The SQL parser is PostgreSQL's own grammar, through
-[go-pgquery](https://github.com/wasilibs/go-pgquery), which runs libpg_query
-as WebAssembly. The binary therefore builds with `CGO_ENABLED=0`.
+The heavy lifting is done by libraries focused on each job:
+
+- SQL: PostgreSQL's own grammar, through
+  [go-pgquery](https://github.com/wasilibs/go-pgquery), which runs
+  libpg_query as WebAssembly, so the binary builds with `CGO_ENABLED=0`.
+- Go: [go/packages](https://pkg.go.dev/golang.org/x/tools/go/packages),
+  `go/types` and [go/ssa](https://pkg.go.dev/golang.org/x/tools/go/ssa).
+- JSON Schema: [go-jsonschema](https://github.com/atombender/go-jsonschema)'s
+  schema model. Positions and `x-mml-*` keywords, which it does not keep, come
+  from a small reader in `internal/jsonschema`.
+- SARIF: [go-sarif](https://github.com/owenrumney/go-sarif), whose schema
+  validator also checks the output in the tests.
+- Plurals for linking names across sources:
+  [inflection](https://github.com/jinzhu/inflection).
 
 ### Deviations from rule_plan.md
 
@@ -121,7 +138,8 @@ as WebAssembly. The binary therefore builds with `CGO_ENABLED=0`.
 - The H-family designs and `--base` diff mode.
 - The M3 lock file, and M4 result ingestion (`--results`).
 - The artifact corpus: CODEOWNERS, glossary, dbt and semantic layer files.
-- The Go code corpus (`go/ssa`).
+- The rest of the Go code corpus: write paths and time handling from SSA
+  (§7.4-D, §9.x), and squirrel query builders.
 - The `explain`, `scaffold`, `annotate`, `lock` and `catalog pull` commands.
 
 ## Development
@@ -137,7 +155,9 @@ The layering is enforced by depguard in `.golangci.yaml`:
 
 - `internal/mixedmodellint` is the pure core. It never touches the filesystem,
   the clock or a parser.
-- The adapters (`internal/postgres`, `internal/goast`, `internal/jsonschema`
-  and `internal/sidecar`) turn bytes into core values.
+- The adapters, each named after the library it wraps (`internal/postgres`,
+  `internal/gopackages`, `internal/jsonschema`, `internal/sidecar` and
+  `internal/sarif`), turn sources into core values or core values into
+  output.
 - `internal/lint` composes the adapters.
 - `cmd/check` dispatches to `internal/lint`.
