@@ -1,0 +1,92 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+# Cancel superseded runs on the same ref; only the newest commit matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  GOFLAGS: "-trimpath"
+  GOLANGCI_LINT_VERSION: "latest"
+permissions:
+  contents: read
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      with:
+        cache: true
+    - run: golangci-lint run --timeout=5m ./...
+  tidy:
+    name: go mod tidy is committed
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      with:
+        cache: true
+    - run: go mod tidy
+    - name: Fail if go.mod or go.sum changed
+      run: |
+        if ! git diff --exit-code go.mod go.sum; then
+          echo "::error::go.mod/go.sum are not tidy. Run 'go mod tidy' and commit the result."
+          exit 1
+        fi
+  test:
+    name: Unit tests (race)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      with:
+        cache: true
+    - name: Run the suite with the race detector
+      run: go test -race -count=1 ./...
+    - name: Coverage report
+      run: |
+        go test -race -coverprofile=coverage.out -covermode=atomic ./...
+        go tool cover -func=coverage.out | tail -1
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      if: always()
+      with:
+        name: coverage
+        path: coverage.out
+        retention-days: 7
+  example:
+    name: Dogfood the linter on _example
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      with:
+        cache: true
+    # _example follows every implemented rule, so a finding there is a false
+    # positive. The directory starts with an underscore, so neither `./...` nor
+    # a lint of the repository root reaches it; without this job it would rot.
+    - run: just example
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      with:
+        cache: true
+    - run: govulncheck ./...
