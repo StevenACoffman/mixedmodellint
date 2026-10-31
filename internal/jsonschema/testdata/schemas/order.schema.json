@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Order",
+  "type": "object",
+  "x-mml-grain": "one row per order",
+  "x-mml-key": ["order_id"],
+  "required": ["order_id", "placed_at"],
+  "properties": {
+    "order_id": { "type": "integer" },
+    "placed_at": { "type": "string", "format": "date-time" },
+    "shipped_on": { "type": "string" },
+    "coupon": { "type": ["string", "null"], "x-mml-null": "not_applicable" },
+    "lines": { "type": "array", "items": { "$ref": "#/$defs/Line" } }
+  },
+  "$defs": {
+    "Line": {
+      "type": "object",
+      "properties": {
+        "sku": { "type": "string" },
+        "qty": { "type": "integer" }
+      }
+    },
+    "Money": { "type": "string" }
+  }
+}
