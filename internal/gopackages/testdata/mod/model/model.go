@@ -1,7 +1,11 @@
 // Package model holds persisted structs.
 package model
 
-import "example.com/mod/audit"
+import (
+	"time"
+
+	"example.com/mod/audit"
+)
 
 // Status is a named string type.
 type Status string
@@ -10,10 +14,12 @@ type Status string
 //
 //mml:grain one row per order
 type Order struct {
-	ID         int64       `db:"id"`
-	CustomerID int64       `db:"customer_id"`
-	Status     Status      `db:"status"`
-	Lines      []OrderLine `db:"-"`
+	ID          int64       `db:"id"`
+	CustomerID  int64       `db:"customer_id"`
+	Status      Status      `db:"status"`
+	Lines       []OrderLine `db:"-"`
+	ShippingFee int64       `db:"shipping_fee"`
+	PlacedAt    time.Time   `db:"placed_at"`
 	audit.Stamps
 }
 

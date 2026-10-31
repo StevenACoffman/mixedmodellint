@@ -66,38 +66,34 @@ func knownSinks() []sink {
 	}
 }
 
-// snippets returns the SQL passed to SQL APIs by the functions of pkgs, one
-// snippet per string the argument can fold to.
-func snippets(
-	prog *ssa.Program,
-	pkgs []*ssa.Package,
-	rel func(token.Position) mml.Position,
-) []Snippet {
-	own := map[*ssa.Package]bool{}
-	for _, p := range pkgs {
-		if p != nil {
-			own[p] = true
-		}
-	}
+// snippets returns the SQL passed to SQL APIs by fns, one snippet per string
+// the argument can fold to, each with the origins of its bind arguments.
+func snippets(fns []*ssa.Function, tr *tracer, rel func(token.Position) mml.Position) []Snippet {
 	sinks := knownSinks()
 	var out []Snippet
-	for _, fn := range sortedFunctions(prog, own) {
+	for _, fn := range fns {
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
 				call, ok := instr.(ssa.CallInstruction)
 				if !ok {
 					continue
 				}
-				out = append(out, callSnippets(prog, call.Common(), sinks, rel)...)
+				out = append(out, callSnippets(tr, call.Common(), sinks, rel)...)
 			}
 		}
 	}
 	return out
 }
 
-// sortedFunctions returns the built functions of the packages in own, ordered
-// by position, so the corpus is the same from run to run.
-func sortedFunctions(prog *ssa.Program, own map[*ssa.Package]bool) []*ssa.Function {
+// ownFunctions returns the built functions of pkgs, the module's own
+// packages, ordered by position, so the corpus is the same from run to run.
+func ownFunctions(prog *ssa.Program, pkgs []*ssa.Package) []*ssa.Function {
+	own := map[*ssa.Package]bool{}
+	for _, p := range pkgs {
+		if p != nil {
+			own[p] = true
+		}
+	}
 	var fns []*ssa.Function
 	for fn := range ssautil.AllFunctions(prog) {
 		if fn.Pkg != nil && own[fn.Pkg] && len(fn.Blocks) > 0 {
@@ -110,7 +106,7 @@ func sortedFunctions(prog *ssa.Program, own map[*ssa.Package]bool) []*ssa.Functi
 
 // callSnippets returns the SQL a call passes, when it calls a sink.
 func callSnippets(
-	prog *ssa.Program, c *ssa.CallCommon, sinks []sink, rel func(token.Position) mml.Position,
+	tr *tracer, c *ssa.CallCommon, sinks []sink, rel func(token.Position) mml.Position,
 ) []Snippet {
 	method, args := callee(c)
 	if method == nil {
@@ -120,14 +116,16 @@ func callSnippets(
 	if !ok {
 		return nil
 	}
-	i := sqlParam(method.Type().(*types.Signature))
+	sig := method.Type().(*types.Signature)
+	i := sqlParam(sig)
 	if i < 0 || i >= len(args) {
 		return nil
 	}
-	pos := rel(prog.Fset.Position(c.Pos()))
+	pos := rel(tr.fset.Position(c.Pos()))
+	bound := tr.args(sig, i, args)
 	var out []Snippet
 	for _, s := range foldString(args[i], map[ssa.Value]bool{}) {
-		out = append(out, Snippet{SQL: s, Pos: pos, Strict: strict})
+		out = append(out, Snippet{SQL: s, Pos: pos, Strict: strict, Args: bound})
 	}
 	return out
 }

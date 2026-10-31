@@ -34,15 +34,18 @@ type goField struct {
 // persisted when a field has a storage tag or an mml tag, or its doc comment
 // has an //mml: directive. A struct that is only ever embedded (an audit
 // mixin) is part of the structs that embed it, not an entity of its own,
-// unless a directive says otherwise.
-func entities(pkgs []*packages.Package, rel func(token.Position) mml.Position) []mml.Entity {
+// unless a directive says otherwise. persisted holds the type of each entity,
+// so code reading one of their fields can be recognized.
+func entities(
+	pkgs []*packages.Package, rel func(token.Position) mml.Position,
+) (out []mml.Entity, persisted map[*types.TypeName]bool) {
 	decls := structDecls(pkgs)
 	byObj := make(map[*types.TypeName]*structDecl, len(decls))
 	for i := range decls {
 		byObj[decls[i].obj] = &decls[i]
 	}
 	mixins := embeddedTypes(decls)
-	var out []mml.Entity
+	persisted = map[*types.TypeName]bool{}
 	for i := range decls {
 		d := &decls[i]
 		anns := directives(d.doc, d.pkg.Fset, rel)
@@ -51,9 +54,10 @@ func entities(pkgs []*packages.Package, rel func(token.Position) mml.Position) [
 		}
 		if e, ok := toEntity(d, anns, byObj, rel); ok {
 			out = append(out, e)
+			persisted[d.obj] = true
 		}
 	}
-	return out
+	return out, persisted
 }
 
 // structDecls finds every named struct type declared at package level, in

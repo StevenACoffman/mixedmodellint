@@ -18,6 +18,7 @@ package gopackages
 import (
 	"context"
 	"go/token"
+	"go/types"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -41,10 +42,15 @@ const loadMode = packages.LoadSyntax | packages.NeedModule
 // API (database/sql, pgx, sqlx, gorm), so SQL that does not parse is a problem
 // worth reporting; it is false for a method that is only named like one (an
 // sqlc DBTX interface), whose argument may not be SQL at all.
+//
+// Args holds, for each bind parameter $n at index n-1, the origins of the Go
+// value passed for it: a field copied from a persisted struct, a time
+// truncated before the write (rule_plan.md §7.4-D, §9.8-B).
 type Snippet struct {
 	SQL    string
 	Pos    mml.Position
 	Strict bool
+	Args   [][]mml.Origin
 }
 
 // Result is what Load found in one module.
@@ -76,11 +82,13 @@ func Load(ctx context.Context, root, dir string) (Result, error) {
 	if len(pkgs) == 0 {
 		return res, nil
 	}
-	res.Source.Entities = entities(pkgs, rel)
+	var persisted map[*types.TypeName]bool
+	res.Source.Entities, persisted = entities(pkgs, rel)
 
 	prog, ssaPkgs := ssautil.Packages(pkgs, ssa.BuilderMode(0))
 	prog.Build()
-	res.Snippets = snippets(prog, ssaPkgs, rel)
+	fns := ownFunctions(prog, ssaPkgs)
+	res.Snippets = snippets(fns, newTracer(prog, fns, persisted, rel), rel)
 	return res, nil
 }
 
