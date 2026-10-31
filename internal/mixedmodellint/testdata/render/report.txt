@@ -1,0 +1,15 @@
+<input>: error: [mml/parse-error] no position at all
+    suggestion: Fix the syntax error, or exclude the file from the run. Entities in this statement were not checked.
+db/bad.sql:3: error: [mml/parse-error] syntax error at or near "TABL"
+    suggestion: Fix the syntax error, or exclude the file from the run. Entities in this statement were not checked.
+db/empty.sql: error: [mml/parse-error] file could not be read
+    suggestion: Fix the syntax error, or exclude the file from the run. Entities in this statement were not checked.
+db/schema.sql:10: error: [7.1-B] grain "one row per order" implies key (order_id), but order_lines has primary key (order_id, line_no)
+    suggestion: Correct the grain statement to match the key (the key implies "one row per order line"); or, if "one row per order" is what a row means, add UNIQUE (order_id).
+db/schema.sql:15:3: error: [5.1-A] column order_lines.date is a bare type word that does not say which event or value it holds
+    suggestion: Rename date to say what it records, for example created_at, or <event>_at such as shipped_at.
+db/schema.sql:16:3: note: [5.1-A] column order_lines.kind is weakly ambiguous
+    suggestion: Rename kind to say what it records, for example order_line_kind.
+db/schema.sql:17:3: warning: [5.1-A] column order_lines.amount is a generic name that does not say what is recorded
+    suggestion: Rename amount to say what it records, for example order_line_amount.
+5 error(s), 1 warning(s), 1 note(s) in 2 entities and 0 queries (1 waived, 2 in baseline)

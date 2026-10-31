@@ -1,0 +1,94 @@
+{
+  "findings": [
+    {
+      "rule": "mml",
+      "design": "mml/parse-error",
+      "severity": "error",
+      "measured": "no position at all",
+      "suggestion": "Fix the syntax error, or exclude the file from the run. Entities in this statement were not checked.",
+      "fingerprint": "811449832854ab7c"
+    },
+    {
+      "rule": "mml",
+      "design": "mml/parse-error",
+      "severity": "error",
+      "file": "db/bad.sql",
+      "line": 3,
+      "measured": "syntax error at or near \"TABL\"",
+      "suggestion": "Fix the syntax error, or exclude the file from the run. Entities in this statement were not checked.",
+      "fingerprint": "e1802a9a94c36fc1"
+    },
+    {
+      "rule": "mml",
+      "design": "mml/parse-error",
+      "severity": "error",
+      "file": "db/empty.sql",
+      "measured": "file could not be read",
+      "suggestion": "Fix the syntax error, or exclude the file from the run. Entities in this statement were not checked.",
+      "fingerprint": "027f030c88a3798a"
+    },
+    {
+      "rule": "7.1",
+      "design": "7.1-B",
+      "severity": "error",
+      "entity": "order_lines",
+      "entity_id": "sql:order_lines",
+      "file": "db/schema.sql",
+      "line": 10,
+      "measured": "grain \"one row per order\" implies key (order_id), but order_lines has primary key (order_id, line_no)",
+      "suggestion": "Correct the grain statement to match the key (the key implies \"one row per order line\"); or, if \"one row per order\" is what a row means, add UNIQUE (order_id).",
+      "fingerprint": "065e51f97be64299"
+    },
+    {
+      "rule": "5.1",
+      "design": "5.1-A",
+      "severity": "error",
+      "entity": "order_lines",
+      "entity_id": "sql:order_lines",
+      "field": "date",
+      "file": "db/schema.sql",
+      "line": 15,
+      "column": 3,
+      "measured": "column order_lines.date is a bare type word that does not say which event or value it holds",
+      "suggestion": "Rename date to say what it records, for example created_at, or <event>_at such as shipped_at.",
+      "fingerprint": "8e436c3f73f65ab1"
+    },
+    {
+      "rule": "5.1",
+      "design": "5.1-A",
+      "severity": "note",
+      "entity": "order_lines",
+      "entity_id": "sql:order_lines",
+      "field": "kind",
+      "file": "db/schema.sql",
+      "line": 16,
+      "column": 3,
+      "measured": "column order_lines.kind is weakly ambiguous",
+      "suggestion": "Rename kind to say what it records, for example order_line_kind.",
+      "fingerprint": "0f009a754b7d153d"
+    },
+    {
+      "rule": "5.1",
+      "design": "5.1-A",
+      "severity": "warning",
+      "entity": "order_lines",
+      "entity_id": "sql:order_lines",
+      "field": "amount",
+      "file": "db/schema.sql",
+      "line": 17,
+      "column": 3,
+      "measured": "column order_lines.amount is a generic name that does not say what is recorded",
+      "suggestion": "Rename amount to say what it records, for example order_line_amount.",
+      "fingerprint": "2f3a4ccdde745298"
+    }
+  ],
+  "summary": {
+    "errors": 5,
+    "warnings": 1,
+    "notes": 1,
+    "entities": 2,
+    "queries": 0,
+    "waived": 1,
+    "baselined": 2
+  }
+}
