@@ -134,6 +134,8 @@ func addConstraint(e *mml.Entity, con *pg.Constraint, column string) {
 	case pg.ConstrType_CONSTR_CHECK:
 		if ch, ok := inListCheck(con.GetRawExpr()); ok {
 			e.Checks = append(e.Checks, ch)
+		} else if ch, ok := comparisonCheck(con.GetRawExpr()); ok {
+			e.Checks = append(e.Checks, ch)
 		}
 	default:
 	}
@@ -156,6 +158,38 @@ func containsFold(list []string, s string) bool {
 
 // inListCheck recognizes CHECK (col IN ('a', 'b')), the form §7.4-B and §5.1
 // read as an enumeration.
+// comparisonCheck reads a CHECK that compares one column with a constant,
+// such as qty > 0, or bounds it with BETWEEN, into a Check whose Expr is the
+// comparison (a BETWEEN as its two comparisons). Anything else is not kept.
+func comparisonCheck(n *pg.Node) (mml.Check, bool) {
+	ae := n.GetAExpr()
+	if ae == nil {
+		return mml.Check{}, false
+	}
+	col := columnName(ae.GetLexpr())
+	if col == "" {
+		return mml.Check{}, false
+	}
+	switch ae.GetKind() {
+	case pg.A_Expr_Kind_AEXPR_OP:
+		switch op := opName(ae); op {
+		case "<", "<=", ">", ">=", "<>", "!=":
+			return mml.Check{
+				Field: col,
+				Expr:  col + " " + op + " " + deparseExpr(ae.GetRexpr()),
+			}, true
+		}
+	case pg.A_Expr_Kind_AEXPR_BETWEEN:
+		bounds := ae.GetRexpr().GetList().GetItems()
+		if len(bounds) == 2 {
+			return mml.Check{Field: col, Expr: col + " >= " + deparseExpr(bounds[0]) + " AND " +
+				col + " <= " + deparseExpr(bounds[1])}, true
+		}
+	default:
+	}
+	return mml.Check{}, false
+}
+
 func inListCheck(n *pg.Node) (mml.Check, bool) {
 	ae := n.GetAExpr()
 	if ae == nil || ae.GetKind() != pg.A_Expr_Kind_AEXPR_IN {

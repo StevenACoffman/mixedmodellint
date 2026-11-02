@@ -4,7 +4,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	pg "github.com/pganalyze/pg_query_go/v6"
+	pgquery "github.com/wasilibs/go-pgquery"
 
 	mml "github.com/StevenACoffman/mixedmodellint/internal/mixedmodellint"
 	"github.com/StevenACoffman/mixedmodellint/internal/postgres"
@@ -225,4 +229,111 @@ func TestSQLCQueriesMerge(t *testing.T) {
 			equals(t, tc.exp, tc.act)
 		})
 	}
+}
+
+func TestRenamesAndRemovals(t *testing.T) {
+	t.Parallel()
+	src := postgres.Load([]postgres.File{{Path: "001.sql", Src: []byte(`
+CREATE TABLE customers (
+    customer_id BIGINT PRIMARY KEY,
+    region TEXT CHECK (region IN ('eu', 'us'))
+);
+CREATE TABLE orders (order_id BIGINT PRIMARY KEY, customer_id BIGINT REFERENCES customers);
+ALTER TABLE customers RENAME COLUMN customer_id TO cust_key;
+ALTER TABLE customers RENAME COLUMN region TO region_code;
+ALTER TABLE orders RENAME COLUMN customer_id TO cust_key;
+ALTER TABLE customers RENAME TO clients;
+ALTER TABLE missing RENAME COLUMN a TO b;
+CREATE TABLE clicks (id BIGINT, clicked_at TIMESTAMPTZ);
+TRUNCATE clicks;
+DELETE FROM clicks c WHERE c.clicked_at < now() - interval '90 days';
+DROP TABLE clicks;
+`)}}, nil)
+	var names []string
+	for i := range src.Entities {
+		names = append(names, src.Entities[i].ID)
+	}
+	clients := entity(t, src, "clients")
+	orders := entity(t, src, "orders")
+	var kinds []mml.QueryKind
+	for i := range src.Queries {
+		kinds = append(kinds, src.Queries[i].Kind)
+	}
+	cases := map[string]struct{ exp, act any }{
+		"table renamed, dropped table gone": {[]string{"sql:orders", "sql:clients"}, names},
+		"renamed key follows":               {[]string{"cust_key"}, clients.PrimaryKey},
+		"renamed column":                    {"region_code", clients.Fields[1].Name},
+		"check follows the column":          {"region_code", clients.Checks[0].Field},
+		"reference column follows":          {[]string{"cust_key"}, orders.Refs[0].Fields},
+		"removals are queries": {
+			[]mml.QueryKind{mml.QueryTruncate, mml.QueryDelete, mml.QueryDrop}, kinds,
+		},
+		"truncate target": {"clicks", src.Queries[0].Target},
+		"delete filters": {
+			[]mml.ColumnRef{{Relation: "c", Column: "clicked_at"}},
+			src.Queries[1].Filters,
+		},
+		"drop target":       {"clicks", src.Queries[2].Target},
+		"no parse problems": {0, len(src.Problems)},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			equals(t, tc.exp, tc.act)
+		})
+	}
+}
+
+// TestKeywordListMatchesTheParser checks the generated keyword list that
+// §5.1-A reads against the parser itself: each listed word must scan as a
+// keyword that cannot be a column name unquoted, and words the rule says are
+// allowed must not.
+func TestKeywordListMatchesTheParser(t *testing.T) {
+	t.Parallel()
+	src, err := os.ReadFile(
+		filepath.Join("..", "mixedmodellint", "lexicon", "postgres_keywords.txt"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind := func(word string) pg.KeywordKind {
+		res, err := pgquery.Scan(word)
+		if err != nil || len(res.GetTokens()) != 1 {
+			t.Fatalf("scan %q: %v", word, err)
+		}
+		return res.GetTokens()[0].GetKeywordKind()
+	}
+	for _, w := range strings.Fields(string(src)) {
+		if k := kind(
+			w,
+		); k != pg.KeywordKind_RESERVED_KEYWORD &&
+			k != pg.KeywordKind_TYPE_FUNC_NAME_KEYWORD {
+			t.Errorf("%s is listed as reserved but scans as %s", w, k)
+		}
+	}
+	for _, w := range []string{"date", "timestamp", "type", "status", "name", "value"} {
+		if k := kind(
+			w,
+		); k == pg.KeywordKind_RESERVED_KEYWORD ||
+			k == pg.KeywordKind_TYPE_FUNC_NAME_KEYWORD {
+			t.Errorf("%s scans as %s, but the rule allows it as a column name", w, k)
+		}
+	}
+}
+
+func TestComparisonChecks(t *testing.T) {
+	t.Parallel()
+	src := postgres.Load([]postgres.File{{Path: "001.sql", Src: []byte(`
+CREATE TABLE items (
+    pack_qty   INTEGER CHECK (pack_qty > 0),
+    net_weight NUMERIC CHECK (net_weight BETWEEN 0 AND 100),
+    grade      TEXT CHECK (grade IN ('a', 'b')),
+    note       TEXT CHECK (length(note) < 200)
+);
+`)}}, nil)
+	equals(t, []mml.Check{
+		{Field: "pack_qty", Expr: "pack_qty > 0"},
+		{Field: "net_weight", Expr: "net_weight >= 0 AND net_weight <= 100"},
+		{Field: "grade", Enum: []string{"a", "b"}},
+	}, entity(t, src, "items").Checks)
 }

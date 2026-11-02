@@ -204,7 +204,9 @@ func (l *loader) loadStmt(ctx *stmtCtx, n *pg.Node) {
 	case n.GetCommentStmt() != nil:
 		l.comment(ctx, n.GetCommentStmt())
 	case n.GetDropStmt() != nil:
-		l.drop(n.GetDropStmt())
+		l.drop(ctx, n.GetDropStmt())
+	case n.GetRenameStmt() != nil:
+		l.rename(n.GetRenameStmt())
 	case n.GetViewStmt() != nil:
 		l.createView(ctx, n.GetViewStmt())
 	default:
@@ -325,14 +327,72 @@ func (l *loader) comment(ctx *stmtCtx, cs *pg.CommentStmt) {
 	}
 }
 
-func (l *loader) drop(ds *pg.DropStmt) {
+func (l *loader) drop(ctx *stmtCtx, ds *pg.DropStmt) {
 	if ds.GetRemoveType() != pg.ObjectType_OBJECT_TABLE &&
 		ds.GetRemoveType() != pg.ObjectType_OBJECT_VIEW {
 		return
 	}
 	for _, obj := range ds.GetObjects() {
-		if e, ok := l.find(stringList(obj)); ok {
+		names := stringList(obj)
+		if ds.GetRemoveType() == pg.ObjectType_OBJECT_TABLE {
+			l.out.Queries = append(l.out.Queries, mml.Query{
+				Pos: ctx.pos(ctx.start), Kind: mml.QueryDrop, Target: strings.Join(names, "."),
+			})
+		}
+		if e, ok := l.find(names); ok {
 			delete(l.tables, strings.TrimPrefix(e.ID, "sql:"))
+		}
+	}
+}
+
+// rename applies ALTER TABLE ... RENAME COLUMN and ALTER TABLE ... RENAME TO,
+// so the replayed model has the names the database ends up with. Keys,
+// references and checks naming a renamed column follow it.
+func (l *loader) rename(rs *pg.RenameStmt) {
+	e, ok := l.find(strings.Split(tableKey(rs.GetRelation()), "."))
+	if !ok {
+		return
+	}
+	switch rs.GetRenameType() {
+	case pg.ObjectType_OBJECT_COLUMN:
+		renameColumn(e, rs.GetSubname(), rs.GetNewname())
+	case pg.ObjectType_OBJECT_TABLE:
+		oldKey := strings.TrimPrefix(e.ID, "sql:")
+		newKey := rs.GetNewname()
+		if rs.GetRelation().GetSchemaname() != "" {
+			newKey = rs.GetRelation().GetSchemaname() + "." + newKey
+		}
+		delete(l.tables, oldKey)
+		e.ID, e.Name = "sql:"+newKey, rs.GetNewname()
+		l.tables[newKey] = e
+		l.order = append(l.order, newKey)
+	default:
+	}
+}
+
+func renameColumn(e *mml.Entity, from, to string) {
+	f, ok := e.Field(from)
+	if !ok {
+		return
+	}
+	f.Name = to
+	rename := func(cols []string) {
+		for i, c := range cols {
+			if strings.EqualFold(c, from) {
+				cols[i] = to
+			}
+		}
+	}
+	rename(e.PrimaryKey)
+	for _, u := range e.Uniques {
+		rename(u)
+	}
+	for i := range e.Refs {
+		rename(e.Refs[i].Fields)
+	}
+	for i := range e.Checks {
+		if strings.EqualFold(e.Checks[i].Field, from) {
+			e.Checks[i].Field = to
 		}
 	}
 }

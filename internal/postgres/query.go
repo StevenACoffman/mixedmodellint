@@ -31,6 +31,12 @@ func buildQueries(ctx *stmtCtx, n *pg.Node) []mml.Query {
 			}
 		}
 	})
+	b.statement(n)
+	return b.out
+}
+
+// statement adds the queries of one statement by its kind.
+func (b *queryBuilder) statement(n *pg.Node) {
 	switch {
 	case n.GetSelectStmt() != nil:
 		b.selectStmt(n.GetSelectStmt(), mml.QuerySelect, "")
@@ -41,12 +47,18 @@ func buildQueries(ctx *stmtCtx, n *pg.Node) []mml.Query {
 	case n.GetMergeStmt() != nil:
 		b.merge(n.GetMergeStmt())
 	case n.GetDeleteStmt() != nil:
-		b.out = append(b.out, mml.Query{
-			Pos: ctx.pos(ctx.start), Kind: mml.QueryDelete,
-			Target: tableKey(n.GetDeleteStmt().GetRelation()),
-		})
+		b.delete(n.GetDeleteStmt())
+	case n.GetTruncateStmt() != nil:
+		for _, r := range n.GetTruncateStmt().GetRelations() {
+			b.out = append(b.out, mml.Query{
+				Pos: b.ctx.pos(
+					b.ctx.start,
+				),
+				Kind:   mml.QueryTruncate,
+				Target: tableKey(r.GetRangeVar()),
+			})
+		}
 	}
-	return b.out
 }
 
 // selectStmt adds the queries of one SELECT. kind and target are set when the
@@ -371,6 +383,27 @@ func (b *queryBuilder) update(us *pg.UpdateStmt) {
 		Pos: pos, Kind: mml.QueryUpdate, Target: tableKey(target),
 		Assignments: a.setAssignments(us.GetTargetList()),
 	})
+}
+
+// delete adds a DELETE with the columns its WHERE clause tests, so a
+// retention delete (WHERE event_time < ...) can be told from a delete by key.
+func (b *queryBuilder) delete(ds *pg.DeleteStmt) {
+	b.with(ds.GetWithClause())
+	target := ds.GetRelation()
+	alias := target.GetAlias().GetAliasname()
+	if alias == "" {
+		alias = target.GetRelname()
+	}
+	q := mml.Query{
+		Pos: b.ctx.pos(b.ctx.start), Kind: mml.QueryDelete, Target: tableKey(target),
+		Relations: []mml.Relation{{Name: tableKey(target), Alias: alias}},
+	}
+	walk(ds.GetWhereClause(), func(x *pg.Node) {
+		if cr := x.GetColumnRef(); cr != nil {
+			q.Filters = append(q.Filters, columnRef(cr, alias))
+		}
+	})
+	b.out = append(b.out, q)
 }
 
 func (b *queryBuilder) merge(ms *pg.MergeStmt) {
