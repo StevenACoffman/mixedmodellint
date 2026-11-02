@@ -5,6 +5,7 @@
 package lint
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,8 +14,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
+	"github.com/StevenACoffman/mixedmodellint/internal/git"
 	"github.com/StevenACoffman/mixedmodellint/internal/gopackages"
 	"github.com/StevenACoffman/mixedmodellint/internal/jsonschema"
 	mml "github.com/StevenACoffman/mixedmodellint/internal/mixedmodellint"
@@ -26,10 +29,18 @@ import (
 // directory being linted.
 const SidecarName = "mml.yaml"
 
+// LockName is the schema lock's file name (rule_plan.md §6, M3), read from
+// and written to the root of the directory being linted.
+const LockName = "mml.lock.json"
+
 // Options configures a run. The zero value lints with no baseline.
 type Options struct {
 	// Baseline, when set, is read as a baseline file (see mml.WriteBaseline).
 	Baseline io.Reader
+	// Base, when set, is a git ref (see git.CheckRef) naming the change's
+	// base revision; the directory's tree at that ref is read as the
+	// previous model.
+	Base string
 }
 
 // inputs is every file the walk collected, by adapter, and the Go modules
@@ -38,6 +49,11 @@ type inputs struct {
 	sql     []postgres.File
 	schemas []jsonschema.File
 	sidecar []byte
+	lock    []byte
+	// artifacts are the decision records and logical-model records read so
+	// far, and problems what went wrong reading the latter.
+	artifacts mml.Artifacts
+	problems  []mml.Problem
 	// modules are the directories, relative to the root, that hold a go.mod.
 	modules []string
 	// hasGo is true when any Go source was seen, so a tree of Go files with no
@@ -53,27 +69,9 @@ type inputs struct {
 // that does not parse is a finding in the report.
 func Run(ctx context.Context, dir string, opts Options) (mml.Report, error) {
 	const op = "lint.Run"
-	root, err := filepath.Abs(dir)
+	input, err := load(ctx, dir)
 	if err != nil {
 		return mml.Report{}, &mml.Error{Op: op, Err: err}
-	}
-	in, err := collect(os.DirFS(root))
-	if err != nil {
-		return mml.Report{}, &mml.Error{Op: op, Err: err}
-	}
-	goSrc, snippets, err := loadGo(ctx, root, in.goModules())
-	if err != nil {
-		return mml.Report{}, &mml.Error{Op: op, Err: err}
-	}
-	input := mml.Input{Sources: []mml.Source{
-		postgres.Load(in.sql, snippets),
-		goSrc,
-		jsonschema.Load(in.schemas),
-	}}
-	if in.sidecar != nil {
-		sc, problems := sidecar.Parse(SidecarName, in.sidecar)
-		input.Sidecar = sc
-		input.Sources = append(input.Sources, mml.Source{Problems: problems})
 	}
 	if opts.Baseline != nil {
 		input.Baseline, err = mml.ReadBaseline(opts.Baseline)
@@ -81,7 +79,94 @@ func Run(ctx context.Context, dir string, opts Options) (mml.Report, error) {
 			return mml.Report{}, &mml.Error{Op: op, Err: err}
 		}
 	}
+	if opts.Base != "" {
+		base, err := loadRef(ctx, dir, opts.Base)
+		if err != nil {
+			return mml.Report{}, &mml.Error{Op: op, Err: fmt.Errorf("base: %w", err)}
+		}
+		input.Base = &base
+	}
 	return mml.Analyze(&input), nil
+}
+
+// Lock loads every source under dir and returns the schema lock that
+// records it, for the lock command to write as LockName.
+func Lock(ctx context.Context, dir string) (mml.Lock, error) {
+	input, err := load(ctx, dir)
+	if err != nil {
+		return mml.Lock{}, &mml.Error{Op: "lint.Lock", Err: err}
+	}
+	return mml.NewLock(&input), nil
+}
+
+// Annotate loads every source under dir and returns the annotations the
+// declaration designs ask for that the model lacks, as an mml.yaml fragment
+// (see mml.Stubs), for the annotate command to print.
+func Annotate(ctx context.Context, dir string) ([]byte, error) {
+	input, err := load(ctx, dir)
+	if err != nil {
+		return nil, &mml.Error{Op: "lint.Annotate", Err: err}
+	}
+	out, err := sidecar.RenderStubs(mml.Stubs(&input))
+	if err != nil {
+		return nil, &mml.Error{Op: "lint.Annotate", Err: err}
+	}
+	return out, nil
+}
+
+// loadRef exports dir's tree at ref to a temporary directory and loads it.
+func loadRef(ctx context.Context, dir, ref string) (_ mml.Input, err error) {
+	tmp, err := os.MkdirTemp("", "mml-base-")
+	if err != nil {
+		return mml.Input{}, fmt.Errorf("export %q: %w", ref, err)
+	}
+	defer func() { err = errors.Join(err, os.RemoveAll(tmp)) }()
+	if err := git.Export(ctx, dir, ref, tmp); err != nil {
+		return mml.Input{}, fmt.Errorf("export %q: %w", ref, err)
+	}
+	return load(ctx, tmp)
+}
+
+// load reads every source and artifact under dir into an Input.
+func load(ctx context.Context, dir string) (mml.Input, error) {
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return mml.Input{}, fmt.Errorf("resolve %s: %w", dir, err)
+	}
+	in, err := collect(os.DirFS(root))
+	if err != nil {
+		return mml.Input{}, err
+	}
+	goSrc, snippets, err := loadGo(ctx, root, in.goModules())
+	if err != nil {
+		return mml.Input{}, err
+	}
+	input := mml.Input{
+		Sources: []mml.Source{
+			postgres.Load(in.sql, snippets),
+			goSrc,
+			jsonschema.Load(in.schemas),
+			{Problems: in.problems},
+		},
+		Artifacts: in.artifacts,
+	}
+	if in.sidecar != nil {
+		sc, problems := sidecar.Parse(SidecarName, in.sidecar)
+		owners, ownerProblems := sidecar.ParseOwnership(SidecarName, in.sidecar, "")
+		input.Sidecar = sc
+		input.Artifacts.Ownership = append(input.Artifacts.Ownership, owners...)
+		input.Sources = append(input.Sources, mml.Source{
+			Problems: slices.Concat(problems, ownerProblems),
+		})
+	}
+	if in.lock != nil {
+		l, err := mml.ReadLock(bytes.NewReader(in.lock))
+		if err != nil {
+			return mml.Input{}, fmt.Errorf("read %s: %w", LockName, err)
+		}
+		input.Lock = &l
+	}
+	return input, nil
 }
 
 // goModules returns the module directories to load: every go.mod the walk
@@ -110,6 +195,7 @@ func loadGo(
 		}
 		src.Entities = append(src.Entities, res.Source.Entities...)
 		src.Problems = append(src.Problems, res.Source.Problems...)
+		src.Queries = append(src.Queries, res.Source.Queries...)
 		for _, sn := range res.Snippets {
 			snippets = append(
 				snippets,
@@ -158,6 +244,11 @@ func (in *inputs) add(fsys fs.FS, p string) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", p, err)
 	}
+	return in.store(kind, p, src)
+}
+
+// store keeps a file's contents for the adapter or artifact list of its kind.
+func (in *inputs) store(kind, p string, src []byte) error {
 	switch kind {
 	case "sql":
 		in.sql = append(in.sql, postgres.File{Path: p, Src: src})
@@ -167,27 +258,73 @@ func (in *inputs) add(fsys fs.FS, p string) error {
 		}
 	case "sidecar":
 		in.sidecar = src
+	case "lock":
+		in.lock = src
+	default:
+		return in.storeArtifact(kind, p, src)
+	}
+	return nil
+}
+
+// storeArtifact keeps a file that is not a model source: CODEOWNERS, an ADR,
+// a logical-model record or an ownership record.
+func (in *inputs) storeArtifact(kind, p string, src []byte) error {
+	switch kind {
+	case "codeowners":
+		in.artifacts.Codeowners = append(
+			in.artifacts.Codeowners,
+			mml.ParseCodeowners(string(src))...)
+	case "adr":
+		in.artifacts.ADRs = append(in.artifacts.ADRs, mml.Document{Path: p, Text: string(src)})
+	case "logical":
+		recs, problems := sidecar.ParseLogical(p, src)
+		in.artifacts.Logical = append(in.artifacts.Logical, recs...)
+		in.problems = append(in.problems, problems...)
+	case "ownership":
+		owner := strings.TrimSuffix(path.Base(p), path.Ext(p))
+		recs, problems := sidecar.ParseOwnership(p, src, owner)
+		in.artifacts.Ownership = append(in.artifacts.Ownership, recs...)
+		in.problems = append(in.problems, problems...)
 	default:
 		return errors.New("unknown file kind " + kind)
 	}
 	return nil
 }
 
+// fileKind names the adapter or artifact list a path belongs to, or "" for
+// a file the linter does not read. The first matching rule wins.
 func fileKind(p string) string {
-	switch {
-	case p == SidecarName:
-		return "sidecar"
-	case path.Base(p) == "go.mod":
-		return "gomod"
-	case strings.HasSuffix(p, ".sql"):
-		return "sql"
-	case strings.HasSuffix(p, ".go") && !strings.HasSuffix(p, "_test.go"):
-		return "go"
-	case path.Ext(p) == ".json":
-		return "json"
-	default:
-		return ""
+	ext := path.Ext(p)
+	rules := []struct {
+		kind  string
+		match bool
+	}{
+		{"sidecar", p == SidecarName},
+		{"lock", p == LockName},
+		{
+			"codeowners",
+			slices.Contains([]string{"CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"}, p),
+		},
+		{"adr", strings.HasPrefix(p, "docs/adr/") && ext == ".md"},
+		{"logical", yamlIn(p, "model/logical/")},
+		{"ownership", yamlIn(p, "model/ownership/")},
+		{"gomod", path.Base(p) == "go.mod"},
+		{"sql", ext == ".sql"},
+		{"go", ext == ".go" && !strings.HasSuffix(p, "_test.go")},
+		{"json", ext == ".json"},
 	}
+	for _, r := range rules {
+		if r.match {
+			return r.kind
+		}
+	}
+	return ""
+}
+
+// yamlIn reports whether p is a YAML file under dir.
+func yamlIn(p, dir string) bool {
+	ext := path.Ext(p)
+	return strings.HasPrefix(p, dir) && (ext == ".yaml" || ext == ".yml")
 }
 
 // skipDir reports directories that hold no model sources of the project
@@ -196,6 +333,8 @@ func skipDir(name string) bool {
 	switch name {
 	case "node_modules", "vendor", "testdata", "bin", "dist", "target":
 		return true
+	case ".github":
+		return false // where CODEOWNERS usually lives
 	default:
 		return strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")
 	}
