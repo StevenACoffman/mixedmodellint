@@ -5,7 +5,6 @@ package check
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +28,7 @@ type Config struct {
 	Output        string
 	Baseline      string
 	WriteBaseline string
+	Base          string
 	Flags         *ff.FlagSet
 	Command       *ff.Command
 }
@@ -51,6 +51,9 @@ func New(parent *root.Config) *Config {
 		"baseline file; findings it lists are not reported")
 	cfg.Flags.StringVar(&cfg.WriteBaseline, 0, "write-baseline", "",
 		"write the fingerprints of every current finding to this file")
+	cfg.Flags.StringVar(&cfg.Base, 0, "base", "",
+		"git ref (branch, tag or commit ID) of the base revision to compare with, "+
+			"instead of mml.lock.json")
 	cfg.Command = &ff.Command{
 		Name:      "check",
 		Usage:     "mixedmodellint check [--dir DIR] [--format text|json|sarif] [FLAGS]",
@@ -84,7 +87,7 @@ func (cfg *Config) exec(ctx context.Context, args []string) error {
 		return &root.UsageError{Err: fmt.Errorf("check: --format: %s", mml.ErrorMessage(err))}
 	}
 
-	var opts lint.Options
+	opts := lint.Options{Base: cfg.Base}
 	if cfg.Baseline != "" {
 		data, err := os.ReadFile(cfg.Baseline)
 		if err != nil {
@@ -98,7 +101,7 @@ func (cfg *Config) exec(ctx context.Context, args []string) error {
 	}
 
 	if cfg.WriteBaseline != "" {
-		if err := writeFile(cfg.WriteBaseline, func(w io.Writer) error {
+		if err := root.WriteFile(cfg.WriteBaseline, func(w io.Writer) error {
 			if err := mml.WriteBaseline(w, report); err != nil {
 				return fmt.Errorf("encode: %w", err)
 			}
@@ -132,20 +135,10 @@ func (cfg *Config) render(report mml.Report, format lint.Format) error {
 	if cfg.Output == "" {
 		return write(cfg.Stdout)
 	}
-	return writeFile(cfg.Output, write)
-}
-
-// writeFile creates path, calls write, and closes it, reporting the first
-// error, including one from Close, which is where a full disk shows up.
-func writeFile(path string, write func(io.Writer) error) (err error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", path, err)
+	if err := root.WriteFile(cfg.Output, write); err != nil {
+		return fmt.Errorf("write report: %w", err)
 	}
-	defer func() {
-		err = errors.Join(err, f.Close())
-	}()
-	return write(f)
+	return nil
 }
 
 func moduleVersion() string {

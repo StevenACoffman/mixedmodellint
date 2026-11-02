@@ -17,7 +17,10 @@ import (
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 
+	"github.com/StevenACoffman/mixedmodellint/cmd/annotate"
 	"github.com/StevenACoffman/mixedmodellint/cmd/check"
+	"github.com/StevenACoffman/mixedmodellint/cmd/explain"
+	"github.com/StevenACoffman/mixedmodellint/cmd/lock"
 	"github.com/StevenACoffman/mixedmodellint/cmd/root"
 	"github.com/StevenACoffman/mixedmodellint/cmd/version" // climax:imports
 )
@@ -39,6 +42,9 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	r := root.New(stdin, stdout, stderr)
 	version.New(r)
 	check.New(r)
+	lock.New(r)
+	explain.New(r)
+	annotate.New(r)
 	// register new commands here
 
 	if err := r.Command.Parse(args, ff.WithEnvVarPrefix("MIXEDMODELLINT")); err != nil {
