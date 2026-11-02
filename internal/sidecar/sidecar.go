@@ -85,7 +85,12 @@ func pairs(n ast.Node) []*ast.MappingValueNode {
 	}
 }
 
+// keyOf returns a mapping key as text: a quoted key without its quotes,
+// since a key named null or true must be quoted to be a string at all.
 func keyOf(kv *ast.MappingValueNode) string {
+	if s, ok := kv.Key.(*ast.StringNode); ok {
+		return s.Value
+	}
 	return strings.TrimSpace(kv.Key.String())
 }
 
