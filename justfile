@@ -117,5 +117,14 @@ example: build
         exit 1
     fi
 
+# Regenerate files derived from other sources: the PostgreSQL keyword list
+# (from the parser's kwlist.h) and explain's design text (from rule_plan.md)
+generate:
+    go generate ./internal/mixedmodellint/ ./cmd/explain/
+
+# Fail when a generated file no longer matches what it is generated from
+generate-check: generate
+    git diff --exit-code -- internal/mixedmodellint/lexicon cmd/explain/designs.txt
+
 # Every gate CI runs on a pull request
-check: tidy-check lint test vulncheck actions example
+check: tidy-check generate-check lint test vulncheck actions example
