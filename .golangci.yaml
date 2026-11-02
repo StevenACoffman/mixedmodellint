@@ -338,6 +338,8 @@ linters:
             desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/sarif"
             desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
+          - pkg: "github.com/StevenACoffman/mixedmodellint/internal/git"
+            desc: "the domain must not depend on an adapter; the adapter depends on the domain — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/internal/lint"
             desc: "internal/lint is the shell above the domain; it imports the domain, never the reverse — summary_rules §1"
           - pkg: "github.com/StevenACoffman/mixedmodellint/cmd"
