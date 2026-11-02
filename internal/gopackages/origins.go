@@ -27,12 +27,14 @@ type fieldKey struct {
 // tracer finds where Go values bound to SQL parameters come from. stores
 // indexes every value the module stores into a field of a named struct, so
 // a value read from an sqlc Params struct can be followed back to the caller
-// that filled it.
+// that filled it; callers indexes the static calls of each function, so a
+// wrapper's parameters can be followed to the values its callers pass.
 type tracer struct {
 	fset      *token.FileSet
 	rel       func(token.Position) mml.Position
 	persisted map[*types.TypeName]bool
 	stores    map[fieldKey][]ssa.Value
+	callers   map[*ssa.Function][]*ssa.CallCommon
 }
 
 func newTracer(
@@ -44,17 +46,29 @@ func newTracer(
 		rel:       rel,
 		persisted: persisted,
 		stores:    map[fieldKey][]ssa.Value{},
+		callers:   map[*ssa.Function][]*ssa.CallCommon{},
 	}
 	for _, fn := range fns {
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
-				if k, v, ok := fieldStore(instr); ok {
-					t.stores[k] = append(t.stores[k], v)
-				}
+				t.index(instr)
 			}
 		}
 	}
 	return t
+}
+
+// index records what one instruction stores into a struct field, or which
+// function it calls.
+func (t *tracer) index(instr ssa.Instruction) {
+	if k, v, ok := fieldStore(instr); ok {
+		t.stores[k] = append(t.stores[k], v)
+	}
+	if call, ok := instr.(ssa.CallInstruction); ok {
+		if callee := call.Common().StaticCallee(); callee != nil {
+			t.callers[callee] = append(t.callers[callee], call.Common())
+		}
+	}
 }
 
 // fieldStore returns the field and value of an instruction that stores into

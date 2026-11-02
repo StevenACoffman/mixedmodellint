@@ -162,3 +162,79 @@ func TestSnippetArgs(t *testing.T) {
 		})
 	}
 }
+
+// describe writes origins as "from@line/truncation", the form the tracer
+// tests compare.
+func describe(origins []mml.Origin) []string {
+	var out []string
+	for _, o := range origins {
+		out = append(
+			out,
+			fmt.Sprintf("%s.%s@%d/%s", o.From.Entity, o.From.Field, o.Pos.Line, o.Truncate),
+		)
+	}
+	return out
+}
+
+// TestORMsAndWrappers pins what the tracer learns from sqlx named
+// parameters, a wrapper around ExecContext, and gorm's Create.
+func TestORMsAndWrappers(t *testing.T) {
+	t.Parallel()
+	res := load(t)
+	got := map[string][][]string{}
+	var lines []int
+	for _, s := range res.Snippets {
+		if s.Pos.File != "store/orm.go" {
+			continue
+		}
+		lines = append(lines, s.Pos.Line)
+		var args [][]string
+		for _, origins := range s.Args {
+			args = append(args, describe(origins))
+		}
+		got[s.SQL] = args
+	}
+	equals(t, []int{21, 38}, lines) // the wrapper's own call is not a snippet; its caller's is
+	equals(t, [][]string{{"Order.id@24/"}, {"Order.shipping_fee@25/"}},
+		got["INSERT INTO order_lines (order_id, order_fee) VALUES ($1, $2::numeric)"])
+	equals(t, [][]string{{"Order.placed_at@38/hour"}}, got["UPDATE clicks SET seen_at = $1"])
+
+	equals(t, 1, len(res.Source.Queries))
+	q := res.Source.Queries[0]
+	equals(t, "OrderLine", q.Target)
+	equals(t, mml.QueryInsert, q.Kind)
+	equals(t, 43, q.Pos.Line)
+	var cols []string
+	for _, a := range q.Assignments {
+		cols = append(cols, a.Column)
+	}
+	equals(t, []string{"order_id", "line_no", "note"}, cols)
+	equals(t, []string{"Order.id@44/"}, describe(q.Assignments[0].Origins))
+	equals(t, []string(nil), describe(q.Assignments[2].Origins))
+}
+
+func TestNamedSQL(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		in, want string
+		names    []string
+	}{
+		"parameters in order": {"VALUES (:a, :b_c)", "VALUES ($1, $2)", []string{"a", "b_c"}},
+		"a repeated name": {
+			"WHERE x = :a OR y = :a",
+			"WHERE x = $1 OR y = $2",
+			[]string{"a", "a"},
+		},
+		"cast is not a name":     {"SELECT :a::int", "SELECT $1::int", []string{"a"}},
+		"quoted text is skipped": {"SELECT ':a', :b", "SELECT ':a', $1", []string{"b"}},
+		"a bare colon":           {"SELECT 1 :", "SELECT 1 :", nil},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got, names := gopackages.NamedSQLForTest(tc.in)
+			equals(t, tc.want, got)
+			equals(t, tc.names, names)
+		})
+	}
+}

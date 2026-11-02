@@ -88,7 +88,9 @@ func Load(ctx context.Context, root, dir string) (Result, error) {
 	prog, ssaPkgs := ssautil.Packages(pkgs, ssa.BuilderMode(0))
 	prog.Build()
 	fns := ownFunctions(prog, ssaPkgs)
-	res.Snippets = snippets(fns, newTracer(prog, fns, persisted, rel), rel)
+	tr := newTracer(prog, fns, persisted, rel)
+	res.Snippets = snippets(fns, tr)
+	res.Source.Queries = tr.modelWrites(fns)
 	return res, nil
 }
 

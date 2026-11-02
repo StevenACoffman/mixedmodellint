@@ -144,12 +144,21 @@ func toEntity(
 		}
 	}
 	if len(e.PrimaryKey) == 0 {
-		if f, ok := e.Field("id"); ok {
-			e.PrimaryKey = []string{f.Name}
-		}
+		e.PrimaryKey = conventionalKey(&e, d.obj.Name())
 	}
 	e.Refs = append(e.Refs, inferredRefs(&e, d, byObj)...)
 	return e, true
+}
+
+// conventionalKey returns the primary key the naming convention implies: an
+// ID field, or one named after the struct (CustomerID on Customer); or nil.
+func conventionalKey(e *mml.Entity, structName string) []string {
+	for _, name := range []string{"id", snake(structName) + "_id"} {
+		if f, ok := e.Field(name); ok {
+			return []string{f.Name}
+		}
+	}
+	return nil
 }
 
 // flatten returns st's exported, persisted fields in declaration order,

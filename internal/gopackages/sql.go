@@ -5,11 +5,10 @@ import (
 	"go/token"
 	"go/types"
 	"slices"
+	"strings"
 
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
-
-	mml "github.com/StevenACoffman/mixedmodellint/internal/mixedmodellint"
 )
 
 // maxVariants caps how many strings one SQL argument may fold to, so a query
@@ -22,6 +21,16 @@ type sink struct {
 	pkg     string
 	types   []string
 	methods []string
+}
+
+// sinkCall is what is known of a call to a sink: its signature, which
+// parameter carries the SQL, whether that SQL uses sqlx's :name parameters,
+// and whether a parse failure is worth reporting.
+type sinkCall struct {
+	sig      *types.Signature
+	sqlIndex int
+	named    bool
+	strict   bool
 }
 
 // databaseSQLMethods are the database/sql methods that take SQL text. A
@@ -68,7 +77,7 @@ func knownSinks() []sink {
 
 // snippets returns the SQL passed to SQL APIs by fns, one snippet per string
 // the argument can fold to, each with the origins of its bind arguments.
-func snippets(fns []*ssa.Function, tr *tracer, rel func(token.Position) mml.Position) []Snippet {
+func snippets(fns []*ssa.Function, tr *tracer) []Snippet {
 	sinks := knownSinks()
 	var out []Snippet
 	for _, fn := range fns {
@@ -78,7 +87,7 @@ func snippets(fns []*ssa.Function, tr *tracer, rel func(token.Position) mml.Posi
 				if !ok {
 					continue
 				}
-				out = append(out, callSnippets(tr, call.Common(), sinks, rel)...)
+				out = append(out, callSnippets(tr, fn, call.Common(), sinks)...)
 			}
 		}
 	}
@@ -104,10 +113,10 @@ func ownFunctions(prog *ssa.Program, pkgs []*ssa.Package) []*ssa.Function {
 	return fns
 }
 
-// callSnippets returns the SQL a call passes, when it calls a sink.
-func callSnippets(
-	tr *tracer, c *ssa.CallCommon, sinks []sink, rel func(token.Position) mml.Position,
-) []Snippet {
+// callSnippets returns the SQL a call in fn passes, when it calls a sink.
+// When the SQL is a parameter of fn, fn wraps the sink, and each call of fn
+// supplies the SQL and its arguments instead, positioned at that call.
+func callSnippets(tr *tracer, fn *ssa.Function, c *ssa.CallCommon, sinks []sink) []Snippet {
 	method, args := callee(c)
 	if method == nil {
 		return nil
@@ -116,16 +125,55 @@ func callSnippets(
 	if !ok {
 		return nil
 	}
-	sig := method.Type().(*types.Signature)
-	i := sqlParam(sig)
-	if i < 0 || i >= len(args) {
+	s := sinkCall{
+		sig: method.Type().(*types.Signature), strict: strict,
+		named: strings.HasPrefix(method.Name(), "Named"),
+	}
+	s.sqlIndex = sqlParam(s.sig)
+	if s.sqlIndex < 0 || s.sqlIndex >= len(args) {
 		return nil
 	}
-	pos := rel(tr.fset.Position(c.Pos()))
-	bound := tr.args(sig, i, args)
+	if p, ok := args[s.sqlIndex].(*ssa.Parameter); ok && p.Parent() == fn &&
+		len(tr.callers[fn]) > 0 {
+		return tr.wrapped(fn, s, args)
+	}
+	return tr.sinkSnippets(s, c.Pos(), args)
+}
+
+// sinkSnippets returns one snippet per string the SQL argument folds to,
+// at pos, with the origins of the values bound to its parameters.
+func (t *tracer) sinkSnippets(s sinkCall, pos token.Pos, args []ssa.Value) []Snippet {
+	at := t.rel(t.fset.Position(pos))
 	var out []Snippet
-	for _, s := range foldString(args[i], map[ssa.Value]bool{}) {
-		out = append(out, Snippet{SQL: s, Pos: pos, Strict: strict, Args: bound})
+	for _, sql := range foldString(args[s.sqlIndex], map[ssa.Value]bool{}) {
+		sn := Snippet{SQL: sql, Pos: at, Strict: s.strict}
+		if s.named && s.sqlIndex+1 < len(args) {
+			var names []string
+			sn.SQL, names = namedSQL(sql)
+			sn.Args = t.namedArgs(args[s.sqlIndex+1], names)
+		} else {
+			sn.Args = t.args(s.sig, s.sqlIndex, args)
+		}
+		out = append(out, sn)
+	}
+	return out
+}
+
+// wrapped returns the snippets of a sink called inside fn with fn's own
+// parameters: for each call of fn, the SQL and bound values that call
+// passes. Only one level of wrapping is followed.
+func (t *tracer) wrapped(fn *ssa.Function, s sinkCall, args []ssa.Value) []Snippet {
+	var out []Snippet
+	for _, call := range t.callers[fn] {
+		outer := slices.Clone(args)
+		for i, a := range args {
+			if p, ok := a.(*ssa.Parameter); ok && p.Parent() == fn {
+				if j := slices.Index(fn.Params, p); j >= 0 && j < len(call.Args) {
+					outer[i] = call.Args[j]
+				}
+			}
+		}
+		out = append(out, t.sinkSnippets(s, call.Pos(), outer)...)
 	}
 	return out
 }
