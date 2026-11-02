@@ -8,6 +8,11 @@ const (
 	QueryDelete
 	QueryMerge
 	QueryCreateView
+	// QueryDrop and QueryTruncate remove a table's rows; Target is the table.
+	// They are kept as queries so §7.5-B can see data being removed after
+	// the DDL replay has already forgotten the table.
+	QueryDrop
+	QueryTruncate
 )
 
 // Dedup kinds.

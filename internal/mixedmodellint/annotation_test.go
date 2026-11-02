@@ -121,12 +121,14 @@ func TestGrainParams(t *testing.T) {
 		return e
 	}
 	designs := func(e mixedmodellint.Entity) (ids []string, suggestion string) {
-		r := mixedmodellint.Analyze(mixedmodellint.Input{
+		r := mixedmodellint.Analyze(&mixedmodellint.Input{
 			Sources: []mixedmodellint.Source{{Entities: []mixedmodellint.Entity{e}}},
 		})
 		for i := range r.Findings {
-			ids = append(ids, r.Findings[i].Design)
-			suggestion = r.Findings[i].Suggestion
+			if r.Findings[i].Rule == "7.1" { // the grain designs read the parameters
+				ids = append(ids, r.Findings[i].Design)
+				suggestion = r.Findings[i].Suggestion
+			}
 		}
 		return ids, suggestion
 	}

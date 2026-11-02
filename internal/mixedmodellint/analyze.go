@@ -9,9 +9,18 @@ import (
 // Input is everything one lint run reads, already loaded into values by the
 // adapters.
 type Input struct {
-	Sources  []Source
-	Sidecar  Sidecar
-	Baseline Baseline
+	Sources   []Source
+	Sidecar   Sidecar
+	Baseline  Baseline
+	Artifacts Artifacts
+	// Lock is the committed schema lock, or nil when the repository has
+	// none.
+	Lock *Lock
+	// Base is the model at the change's base revision (check --base), or
+	// nil. The designs that compare a change with the previous model read
+	// Base when it is set and the lock otherwise; with neither they do not
+	// run.
+	Base *Input
 }
 
 // Sidecar is the mml.yaml catalog: annotations for entities whose source
@@ -50,37 +59,19 @@ func (r Report) HasErrors() bool {
 //
 // Requires: nothing beyond well-formed values; empty input is valid.
 // Ensures:  the same Input always yields the same Report; Report.Findings is
-// sorted by position; no finding a waiver with a reason covers, and no finding
+// sorted by position; in is not modified; no finding a waiver with a reason covers, and no finding
 // whose fingerprint is in the baseline, is returned.
-func Analyze(in Input) Report {
-	var entities []*Entity
-	var queries []Query
-	var findings []Finding
-	for i := range in.Sources {
-		src := &in.Sources[i]
-		// Copies, so linking and the sidecar merge never write through to the
-		// caller's Input (summary_rules §5: do not mutate a parameter).
-		for j := range src.Entities {
-			e := src.Entities[j]
-			e.Fields = slices.Clone(e.Fields)
-			entities = append(entities, &e)
-		}
-		queries = append(queries, src.Queries...)
-		findings = append(findings, problemFindings(src.Problems)...)
-	}
-
-	// Annotations first: linking reads `entity`, and every design reads the
-	// merged result.
-	findings = append(findings, mergeSidecar(entities, in.Sidecar)...)
-	findings = append(findings, unknownKeyFindings(entities)...)
-	for _, e := range entities {
-		e.Canonical = Canonical(e.Name)
-		if v, ok := e.Annotations.Get("entity"); ok {
-			e.Canonical = Canonical(v)
-		}
-	}
-
+func Analyze(in *Input) Report {
+	entities, queries, findings := prepare(in)
 	c := newCatalog(entities, queries, newLexicon())
+	c.artifacts, c.sidecar = in.Artifacts, in.Sidecar
+	if in.Lock != nil {
+		c.previous = in.Lock.restore()
+		findings = append(findings, lockStaleFindings(diffLock(c.previous, entities))...)
+	}
+	if in.Base != nil {
+		c.previous, _, _ = prepare(in.Base)
+	}
 	findings = append(findings, run(c, allDesigns())...)
 
 	findings, waived, waiverFindings := applyWaivers(findings, entities)
@@ -96,6 +87,38 @@ func Analyze(in Input) Report {
 	}
 }
 
+// prepare builds the model every design reads, and that a lock records: the
+// sources' entities, copied, with the sidecar merged, ref= declarations
+// added and canonical names set; the query corpus; and the findings made
+// while reading them.
+func prepare(in *Input) (entities []*Entity, queries []Query, findings []Finding) {
+	for i := range in.Sources {
+		src := &in.Sources[i]
+		// Copies, so linking and the sidecar merge never write through to the
+		// caller's Input (summary_rules §5: do not mutate a parameter).
+		for j := range src.Entities {
+			e := src.Entities[j]
+			e.Fields, e.Refs = slices.Clone(e.Fields), slices.Clone(e.Refs)
+			entities = append(entities, &e)
+		}
+		queries = append(queries, src.Queries...)
+		findings = append(findings, problemFindings(src.Problems)...)
+	}
+
+	// Annotations first: linking reads `entity`, and every design reads the
+	// merged result.
+	findings = append(findings, mergeSidecar(entities, in.Sidecar)...)
+	findings = append(findings, unknownKeyFindings(entities)...)
+	for _, e := range entities {
+		declareRefs(e)
+		e.Canonical = Canonical(e.Name)
+		if v, ok := e.Annotations.Get("entity"); ok {
+			e.Canonical = Canonical(v)
+		}
+	}
+	return entities, queries, findings
+}
+
 func problemFindings(problems []Problem) []Finding {
 	out := make([]Finding, 0, len(problems))
 	for _, p := range problems {
@@ -109,6 +132,61 @@ func problemFindings(problems []Problem) []Finding {
 			Suggestion: "Fix the syntax error, or exclude the file from the run. " +
 				"Entities in this statement were not checked.",
 		})
+	}
+	return out
+}
+
+// declareRefs adds a reference for each field annotated ref=<entity> that no
+// declared reference covers yet: the declaration a source without foreign
+// keys makes (JSON x-mml-ref, a Go mml:"ref=..." tag, a SQL @ref comment,
+// mml.yaml).
+func declareRefs(e *Entity) {
+	for i := range e.Fields {
+		f := &e.Fields[i]
+		target, ok := f.Annotations.Get("ref")
+		if !ok {
+			continue
+		}
+		declared := Ref{Fields: []string{f.Name}, Target: target, Pos: f.Annotations["ref"].Pos}
+		j := slices.IndexFunc(e.Refs, func(r Ref) bool { return containsFold(r.Fields, f.Name) })
+		switch {
+		case j < 0:
+			e.Refs = append(e.Refs, declared)
+		case e.Refs[j].Inferred:
+			e.Refs[j] = declared // a declaration replaces a guess from the name
+		}
+	}
+}
+
+// lockStaleFindings reports each entity that differs from mml.lock.json, so
+// a structural change cannot land without the reviewed lock diff that
+// records it (M3).
+func lockStaleFindings(changes []lockChange) []Finding {
+	out := make([]Finding, 0, len(changes))
+	for i := range changes {
+		ch := &changes[i]
+		f := Finding{
+			Rule: "mml", Design: "mml/lock-stale",
+			Title:    "Model differs from mml.lock.json",
+			Severity: SeverityWarning,
+			Suggestion: "Run mixedmodellint lock and commit mml.lock.json with this change, " +
+				"so reviewers see the structural diff.",
+		}
+		switch {
+		case ch.locked == nil:
+			f.EntityID, f.Entity, f.Pos = ch.current.ID, ch.current.Name, ch.current.Pos
+			f.Measured = fmt.Sprintf("%s is not in mml.lock.json", ch.current.Name)
+		case ch.current == nil:
+			f.EntityID, f.Entity = ch.locked.ID, ch.locked.Name
+			f.Pos = Position{File: "mml.lock.json"}
+			f.Measured = fmt.Sprintf("%s is in mml.lock.json but no longer in the sources",
+				ch.locked.Name)
+		default:
+			f.EntityID, f.Entity, f.Pos = ch.current.ID, ch.current.Name, ch.current.Pos
+			f.Measured = fmt.Sprintf("%s changed since mml.lock.json: %s", ch.current.Name,
+				ch.describe())
+		}
+		out = append(out, f)
 	}
 	return out
 }

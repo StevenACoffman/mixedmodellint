@@ -183,3 +183,45 @@ func (e *Entity) Keys() [][]string {
 	}
 	return append(keys, e.Uniques...)
 }
+
+// String is the source kind's name in mml.lock.json and messages.
+func (s SourceKind) String() string { return sourceNames()[s] }
+
+// String is the entity kind's name in mml.lock.json and messages.
+func (k EntityKind) String() string { return kindNames()[k] }
+
+// String is the logical type's name in mml.lock.json and messages.
+func (t LogicalType) String() string { return typeNames()[t] }
+
+// sourceNames, kindNames and typeNames are the one table each enum's names
+// come from, read both ways, so writing and reading a lock cannot disagree.
+func sourceNames() map[SourceKind]string {
+	return map[SourceKind]string{SourceSQL: "sql", SourceGo: "go", SourceJSONSchema: "jsonschema"}
+}
+
+func kindNames() map[EntityKind]string {
+	return map[EntityKind]string{
+		KindTable: "table", KindView: "view", KindStruct: "struct", KindSchema: "schema",
+	}
+}
+
+func typeNames() map[LogicalType]string {
+	return map[LogicalType]string{
+		TypeUnknown: "unknown", TypeString: "string", TypeInt: "int", TypeDecimal: "decimal",
+		TypeFloat: "float", TypeBool: "bool", TypeDate: "date", TypeTimestamptz: "timestamptz",
+		TypeTimestampNaive: "timestamp", TypeTime: "time", TypeInterval: "interval",
+		TypeUUID: "uuid", TypeBytes: "bytes", TypeJSON: "json", TypeArray: "array",
+		TypeObject: "object",
+	}
+}
+
+// parseName returns the value names gives name, or false.
+func parseName[T comparable](names map[T]string, name string) (T, bool) {
+	for v, n := range names {
+		if n == name {
+			return v, true
+		}
+	}
+	var zero T
+	return zero, false
+}

@@ -7,12 +7,30 @@ import (
 	"strings"
 )
 
+// Ways a column's time unit is known.
+const (
+	heldByType heldSource = iota + 1
+	heldByWrites
+	heldByGrain
+)
+
 // scope resolves a query's relation aliases to entities. Derived relations
 // (CTEs, subqueries) and names with no entity resolve to nil, and designs
 // skip them rather than guess.
 type scope struct {
 	q        *Query
 	entities map[string]*Entity // by lowercase alias
+}
+
+// heldSource is how the time unit a column holds is known.
+type heldSource int
+
+// held is the finest time unit a column can hold, how that is known, and,
+// for truncating writes, where one is.
+type held struct {
+	unit string
+	from heldSource
+	at   Position
 }
 
 // ancestorCopy is an origin of a written value that is a field of an
@@ -36,12 +54,6 @@ func section7QueryDesigns() []design {
 		{id: "7.2-A", title: "Static fan-out analysis", strength: Must, check: check72A},
 		{id: "7.3-A", title: "Write-statement idempotency", strength: Must, check: check73A},
 		{id: "7.3-D", title: "Readers deduplicating at the grain", strength: Must, check: check73D},
-		{
-			id:       "7.4-B",
-			title:    "Mixed-grain discriminator contract",
-			strength: Should,
-			check:    check74BQuery,
-		},
 		{
 			id: "7.4-D", title: "Copy-on-write from the coarser grain",
 			strength: Should, check: check74D,
@@ -422,12 +434,12 @@ func finerThanGrain(c *catalog, s scope, te *TimeExpr) (issue, bool) {
 	if !ok {
 		return issue{}, false
 	}
-	held, at, truncatedOnWrite, ok := c.heldUnit(e, f)
+	h, ok := c.heldUnit(e, f)
 	if !ok {
 		return issue{}, false
 	}
 	need := timeUnitRank(te.Unit)
-	if need == 0 || need >= timeUnitRank(held) {
+	if need == 0 || need >= timeUnitRank(h.unit) {
 		return issue{}, false
 	}
 	asked := te.Unit
@@ -435,34 +447,60 @@ func finerThanGrain(c *catalog, s scope, te *TimeExpr) (issue, bool) {
 		asked = "a time of day"
 	}
 	is := issue{entity: e, field: f.Name, pos: te.Pos}
-	if !truncatedOnWrite {
+	switch h.from {
+	case heldByType:
 		is.measured = fmt.Sprintf("a query asks for %s from %s.%s, a date column whose finest "+
 			"unit is a day, so every value falls on midnight and the result looks valid while "+
 			"saying nothing", asked, e.Name, f.Name)
 		is.suggestion = finerSourceHint(c, e)
-		return is, true
+	case heldByWrites:
+		is.measured = fmt.Sprintf("a query asks for %s from %s.%s, but every write truncates it "+
+			"to the %s (as at %s), so every value within a %s is the same and the result looks "+
+			"valid while saying nothing", asked, e.Name, f.Name, h.unit, h.at, h.unit)
+		is.suggestion = fmt.Sprintf("Store %s.%s at full precision and truncate when reading "+
+			"(§9.8-B), or ask for the %s or coarser.", e.Name, f.Name, h.unit)
+	default:
+		is.measured = fmt.Sprintf("a query asks for %s from %s.%s, but %s's declared grain holds "+
+			"one row per %s, so nothing finer is there to find", asked, e.Name, f.Name, e.Name,
+			h.unit)
+		is.suggestion = finerSourceHint(c, e)
 	}
-	is.measured = fmt.Sprintf("a query asks for %s from %s.%s, but every write truncates it to "+
-		"the %s (as at %s), so every value within a %s is the same and the result looks valid "+
-		"while saying nothing", asked, e.Name, f.Name, held, at, held)
-	is.suggestion = fmt.Sprintf("Store %s.%s at full precision and truncate when reading "+
-		"(§9.8-B), or ask for the %s or coarser.", e.Name, f.Name, held)
 	return is, true
 }
 
-// heldUnit returns the finest time unit f can hold: a day for a date, or the
-// unit every write truncates a timestamp to, with where one does. ok is false
-// when f holds full precision or is not temporal.
-func (c *catalog) heldUnit(e *Entity, f *Field) (unit string, at Position, onWrite, ok bool) {
+// heldUnit returns the finest time unit f can hold, and why: a day for a
+// date; for a timestamp, the unit every write truncates it to (§9.8-B), or
+// else the time unit of the declared grain when f is the grain's time
+// column. ok is false when f holds full precision or is not temporal.
+func (c *catalog) heldUnit(e *Entity, f *Field) (held, bool) {
 	switch f.Type {
 	case TypeDate:
-		return "day", Position{}, false, true
+		return held{unit: "day", from: heldByType}, true
 	case TypeTimestamptz, TypeTimestampNaive:
-		unit, at, ok = c.writtenUnit(e, f.Name)
-		return unit, at, true, ok
+		if unit, at, ok := c.writtenUnit(e, f.Name); ok {
+			return held{unit: unit, at: at, from: heldByWrites}, true
+		}
+		if unit := grainUnit(e, f); unit != "" {
+			return held{unit: unit, from: heldByGrain}, true
+		}
 	default:
-		return "", Position{}, false, false
 	}
+	return held{}, false
+}
+
+// grainUnit returns the time unit e's declared grain names for f ("one row
+// per sensor per hour" for the key's timestamp), or "".
+func grainUnit(e *Entity, f *Field) string {
+	g, ok := grainOf(e)
+	if !ok {
+		return ""
+	}
+	for _, n := range g.nouns {
+		if timeUnitRank(n) > 0 && containsFold(nounColumns(e, n), f.Name) {
+			return n
+		}
+	}
+	return ""
 }
 
 // finerSourceHint names a source with timestamps that e is built from, when

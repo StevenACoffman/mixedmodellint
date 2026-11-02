@@ -15,6 +15,15 @@ type design struct {
 	check     func(c *catalog) []issue
 }
 
+// DesignInfo describes one implemented design for commands that list or
+// explain designs: its rule_plan.md ID, title, and the severity its findings
+// get by default.
+type DesignInfo struct {
+	ID       string
+	Title    string
+	Severity Severity
+}
+
 // issue is what a design reports. The engine turns it into a Finding,
 // filling in the rule, design, title and severity, so no design can get its
 // own severity wrong.
@@ -37,6 +46,13 @@ type catalog struct {
 	byCanonical map[string][]*Entity
 	queries     []Query
 	rx          *lexicon
+	artifacts   Artifacts
+	// sidecar holds mml.yaml's annotations, the only place an entity that no
+	// longer exists, such as a dropped table, can declare anything.
+	sidecar Sidecar
+	// previous is the model the change is compared with, from mml.lock.json;
+	// nil when there is none, and the designs that need it report nothing.
+	previous []*Entity
 }
 
 func newCatalog(entities []*Entity, queries []Query, rx *lexicon) *catalog {
@@ -137,10 +153,24 @@ func run(c *catalog, designs []design) []Finding {
 // package variable, so there is no global state (summary_rules §1).
 func allDesigns() []design {
 	var ds []design
+	ds = append(ds, section1Designs()...)
+	ds = append(ds, section3Designs()...)
+	ds = append(ds, section4Designs()...)
 	ds = append(ds, section5Designs()...)
+	ds = append(ds, section6Designs()...)
 	ds = append(ds, section7Designs()...)
 	ds = append(ds, section7QueryDesigns()...)
 	ds = append(ds, section8Designs()...)
 	ds = append(ds, section9Designs()...)
 	return ds
+}
+
+// Designs lists every implemented design, in the order they run.
+func Designs() []DesignInfo {
+	ds := allDesigns()
+	out := make([]DesignInfo, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, DesignInfo{ID: d.id, Title: d.title, Severity: severityFor(d)})
+	}
+	return out
 }

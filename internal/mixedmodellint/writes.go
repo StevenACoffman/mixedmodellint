@@ -2,12 +2,27 @@ package mixedmodellint
 
 import "strings"
 
+// Time roles.
+const (
+	roleNone timeRole = iota
+	roleEvent
+	roleIngested
+	roleProcessed
+	roleAmbiguous
+	roleConflict
+)
+
+// timeRole is what a temporal field records (rule_plan.md §9.1-A).
+type timeRole int
+
 // write is one assignment of the query corpus, resolved: the entity written,
-// the field set (nil when the entity has no such field), and the assignment.
+// the field set (nil when the entity has no such field), the assignment, and
+// the kind of statement that makes it.
 type write struct {
 	entity     *Entity
 	field      *Field
 	assignment *Assignment
+	kind       QueryKind
 }
 
 // writes returns every assignment in the corpus to an entity in the catalog.
@@ -29,7 +44,7 @@ func (c *catalog) writes() []write {
 		for j := range q.Assignments {
 			a := &q.Assignments[j]
 			f, _ := e.Field(a.Column)
-			out = append(out, write{entity: e, field: f, assignment: a})
+			out = append(out, write{entity: e, field: f, assignment: a, kind: q.Kind})
 		}
 	}
 	return out
@@ -94,36 +109,85 @@ func (c *catalog) ancestors(e *Entity) []*Entity {
 	return out
 }
 
-// eventTime reports whether f holds when something happened, as rule_plan.md
-// §9.1-A classifies temporal fields: a time= annotation decides; otherwise a
-// timestamp named with an at/time/ts stem is event time unless its words say
-// ingestion, processing, or row bookkeeping (created_at is ambiguous: in the
-// store it is when the row was written).
+// eventTime reports whether f is a timestamp holding when something
+// happened (rule_plan.md §9.1-A), the kind of field truncation must not
+// touch.
 func eventTime(f *Field) bool {
-	if f.Type != TypeTimestamptz && f.Type != TypeTimestampNaive {
-		return false
-	}
+	return (f.Type == TypeTimestamptz || f.Type == TypeTimestampNaive) &&
+		temporalRole(f) == roleEvent
+}
+
+// temporalRole classifies a temporal field by what its time records, as
+// rule_plan.md §9.1-A does: a time= annotation decides; otherwise the words
+// of its name. created_at is ambiguous: in the store it is when the row was
+// written, which may or may not be when the thing happened. A name whose
+// words point two ways (loaded_event_at) is a conflict, and a name with none
+// is event time when it ends like a time (_at, _time, _ts, _on, _date).
+func temporalRole(f *Field) timeRole {
 	if t, ok := f.Annotations.Get("time"); ok {
-		return t == "event"
+		return annotatedRole(t)
 	}
-	ws := splitWords(f.Name)
-	if len(ws) == 0 {
-		return false
+	return nameRole(splitWords(f.Name))
+}
+
+// annotatedRole maps a time= value to a role; business time is event time
+// and system time is processing time.
+func annotatedRole(t string) timeRole {
+	switch t {
+	case "event", "business":
+		return roleEvent
+	case "ingested":
+		return roleIngested
+	case "processed", "system":
+		return roleProcessed
+	default:
+		return roleNone
 	}
-	switch ws[len(ws)-1] {
-	case "at", "time", "ts", "timestamp":
+}
+
+// nameRole classifies a field name's words.
+func nameRole(ws []string) timeRole {
+	found := roleNone
+	for _, w := range ws {
+		switch r := wordRole(w); {
+		case r == roleNone:
+		case found != roleNone && found != r:
+			return roleConflict
+		default:
+			found = r
+		}
+	}
+	if found == roleNone && len(ws) > 0 && timeStem(ws[len(ws)-1]) {
+		return roleEvent
+	}
+	return found
+}
+
+// wordRole is the role one word of a field name signals, from the §9.1-A
+// lexicon.
+func wordRole(w string) timeRole {
+	switch w {
+	case "ingest", "ingested", "loaded", "received", "arrived", "landed", "synced":
+		return roleIngested
+	case "processed", "transformed", "computed", "etl", "batch", "run", "updated", "modified",
+		"deleted":
+		return roleProcessed
+	case "created", "inserted":
+		return roleAmbiguous
+	case "occurred", "event", "happened", "captured", "placed", "ordered", "clicked":
+		return roleEvent
+	default:
+		return roleNone
+	}
+}
+
+func timeStem(w string) bool {
+	switch w {
+	case "at", "time", "ts", "timestamp", "on", "date":
+		return true
 	default:
 		return false
 	}
-	for _, w := range ws {
-		switch w {
-		case "ingest", "ingested", "loaded", "received", "arrived", "landed", "processed",
-			"transformed", "computed", "etl", "batch", "run", "created", "inserted", "updated",
-			"modified", "deleted", "synced":
-			return false
-		}
-	}
-	return true
 }
 
 // finestKept returns the finest time unit a write may truncate f to without

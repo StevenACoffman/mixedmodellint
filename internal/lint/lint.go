@@ -81,7 +81,7 @@ func Run(ctx context.Context, dir string, opts Options) (mml.Report, error) {
 			return mml.Report{}, &mml.Error{Op: op, Err: err}
 		}
 	}
-	return mml.Analyze(input), nil
+	return mml.Analyze(&input), nil
 }
 
 // goModules returns the module directories to load: every go.mod the walk

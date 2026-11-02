@@ -3,6 +3,7 @@ package mixedmodellint_test
 import (
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -92,7 +93,7 @@ func TestLinterFindingFields(t *testing.T) {
 			},
 		},
 	}
-	r := m.Analyze(m.Input{
+	r := m.Analyze(&m.Input{
 		Sources: []m.Source{
 			{Entities: []m.Entity{e}},
 			{
@@ -117,7 +118,7 @@ func TestLinterFindingFields(t *testing.T) {
 		"counts entities":       {1, r.Entities},
 		"counts queries":        {1, r.Queries},
 		"field waiver applied":  {1, r.Waived},
-		"three linter findings": {3, len(r.Findings)},
+		"three linter findings": {3, countRule(r, "mml")},
 		"conflict names both": {
 			`grain is "one row per cart" inline but "one row per basket" in mml.yaml`,
 			conflict.Measured,
@@ -184,16 +185,16 @@ func TestSidecarAndLinking(t *testing.T) {
 			},
 		},
 	}}
-	r := m.Analyze(m.Input{
+	r := m.Analyze(&m.Input{
 		Sources: []m.Source{{Entities: []m.Entity{vendor, linked}}}, Sidecar: sidecar,
 	})
-	equals(t, 0, len(r.Findings))
+	equals(t, 0, len(withoutContracts(r.Findings)))
 	equals(t, 1, r.Waived)
-	equals(t, false, r.HasErrors())
+	equals(t, false, m.Report{Findings: withoutContracts(r.Findings)}.HasErrors())
 
 	// Without the sidecar, the grain is missing on both entities, since the
 	// Go struct is linked to the table through its entity annotation.
-	bare := m.Analyze(m.Input{Sources: []m.Source{{Entities: []m.Entity{vendor, linked}}}})
+	bare := m.Analyze(&m.Input{Sources: []m.Source{{Entities: []m.Entity{vendor, linked}}}})
 	var missing []string
 	for i := range bare.Findings {
 		if bare.Findings[i].Design == "7.1-A" {
@@ -223,4 +224,23 @@ func TestHasErrors(t *testing.T) {
 			equals(t, tc.want, r.HasErrors())
 		})
 	}
+}
+
+// countRule counts r's findings of one rule.
+func countRule(r m.Report, rule string) int {
+	n := 0
+	for i := range r.Findings {
+		if r.Findings[i].Rule == rule {
+			n++
+		}
+	}
+	return n
+}
+
+// withoutContracts returns findings without those of the contract designs
+// (see contractDesigns).
+func withoutContracts(findings []m.Finding) []m.Finding {
+	return slices.DeleteFunc(slices.Clone(findings), func(f m.Finding) bool {
+		return slices.Contains(contractDesigns(), f.Design)
+	})
 }

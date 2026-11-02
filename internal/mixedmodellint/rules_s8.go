@@ -8,6 +8,11 @@ import (
 
 func section8Designs() []design {
 	return []design{
+		{id: "8.2-A", title: "Junction-table hazard tagging", strength: Must, check: check82A},
+		{
+			id: "8.3-A", title: "Measure-classification contract", strength: Must,
+			check: check83A,
+		},
 		{
 			id: "8.4-A", title: "Stored ratio without components", strength: Must,
 			heuristic: true, check: check84A,
@@ -133,4 +138,251 @@ func stemWithout(name string) string {
 		}
 	}
 	return strings.Join(kept, "_")
+}
+
+// junction reports whether e links two or more entities many-to-many
+// (rule_plan.md §8.2-A): at least two references, and either a key equal to
+// the union of the reference columns or at most two other columns.
+func junction(e *Entity) bool {
+	if len(e.Refs) < 2 {
+		return false
+	}
+	var refCols []string
+	for _, r := range e.Refs {
+		refCols = append(refCols, r.Fields...)
+	}
+	for _, k := range e.Keys() {
+		if sameColumns(k, refCols) {
+			return true
+		}
+	}
+	other := 0
+	for i := range e.Fields {
+		if !containsFold(refCols, e.Fields[i].Name) &&
+			!containsFold(e.PrimaryKey, e.Fields[i].Name) {
+			other++
+		}
+	}
+	return other <= 2
+}
+
+func check82A(c *catalog) []issue {
+	var out []issue
+	for _, j := range c.entities {
+		if !junction(j) {
+			continue
+		}
+		if is, ok := c.junctionIssue(j); ok {
+			out = append(out, is)
+		}
+	}
+	return out
+}
+
+// junctionIssue reports a junction whose sides carry a measure but which
+// does not say how that measure splits across the pairs, or names a weight
+// or flag column it does not have.
+func (c *catalog) junctionIssue(j *Entity) (issue, bool) {
+	policy, declared := j.Annotations.Get("m2m")
+	if declared {
+		col := policyColumn(policy)
+		if _, ok := j.Field(col); col != "" && !ok {
+			return issue{
+				entity: j,
+				measured: fmt.Sprintf("%s declares m2m=%s, but has no column %s", j.Name,
+					policy, col),
+				suggestion: fmt.Sprintf("Add %s to %s, or correct the m2m declaration (§8.2).",
+					col, j.Name),
+			}, true
+		}
+		return issue{}, false
+	}
+	sides := c.parents(j)
+	for _, x := range sides {
+		measure, exact := measureField(x)
+		if measure == "" {
+			continue
+		}
+		is := junctionHazard(j, x, sides, measure)
+		if !exact {
+			is.level = SeverityWarning
+		}
+		return is, true
+	}
+	return issue{}, false
+}
+
+// policyColumn returns the column an m2m policy names: the weight of
+// allocated(w) or the flag of primary(f), or "".
+func policyColumn(policy string) string {
+	lo, hi := strings.IndexByte(policy, '('), strings.LastIndexByte(policy, ')')
+	if lo < 0 || hi < lo {
+		return ""
+	}
+	return strings.TrimSpace(policy[lo+1 : hi])
+}
+
+// measureField returns a field of x that is summed: one declared
+// measure=additive (exact), or else a number named like an amount
+// (heuristic).
+func measureField(x *Entity) (name string, exact bool) {
+	for i := range x.Fields {
+		m, _ := x.Fields[i].Annotations.Get("measure")
+		if class, _, _ := strings.Cut(m, " "); class == "additive" {
+			return x.Fields[i].Name, true
+		}
+	}
+	for i := range x.Fields {
+		f := &x.Fields[i]
+		if isNumeric(f.Type) && slices.ContainsFunc(splitWords(f.Name), func(w string) bool {
+			switch w {
+			case "amount", "revenue", "price", "qty", "total":
+				return true
+			}
+			return false
+		}) {
+			return f.Name, false
+		}
+	}
+	return "", false
+}
+
+func junctionHazard(j, x *Entity, sides []*Entity, measure string) issue {
+	y := "the other side"
+	for _, s := range sides {
+		if s != x {
+			y = s.Name
+			break
+		}
+	}
+	return issue{
+		entity: j,
+		measured: fmt.Sprintf("%s links %s and %s many-to-many, so summing %s.%s grouped by "+
+			"%s counts each %s once per %s and the groups overlap", j.Name, x.Name, y, x.Name,
+			measure, y, x.Canonical, singular(y)),
+		suggestion: fmt.Sprintf("Declare m2m=overlapping on %s and label reports as "+
+			"overlapping; or add allocation_weight NUMERIC NOT NULL CHECK (allocation_weight "+
+			"BETWEEN 0 AND 1) summing to 1 per %s and declare m2m=allocated(allocation_weight); "+
+			"or add is_primary BOOLEAN with a partial unique index and declare "+
+			"m2m=primary(is_primary) (§8.2).", j.Name, x.Canonical),
+	}
+}
+
+// measureScoped reports whether §8.3-A asks e's numbers for a measure
+// class: analytical, feature, wide or event data, or anything with a grain.
+func measureScoped(e *Entity) bool {
+	layer, _ := e.Annotations.Get("layer")
+	switch layer {
+	case "analytical", "feature", "obt", "event":
+		return true
+	default:
+		return e.Annotations.Has("grain")
+	}
+}
+
+func check83A(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		if !measureScoped(e) {
+			continue
+		}
+		for i := range e.Fields {
+			f := &e.Fields[i]
+			if is, ok := measureClassIssue(e, f); ok {
+				out = append(out, is)
+			}
+		}
+	}
+	return out
+}
+
+// measureClassIssue applies §8.3-A to one field: a number that is not a key
+// or a code must declare how it adds up.
+func measureClassIssue(e *Entity, f *Field) (issue, bool) {
+	if !measureCandidate(e, f) {
+		return issue{}, false
+	}
+	declared, ok := f.Annotations.Get("measure")
+	if !ok {
+		guess := measureGuess(f.Name)
+		return issue{
+			entity: e, field: f.Name, pos: f.Pos,
+			measured: fmt.Sprintf("%s.%s has no additivity class", e.Name, f.Name),
+			suggestion: fmt.Sprintf("Its name suggests %s. Declare measure=%s%s so the query "+
+				"checks can protect it (§8.3).", guess, guess, overHint(guess)),
+		}, true
+	}
+	return declaredMeasureIssue(e, f, declared)
+}
+
+// declaredMeasureIssue checks a declared measure class: it must be one of
+// the three, a semi-additive one must say over what, and one the name
+// contradicts gets a note asking for confirmation.
+func declaredMeasureIssue(e *Entity, f *Field, declared string) (issue, bool) {
+	class, _, _ := strings.Cut(declared, " ")
+	guess := measureGuess(f.Name)
+	is := issue{entity: e, field: f.Name, pos: f.Pos}
+	switch {
+	case class != "additive" && class != "semi_additive" && class != "non_additive":
+		is.measured = fmt.Sprintf("%s.%s declares measure=%s, which is not a class", e.Name,
+			f.Name, declared)
+		is.suggestion = "Use measure=additive, semi_additive (with over=<dimension>) or " +
+			"non_additive (§8.3)."
+	case class == "semi_additive" && !f.Annotations.Has("over"):
+		is.measured = fmt.Sprintf("%s.%s is semi-additive but does not say over which "+
+			"dimension it must not be summed", e.Name, f.Name)
+		is.suggestion = "Add over=time (or the dimension it must not be summed across) (§8.3)."
+	case class != guess && measureLexicon(f.Name) != "":
+		is.level = SeverityNote
+		is.measured = fmt.Sprintf("%s.%s declares measure=%s, but its name suggests %s",
+			e.Name, f.Name, class, guess)
+		is.suggestion = "Confirm the class; waive this finding if the declaration is right " +
+			"(§8.3)."
+	default:
+		return issue{}, false
+	}
+	return is, true
+}
+
+// measureCandidate reports whether f is a number that is a quantity rather
+// than a key, a reference or a code.
+func measureCandidate(e *Entity, f *Field) bool {
+	return isNumeric(f.Type) && !isKeyOrRef(e, f.Name) &&
+		!strings.HasSuffix(strings.ToLower(f.Name), "_id") && len(f.Enum) == 0 && !hasEnum(e, f)
+}
+
+// measureGuess proposes a class from a field's name, additive when the
+// lexicon has no opinion.
+func measureGuess(name string) string {
+	if g := measureLexicon(name); g != "" {
+		return g
+	}
+	return "additive"
+}
+
+// measureLexicon is §8.3-A's English lexicon: a class for a name word, or ""
+// when no word decides.
+func measureLexicon(name string) string {
+	for _, w := range splitWords(name) {
+		switch w {
+		case "balance", "inventory", "stock", "level", "headcount", "outstanding":
+			return "semi_additive"
+		case "rate", "ratio", "pct", "percent", "avg", "mean", "median", "margin", "score",
+			"price", "p50", "p90", "p95", "p99":
+			return "non_additive"
+		case "amount", "revenue", "qty", "count", "cost", "fee":
+			return "additive"
+		}
+	}
+	if strings.Contains(strings.ToLower(name), "on_hand") {
+		return "semi_additive"
+	}
+	return ""
+}
+
+func overHint(class string) string {
+	if class == "semi_additive" {
+		return " over=time"
+	}
+	return ""
 }

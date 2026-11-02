@@ -342,7 +342,7 @@ func TestWriteDesigns(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			r := m.Analyze(m.Input{Sources: []m.Source{{
+			r := m.Analyze(&m.Input{Sources: []m.Source{{
 				Entities: writeCatalog(), Queries: tc.queries,
 			}}})
 			var got []string
@@ -363,7 +363,7 @@ func TestWriteDesigns(t *testing.T) {
 // truncated timestamp cites: the first one that truncates to the unit kept.
 func TestTruncatedColumnNamesTheWrite(t *testing.T) {
 	t.Parallel()
-	r := m.Analyze(m.Input{Sources: []m.Source{{
+	r := m.Analyze(&m.Input{Sources: []m.Source{{
 		Entities: writeCatalog(),
 		Queries: []m.Query{
 			insert("clicks", "clicked_at", 5, truncTo("hour")),

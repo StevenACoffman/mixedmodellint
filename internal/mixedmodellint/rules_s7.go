@@ -2,8 +2,19 @@ package mixedmodellint
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
+
+// removal is evidence that a relation's atomic rows go away: name is the
+// relation, entity what is known of it (nil when only its name is), how the
+// removal happens, and where.
+type removal struct {
+	name   string
+	entity *Entity
+	how    string
+	pos    Position
+}
 
 // section7Designs are the grain designs of rule_plan.md §7 that read only the
 // IR. The query-corpus designs are in rules_s7_query.go.
@@ -16,13 +27,23 @@ func section7Designs() []design {
 			id:       "7.4-B",
 			title:    "Mixed-grain discriminator contract",
 			strength: Should,
-			check:    check74B,
+			// The structural half reads the entity; the query half, every
+			// aggregate over it (rule_plan.md §7.4-B describes both).
+			check: func(c *catalog) []issue { return append(check74B(c), check74BQuery(c)...) },
 		},
 		// rule_plan.md: same-name-and-type alone reports at warning (M5), so
 		// it is not demoted as a heuristic.
 		{
+			id: "7.4-A", title: "Coarser-grain column prefix detector", strength: Should,
+			heuristic: true, check: check74A,
+		},
+		{
 			id: "7.4-C", title: "Functional dependency across linked entities",
 			strength: Should, check: check74C,
+		},
+		{
+			id: "7.5-B", title: "Drop or truncate after aggregation", strength: Should,
+			check: check75B,
 		},
 		{
 			id: "7.5-C", title: "Pre-aggregated ingestion", strength: Should,
@@ -452,4 +473,233 @@ func quoteList(items []string) string {
 		q[i] = fmt.Sprintf("%q", s)
 	}
 	return strings.Join(q, ", ")
+}
+
+// check75B reports atomic data removed while an aggregate still summarizes
+// it (rule_plan.md §7.5-B), unless the data declares a valid
+// recoverable_from.
+func check75B(c *catalog) []issue {
+	var out []issue
+	for _, r := range c.removals() {
+		aggs := c.dependentAggregates(r.name)
+		if len(aggs) == 0 || c.recoverable(r) {
+			continue
+		}
+		is := issue{
+			entity: r.entity, pos: r.pos,
+			measured: fmt.Sprintf("%s %s while %s summarizes it, so the aggregate can no "+
+				"longer be drilled into or re-cut", r.how, r.name, strings.Join(aggs, ", ")),
+			suggestion: fmt.Sprintf("Archive %s to cold storage instead, or, if an upstream "+
+				"system still holds the same events, declare recoverable_from: <upstream> on it "+
+				"(in mml.yaml for a dropped table) and keep its keys on %s (§7.5).", r.name,
+				strings.Join(aggs, ", ")),
+		}
+		out = append(out, is)
+	}
+	return out
+}
+
+// removals returns every way the change removes atomic rows: an entity in
+// the previous model that is gone, a DROP TABLE or TRUNCATE, and a retention
+// DELETE, one that filters an event entity on a temporal column.
+func (c *catalog) removals() []removal {
+	var out []removal
+	current := map[string]bool{}
+	for _, e := range c.entities {
+		current[e.ID] = true
+	}
+	for _, e := range c.previous {
+		if !current[e.ID] {
+			out = append(out, removal{
+				name: e.Name, entity: e, how: "this change removes",
+				pos: Position{File: "mml.lock.json"},
+			})
+		}
+	}
+	for i := range c.queries {
+		if r, ok := c.queryRemoval(&c.queries[i]); ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// queryRemoval returns the removal a statement makes, if any.
+func (c *catalog) queryRemoval(q *Query) (removal, bool) {
+	e := c.lookup(q.Target, SourceSQL)
+	r := removal{name: lastPart(q.Target), entity: e, pos: q.Pos}
+	switch {
+	case q.Kind == QueryDrop:
+		r.how = "a DROP TABLE removes"
+	case q.Kind == QueryTruncate:
+		r.how = "a TRUNCATE empties"
+	case q.Kind == QueryDelete && e != nil && isEventEntity(e) && filtersTemporal(e, q):
+		r.how, r.name = "a retention DELETE removes rows of", e.Name
+	default:
+		return removal{}, false
+	}
+	return r, true
+}
+
+func isEventEntity(e *Entity) bool {
+	layer, _ := e.Annotations.Get("layer")
+	return layer == "event" || strings.HasSuffix(strings.ToLower(e.Name), "_events")
+}
+
+func filtersTemporal(e *Entity, q *Query) bool {
+	for _, f := range q.Filters {
+		if fld, ok := e.Field(f.Column); ok && isTemporal(fld.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+// dependentAggregates names the views in the corpus that aggregate or group
+// over the relation called name.
+func (c *catalog) dependentAggregates(name string) []string {
+	var out []string
+	for i := range c.queries {
+		q := &c.queries[i]
+		if q.Kind != QueryCreateView || (len(q.Aggregates) == 0 && len(q.GroupBy) == 0) {
+			continue
+		}
+		for _, r := range q.Relations {
+			if !r.Derived && Canonical(lastPart(r.Name)) == Canonical(name) &&
+				!slices.Contains(out, q.Target) {
+				out = append(out, q.Target)
+			}
+		}
+	}
+	return out
+}
+
+// recoverable reports whether the removed data declares recoverable_from=
+// naming an entity that can supply it again: one the team does not own
+// (source legacy or third_party) with the same grain key.
+func (c *catalog) recoverable(r removal) bool {
+	upName, ok := c.removedAnnotations(r).Get("recoverable_from")
+	if !ok {
+		return false
+	}
+	up := c.lookup(upName, SourceSQL)
+	if up == nil {
+		return false
+	}
+	src, _ := up.Annotations.Get("source")
+	if src != "legacy" && src != "third_party" {
+		return false
+	}
+	if r.entity == nil || len(r.entity.Fields) == 0 {
+		return true // nothing known of the removed shape to compare keys with
+	}
+	return sameColumns(c.grainKey(up), c.grainKey(r.entity))
+}
+
+// removedAnnotations returns what the removed data declares: its own
+// annotations, with mml.yaml's for any key it does not declare inline, since
+// a dropped table can only declare anything there.
+func (c *catalog) removedAnnotations(r removal) Annotations {
+	anns := Annotations{}
+	if r.entity != nil {
+		anns = r.entity.Annotations
+	}
+	se, ok := sidecarFor(c.sidecar, &Entity{ID: "sql:" + r.name, Name: r.name})
+	if !ok {
+		return anns
+	}
+	for k, v := range se.Annotations {
+		if _, inline := anns[k]; !inline {
+			anns = mergedWith(anns, k, v)
+		}
+	}
+	return anns
+}
+
+// mergedWith returns a copy of a with k set to v.
+func mergedWith(a Annotations, k string, v Annotation) Annotations {
+	out := make(Annotations, len(a)+1)
+	for key, val := range a {
+		out[key] = val
+	}
+	out[k] = v
+	return out
+}
+
+// check74A reports child fields named after an ancestor, which describe the
+// ancestor rather than the child (rule_plan.md §7.4-A). A name is a guess,
+// so a finding is a note, raised to a warning when a second, independent
+// signal agrees on the field (M5): the ancestor has a field of that name and
+// type (§7.4-C), or a write copies it from the ancestor (§7.4-D).
+func check74A(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		ancestors := c.ancestors(e)
+		for i := range e.Fields {
+			f := &e.Fields[i]
+			if isKeyOrRef(e, f.Name) || f.Annotations.Has("denormalized_for") {
+				continue
+			}
+			if is, ok := c.ancestorNamed(e, f, ancestors); ok {
+				out = append(out, is)
+			}
+		}
+	}
+	return out
+}
+
+// ancestorNamed reports f when its name starts with an ancestor's name
+// (order_shipping_fee on order_lines), or, more weakly, says it describes
+// something wider than the row (lifetime, header, overall).
+func (c *catalog) ancestorNamed(e *Entity, f *Field, ancestors []*Entity) (issue, bool) {
+	name := strings.ToLower(f.Name)
+	if strings.HasPrefix(name, e.Canonical+"_") || name == "total" {
+		return issue{}, false // the child's own total, or one named after itself
+	}
+	for _, a := range ancestors {
+		if strings.HasPrefix(name, a.Canonical+"_") || strings.HasPrefix(name, a.Canonical+"s_") {
+			is := issue{
+				level: SeverityNote, entity: e, field: f.Name, pos: f.Pos,
+				measured: fmt.Sprintf("%s.%s is named after %s, a coarser grain, so it repeats "+
+					"on every %s row and inflates sums", e.Name, f.Name, a.Name, e.Canonical),
+				suggestion: fmt.Sprintf("Move %s to %s, or mark it measure=non_additive and "+
+					"declare denormalized_for=<reason> (§7.4).", f.Name, a.Name),
+			}
+			if why := c.secondSignal(e, f, a); why != "" {
+				is.level = SeverityWarning
+				is.measured += "; " + why
+			}
+			return is, true
+		}
+	}
+	if c.rx.widerToken.MatchString(name) && len(ancestors) > 0 {
+		return issue{
+			level: SeverityNote, entity: e, field: f.Name, pos: f.Pos,
+			measured: fmt.Sprintf("%s.%s is named as a value of something wider than one %s row",
+				e.Name, f.Name, e.Canonical),
+			suggestion: fmt.Sprintf("Store %s on the entity it describes, or declare "+
+				"denormalized_for=<reason> (§7.4).", f.Name),
+		}, true
+	}
+	return issue{}, false
+}
+
+// secondSignal says how an independent signal confirms that f depends on
+// ancestor a, or "": a has a field of the same name and type (§7.4-C), or a
+// write copies one of a's fields into f (§7.4-D).
+func (c *catalog) secondSignal(e *Entity, f *Field, a *Entity) string {
+	if af, ok := a.Field(f.Name); ok && af.Type == f.Type {
+		return a.Name + " has the same field, so it repeats that value"
+	}
+	for _, w := range c.writes() {
+		if w.entity != e || w.field != f {
+			continue
+		}
+		for _, cp := range c.ancestorCopies(w) {
+			if cp.parent == a {
+				return fmt.Sprintf("a write copies %s.%s into it (%s)", a.Name, cp.field, cp.at)
+			}
+		}
+	}
+	return ""
 }

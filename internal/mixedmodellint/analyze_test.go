@@ -17,14 +17,27 @@ func ann(kv ...string) m.Annotations {
 	return a
 }
 
+// contractDesigns are designs that ask every entity in scope to declare
+// something (an owner, what NULL means, a measure class). They fire on almost
+// any fixture, so designsFor leaves them out and each is tested in its own
+// table, where its fixtures are built for it.
+func contractDesigns() []string {
+	return []string{
+		"1.2-A", "1.13-A", "3.1-A", "4.1-A", "4.2-A", "4.6-A", "5.3-A", "6.1-A", "6.2-A",
+		"6.2-B", "8.2-A", "8.3-A", "9.1-A", "9.4-A", "9.4-B",
+	}
+}
+
 // designsFor runs Analyze over entities and returns the design IDs reported,
-// sorted, with each ID once.
+// sorted, with each ID once, leaving out the contract designs.
 func designsFor(entities ...m.Entity) []string {
-	r := m.Analyze(m.Input{Sources: []m.Source{{Entities: entities}}})
+	r := m.Analyze(&m.Input{Sources: []m.Source{{Entities: entities}}})
 	var ids []string
 	for i := range r.Findings {
 		f := &r.Findings[i]
-		ids = append(ids, f.Design)
+		if !slices.Contains(contractDesigns(), f.Design) {
+			ids = append(ids, f.Design)
+		}
 	}
 	slices.Sort(ids)
 	return slices.Compact(ids)
@@ -203,7 +216,7 @@ func TestDesigns(t *testing.T) {
 					{Name: "customer_email", Type: m.TypeString},
 				},
 			}},
-			want: []string{"7.4-C"},
+			want: []string{"3.2-A", "7.4-C"},
 		},
 		"7.5-C events stored as daily counts": {
 			entities: []m.Entity{{
@@ -273,7 +286,7 @@ func TestDesigns(t *testing.T) {
 					{Name: "avg_order_value", Type: m.TypeDecimal},
 				},
 			}},
-			want: []string{"8.4-A"},
+			want: []string{"5.1-A", "8.4-A"},
 		},
 		"8.4-A components present": {
 			entities: []m.Entity{{
@@ -326,11 +339,12 @@ func TestSeverityFollowsStrength(t *testing.T) {
 			{Name: "amount", Type: m.TypeInt},
 		},
 	}
-	r := m.Analyze(m.Input{Sources: []m.Source{{Entities: []m.Entity{e}}}})
+	r := m.Analyze(&m.Input{Sources: []m.Source{{Entities: []m.Entity{e}}}})
 	got := map[string]string{}
 	for i := range r.Findings {
-		f := &r.Findings[i]
-		got[f.Field] = f.Severity.String()
+		if f := &r.Findings[i]; f.Design == "5.1-A" {
+			got[f.Field] = f.Severity.String()
+		}
 	}
 	cases := map[string]struct{ field, want string }{
 		"ambiguous type word is an error": {"date", "error"},
@@ -404,10 +418,9 @@ func TestWaiversAndBaseline(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			r := m.Analyze(m.Input{Sources: []m.Source{{Entities: []m.Entity{tc.entity}}}})
+			r := m.Analyze(&m.Input{Sources: []m.Source{{Entities: []m.Entity{tc.entity}}}})
 			var ids []string
-			for i := range r.Findings {
-				f := &r.Findings[i]
+			for _, f := range withoutContracts(r.Findings) {
 				ids = append(ids, f.Design)
 			}
 			slices.Sort(ids)
@@ -425,13 +438,13 @@ func TestBaselineRoundTrip(t *testing.T) {
 		Fields:     []m.Field{{Name: "cart_id", Type: m.TypeInt}},
 	}
 	in := m.Input{Sources: []m.Source{{Entities: []m.Entity{e}}}}
-	first := m.Analyze(in)
+	first := m.Analyze(&in)
 	var buf strings.Builder
 	ok(t, m.WriteBaseline(&buf, first))
 	b, err := m.ReadBaseline(strings.NewReader(buf.String()))
 	ok(t, err)
 	in.Baseline = b
-	second := m.Analyze(in)
+	second := m.Analyze(&in)
 	equals(t, 0, len(second.Findings))
 	equals(t, len(first.Findings), second.Baselined)
 }
@@ -445,9 +458,10 @@ func TestSidecarConflict(t *testing.T) {
 			"orders": {Annotations: ann("grain", "one row per order line", "owner", "team-orders")},
 		}},
 	}
-	r := m.Analyze(in)
-	equals(t, 1, len(r.Findings))
-	equals(t, "mml/annotation-conflict", r.Findings[0].Design)
+	r := m.Analyze(&in)
+	found := withoutContracts(r.Findings)
+	equals(t, 1, len(found))
+	equals(t, "mml/annotation-conflict", found[0].Design)
 	// The sidecar's owner was merged in, and the input was not modified.
 	_, hasOwner := e.Annotations.Get("owner")
 	equals(t, false, hasOwner)

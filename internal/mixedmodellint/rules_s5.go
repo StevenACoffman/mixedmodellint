@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // siblingGroup is one family of numbered columns: phone1, phone2, phone3.
@@ -17,6 +18,7 @@ type siblingGroup struct {
 
 func section5Designs() []design {
 	return []design{
+		{id: "5.3-A", title: "Null-meaning contract", strength: Must, check: check53A},
 		{
 			id:       "5.1-A",
 			title:    "Reserved-word and bare-type lexicon",
@@ -43,7 +45,7 @@ func check51A(c *catalog) []issue {
 		categorical := countCategorical(e)
 		for i := range e.Fields {
 			f := &e.Fields[i]
-			if is, ok := nameIssue(e, f, categorical); ok {
+			if is, ok := nameIssue(c.rx, e, f, categorical); ok {
 				out = append(out, is)
 			}
 		}
@@ -55,13 +57,16 @@ func check51A(c *catalog) []issue {
 // ambiguous type words are errors, generic names warnings, and a weakly
 // ambiguous "type" or "kind" a note, raised to a warning when the entity has
 // two or more categorical fields that a bare "type" cannot tell apart.
-func nameIssue(e *Entity, f *Field, categorical int) (issue, bool) {
+func nameIssue(rx *lexicon, e *Entity, f *Field, categorical int) (issue, bool) {
 	name := strings.ToLower(f.Name)
 	base := issue{entity: e, field: f.Name, pos: f.Pos}
 	var reason string
-	switch classifyName(name) {
+	switch rx.classifyName(name) {
 	case nameReserved:
-		base.level, reason = SeverityError, "a reserved word in PostgreSQL 17, so every query must quote it"
+		base.level, reason = SeverityError, "a reserved word in PostgreSQL, so every query must quote it"
+	case nameSQLReserved:
+		base.level, reason = SeverityWarning,
+			"a reserved word in SQL:2016, so portable SQL and other databases must quote it"
 	case nameAmbiguousType:
 		base.level, reason = SeverityError, "a bare type word that does not say which event or value it holds"
 	case nameGeneric:
@@ -193,4 +198,102 @@ func fixedArrays(e *Entity) []issue {
 		})
 	}
 	return out
+}
+
+// nullMeanings are the values null= may take (rule_plan.md §5.3-A).
+func nullMeanings() []string {
+	return []string{"missing", "unknown", "not_applicable", "zero", "forbidden"}
+}
+
+func check53A(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		if e.Kind == KindView {
+			continue
+		}
+		for i := range e.Fields {
+			f := &e.Fields[i]
+			if is, ok := nullMeaningIssue(e, f); ok {
+				out = append(out, is)
+			}
+		}
+	}
+	return out
+}
+
+// nullMeaningIssue applies §5.3-A to one field: a nullable field must say
+// what NULL means, not_applicable must name the discriminator that decides
+// it, and the declaration must not contradict the structure.
+func nullMeaningIssue(e *Entity, f *Field) (issue, bool) {
+	if containsFold(e.PrimaryKey, f.Name) {
+		return issue{}, false
+	}
+	meaning, declared := f.Annotations.Get("null")
+	is := issue{entity: e, field: f.Name, pos: f.Pos}
+	switch {
+	case !declared && f.Nullable:
+		is.measured = fmt.Sprintf("%s.%s is nullable but does not say what NULL means", e.Name,
+			f.Name)
+	case !declared:
+		return issue{}, false
+	case !slices.Contains(nullMeanings(), meaning):
+		is.measured = fmt.Sprintf("%s.%s declares null=%s, which is not a meaning", e.Name,
+			f.Name, meaning)
+	case meaning == "forbidden" && f.Nullable:
+		is.measured = fmt.Sprintf("%s.%s declares null=forbidden but allows NULL", e.Name, f.Name)
+	case meaning == "not_applicable":
+		return notApplicableIssue(e, f)
+	default:
+		return issue{}, false
+	}
+	is.suggestion = nullHint(e, f)
+	return is, true
+}
+
+// notApplicableIssue checks that null=not_applicable names, in null_when=,
+// a field of e that decides when the value does not apply.
+func notApplicableIssue(e *Entity, f *Field) (issue, bool) {
+	when, ok := f.Annotations.Get("null_when")
+	if ok {
+		if _, exists := e.Field(predicateField(when)); exists {
+			return issue{}, false
+		}
+	}
+	return issue{
+		entity: e, field: f.Name, pos: f.Pos,
+		measured: fmt.Sprintf("%s.%s is null when not applicable, but null_when does not name "+
+			"a field of %s", e.Name, f.Name, e.Name),
+		suggestion: fmt.Sprintf("Add null_when: <predicate> naming the field that decides it, "+
+			"for example %s (§5.3).", discriminatorHint(e)),
+	}, true
+}
+
+// predicateField returns the field a predicate such as "order_type =
+// 'digital'" tests: its first identifier.
+func predicateField(pred string) string {
+	end := strings.IndexFunc(pred, func(r rune) bool {
+		return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	if end < 0 {
+		return pred
+	}
+	return pred[:end]
+}
+
+func nullHint(e *Entity, f *Field) string {
+	return fmt.Sprintf("Declare null=missing|unknown|not_applicable|zero on %s; for "+
+		"not_applicable also null_when naming the discriminator (e.g. %s). If NULL should "+
+		"never happen, make it NOT NULL (§5.3).", f.Name, discriminatorHint(e))
+}
+
+// discriminatorHint proposes a predicate on a field named like a type or
+// kind, or a placeholder.
+func discriminatorHint(e *Entity) string {
+	for i := range e.Fields {
+		ws := splitWords(e.Fields[i].Name)
+		if len(ws) > 0 && (ws[len(ws)-1] == "type" || ws[len(ws)-1] == "kind") {
+			return e.Fields[i].Name + " = '<value>'"
+		}
+	}
+	return "<field> = '<value>'"
 }
