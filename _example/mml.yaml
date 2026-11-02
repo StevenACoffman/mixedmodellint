@@ -1,4 +1,59 @@
 entities:
-  orders:
-    owner: team-orders
-    definition: A customer's request to buy one or more products.
+  customer:
+    definition: A person or business that signed up and may place orders with us.
+    owner: team:accounts
+    escalation: role:head-of-commerce
+  order:
+    definition: A customer's request to buy one or more products, placed at checkout and paid together.
+    owner: team:orders
+    escalation: role:head-of-commerce
+  order_line:
+    definition: One product and quantity within an order, priced when the order was placed.
+    owner: team:orders
+    escalation: role:head-of-commerce
+    fields:
+      unit_price_usd:
+        measure: non_additive
+        captured_at_transaction: "true"
+      quantity:
+        measure: additive
+  daily_product_sale:
+    definition: Units and revenue of one product summed over the orders placed on one calendar day.
+    owner: team:analytics
+    escalation: role:head-of-data
+    fields:
+      units_sold:
+        measure: additive
+      revenue_usd_sum:
+        measure: additive
+      order_line_count:
+        measure: additive
+  order_placed:
+    definition: The event published once, when a customer's order is accepted at checkout.
+    owner: team:orders
+    escalation: role:head-of-commerce
+    fields:
+      order_id:
+        ref: orders
+      placed_at:
+        denormalized_for: "other: the event carries the time so consumers need no lookup"
+
+owners:
+  team:accounts:
+    model: [customer*]
+    responsibilities: [definitions, data_quality, change_approval]
+    decisions:
+      - {name: approve_breaking_change, without_signoff: true}
+    granted_by: role:vp-engineering
+  team:orders:
+    model: [order*]
+    responsibilities: [definitions, data_quality, change_approval]
+    decisions:
+      - {name: approve_breaking_change, without_signoff: true}
+    granted_by: role:vp-engineering
+  team:analytics:
+    model: [daily_*]
+    responsibilities: [definitions, data_quality]
+    decisions:
+      - {name: change_definition, without_signoff: true}
+    granted_by: role:head-of-data

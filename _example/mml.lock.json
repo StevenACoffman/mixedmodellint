@@ -1,0 +1,195 @@
+{
+  "version": 1,
+  "entities": [
+    {
+      "id": "go:example.com/mmlexample/model.Customer",
+      "name": "Customer",
+      "kind": "struct",
+      "source": "go",
+      "fingerprint": "aa614e84a7d0",
+      "fields": [
+        {
+          "name": "customer_id",
+          "type": "int"
+        },
+        {
+          "name": "email",
+          "type": "string"
+        },
+        {
+          "name": "signed_up_at",
+          "type": "timestamptz"
+        }
+      ],
+      "primary_key": [
+        "customer_id"
+      ]
+    },
+    {
+      "id": "json:schemas/order_placed.schema.json#",
+      "name": "OrderPlaced",
+      "kind": "schema",
+      "source": "jsonschema",
+      "fingerprint": "ab3e23c134d3",
+      "fields": [
+        {
+          "name": "event_id",
+          "type": "uuid"
+        },
+        {
+          "name": "order_id",
+          "type": "int"
+        },
+        {
+          "name": "placed_at",
+          "type": "timestamptz"
+        }
+      ],
+      "primary_key": [
+        "event_id"
+      ],
+      "refs": [
+        {
+          "fields": [
+            "order_id"
+          ],
+          "target": "orders"
+        }
+      ]
+    },
+    {
+      "id": "sql:customers",
+      "name": "customers",
+      "kind": "table",
+      "source": "sql",
+      "fingerprint": "aa614e84a7d0",
+      "fields": [
+        {
+          "name": "customer_id",
+          "type": "int"
+        },
+        {
+          "name": "email",
+          "type": "string"
+        },
+        {
+          "name": "signed_up_at",
+          "type": "timestamptz"
+        }
+      ],
+      "primary_key": [
+        "customer_id"
+      ]
+    },
+    {
+      "id": "sql:daily_product_sales",
+      "name": "daily_product_sales",
+      "kind": "table",
+      "source": "sql",
+      "fingerprint": "ab0a8d0ae503",
+      "fields": [
+        {
+          "name": "product_id",
+          "type": "int"
+        },
+        {
+          "name": "sale_date",
+          "type": "date"
+        },
+        {
+          "name": "units_sold",
+          "type": "int"
+        },
+        {
+          "name": "revenue_usd_sum",
+          "type": "decimal"
+        },
+        {
+          "name": "order_line_count",
+          "type": "int"
+        }
+      ],
+      "primary_key": [
+        "product_id",
+        "sale_date"
+      ]
+    },
+    {
+      "id": "sql:order_lines",
+      "name": "order_lines",
+      "kind": "table",
+      "source": "sql",
+      "fingerprint": "a8de5afc37dd",
+      "fields": [
+        {
+          "name": "order_id",
+          "type": "int"
+        },
+        {
+          "name": "line_no",
+          "type": "int"
+        },
+        {
+          "name": "product_id",
+          "type": "int"
+        },
+        {
+          "name": "unit_price_usd",
+          "type": "decimal"
+        },
+        {
+          "name": "quantity",
+          "type": "int"
+        }
+      ],
+      "primary_key": [
+        "order_id",
+        "line_no"
+      ],
+      "refs": [
+        {
+          "fields": [
+            "order_id"
+          ],
+          "target": "orders"
+        }
+      ]
+    },
+    {
+      "id": "sql:orders",
+      "name": "orders",
+      "kind": "table",
+      "source": "sql",
+      "fingerprint": "fe191bbb2b88",
+      "fields": [
+        {
+          "name": "order_id",
+          "type": "int"
+        },
+        {
+          "name": "customer_id",
+          "type": "int"
+        },
+        {
+          "name": "placed_at",
+          "type": "timestamptz"
+        },
+        {
+          "name": "status",
+          "type": "string"
+        }
+      ],
+      "primary_key": [
+        "order_id"
+      ],
+      "refs": [
+        {
+          "fields": [
+            "customer_id"
+          ],
+          "target": "customers"
+        }
+      ]
+    }
+  ]
+}

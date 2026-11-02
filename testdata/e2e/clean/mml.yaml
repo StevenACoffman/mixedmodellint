@@ -1,0 +1,7 @@
+owners:
+  team:orders:
+    model: [orders]
+    responsibilities: [definitions, data_quality, change_approval]
+    decisions:
+      - {name: approve_breaking_change, without_signoff: true}
+    granted_by: role:vp-data
