@@ -136,20 +136,30 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | ------- | ------------------------------------------------------------------------------------------------------- |
 | 1.1-B   | A table, struct or schema new since the lock or base without a logical-model record or ADR              |
 | 1.2-A   | Every core entity declares a substantial definition, an owner and an escalation; a stale `fp=`          |
+| 1.2-C   | CODEOWNERS routes each entity's defining file to its declared owner (last match wins)                   |
 | 1.13-A  | Each owner has an ownership record with responsibilities and a decision it can make alone               |
+| 1.5-D   | Every join in the query corpus follows a reference, or a shared dimension, between its two sides        |
+| 1.6-B   | Three or more thin lookup tables in a chain (`address → city → state → country`)                        |
+| 1.7-A   | A scratch-named or scratch-schema model that a durable view, query or table depends on                  |
 | 3.1-A   | A life-cycle state that needs history has an event entity, versions or a declared stream                |
 | 3.2-A   | An operational copy of a referenced entity's field states its reason                                    |
 | 3.4-A   | Master and reference data rejects bad records: required, quantity, unit and hierarchy checks            |
 | 4.1-A   | Every entity has a primary key, and no key is a mutable value or a bare time                            |
+| 4.1-B   | Every Go and JSON Schema form of an entity carries its key, required and of a compatible type           |
 | 4.2-A   | An entity fed by several systems declares its identity resolution and its owner                         |
 | 4.3-A   | A key renamed since the lock, or rewritten by an UPDATE, without an identity map                        |
 | 4.6-A   | Entities cut out of a file are keyed by source ID and location                                          |
+| 4.6-B   | An entity referencing a declared file entity declares `location=` and keys on it with the reference     |
 | 5.1-A   | PostgreSQL and SQL:2016 reserved words, bare type words, generic and weakly ambiguous names             |
+| 5.1-B   | Date and time columns are named `<event>_at\|on\|date\|time\|ts` after an event word                    |
 | 5.3-A   | Every nullable field says what NULL means                                                               |
+| 5.3-B   | `AVG`/`SUM`/`MIN`/`MAX`/`COUNT` of a column whose NULL means zero, or whose NULL is undeclared          |
+| 5.3-C   | Linked Go, SQL and JSON Schema fields agree on whether they may be NULL                                 |
 | 5.5-A   | Numbered sibling columns (`phone1`…`phone3`) and fixed-size Go arrays                                   |
 | 6.1-A   | Arrays of references instead of a junction table                                                        |
 | 6.2-A   | A column named like a reference with no foreign key or `ref=` declaration                               |
 | 6.2-B   | A nullable reference whose cardinality is mandatory or undeclared                                       |
+| 6.2-C   | A reference declared in one form is a foreign key, and as required, in the others                       |
 | 7.1-A   | Every entity has a well-formed grain statement whose nouns resolve; a stale `fp=` is reported (M1)      |
 | 7.1-B   | The declared grain matches a primary or unique key                                                      |
 | 7.1-C   | Upsert keys in the query corpus match the declared grain                                                |
@@ -166,9 +176,17 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 7.5-D   | Queries asking for a finer unit than a column holds: by its type, its writes or the grain               |
 | 8.2-A   | A junction between a measure-bearing entity and another declares its `m2m` policy                       |
 | 8.3-A   | Every measure declares its additivity class                                                             |
+| 8.3-B   | `SUM` of a semi-additive measure across the dimension it is semi-additive over                          |
 | 8.4-A   | Stored ratios and averages at a coarse grain without their additive components or a sketch              |
+| 8.4-B   | `SUM` or `AVG` of a stored average, ratio or distinct count                                             |
+| 8.5-B   | Stored aggregates key on a period and declare `dimensions=` naming key columns                          |
+| 8.6-A   | Window outputs declare `window=`, `lateness=`, `late_policy=`; sliding windows have no additive measure |
 | 9.1-A   | Event, ingestion and processing time are told apart                                                     |
+| 9.1-B   | Aggregations bucketed or filtered by load or processing time while event time exists                    |
+| 9.1-C   | Event time a Go or JSON Schema form carries is stored by the SQL form                                   |
 | 9.2-A   | Naive timestamps, and dates or times stored as strings or undeclared integers                           |
+| 9.2-B   | Local times have a time-zone field constrained to IANA zone names                                       |
+| 9.3-B   | Interval end fields declare `end=` and, when nullable, `null=open`; both ends share a type              |
 | 9.4-A   | File entities record creation and ingestion times and a dedup basis                                     |
 | 9.4-B   | File entities are not deduplicated by file name                                                         |
 | 9.8-A   | Event time stored with less precision than its source provides                                          |
@@ -212,6 +230,31 @@ The heavy lifting is done by libraries focused on each job:
   told from the files.
 - **3.4-A** checks SQL entities only: Go `validate` tags and JSON Schema
   bounds are not read yet.
+- **5.1-B** reads a hand-curated `lexicon/event_verbs.txt` rather than
+  WordNet's participles, accepts any word ending in `-ed`, extends the
+  default event nouns (`sale`, `booking`, `session` and others), and lets
+  period bounds (`period_start`, `valid_to`) pass, since 8.5-B and 9.3-B ask
+  for those names. A name that 5.1-A already reports is left to it.
+- **5.3-B** checks aggregates only; arithmetic on a nullable operand needs
+  expressions the query model does not keep.
+- **1.5-D** also sanctions references inferred from a name (6.2-A reports
+  them as undeclared) and joins through a shared dimension. It does not read
+  `model/conceptual.yaml` or `-- mml:join` comments, so a deliberate join on
+  other columns needs a `waive`.
+- **1.6-B** uses the default chain length of 3; the translation-table case
+  waits for a `locales` setting.
+- **1.2-C** matches `team:x` and `group:x` to any `@org/x` and skips `role:`
+  owners, since `mml.yaml` has no `owner_aliases` yet.
+- **4.1-B** leaves unlinked event and document schemas to 4.1-A, and treats
+  a UUID and a string as the same key type.
+- **6.2-C** asks only a SQL form to declare the foreign key itself; a Go or
+  JSON Schema form is asked only to be as required.
+- **8.3-B** counts any `WHERE` test of the dimension as pinning it, and does
+  not check window aggregates. **8.4-B** checks stored fields only, not CTE or
+  view outputs.
+- **9.1-C** compares event time only; it does not read Go tags that map an
+  event field onto an ingestion column.
+- **9.2-B** trusts a `local_` name only on a date or time field.
 - **`annotate`** prints stubs rather than editing files, and has no
   `--refresh` yet.
 - **`mml.lock.json`** does not record the seed rows of reference entities.
@@ -240,10 +283,11 @@ The layering is enforced by depguard in `.golangci.yaml`:
 
 - `internal/mixedmodellint` is the pure core. It never touches the filesystem,
   the clock or a parser.
-- The adapters, each named after the library it wraps (`internal/postgres`,
-  `internal/gopackages`, `internal/jsonschema`, `internal/sidecar` and
-  `internal/sarif`), turn sources into core values or core values into
-  output.
+- The adapters, each named after the library or tool it wraps
+  (`internal/postgres`, `internal/gopackages`, `internal/jsonschema`,
+  `internal/sidecar`, `internal/sarif` and `internal/git`), turn sources
+  into core values or core values into output. `internal/git` is the only
+  package that runs `git`.
 - `internal/lint` composes the adapters.
 - The commands (`cmd/check`, `cmd/lock`, `cmd/annotate`, `cmd/explain`)
   dispatch to `internal/lint` and the core.
