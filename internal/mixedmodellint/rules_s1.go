@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// maxLookupChain is §1.6-B's default for mml.yaml's max_lookup_chain: a
+// chain of this many thin lookups is over-normalized.
+const maxLookupChain = 3
+
 func section1Designs() []design {
 	return []design{
 		{id: "1.1-B", title: "New-table gate", strength: Must, check: check11B},
@@ -15,7 +19,14 @@ func section1Designs() []design {
 			id: "1.2-A", title: "Definition, owner and escalation contract", strength: Must,
 			check: check12A,
 		},
+		{id: "1.2-C", title: "CODEOWNERS consistency", strength: Must, check: check12C},
 		{id: "1.13-A", title: "Ownership-record contract", strength: Must, check: check113A},
+		{id: "1.5-D", title: "Query join-key conformance", strength: Must, check: check15D},
+		{id: "1.6-B", title: "Normalization-depth graph metric", strength: Must, check: check16B},
+		{
+			id: "1.7-A", title: "Scratch model with a dependent", strength: Must,
+			check: check17A,
+		},
 	}
 }
 
@@ -187,7 +198,7 @@ func (c *catalog) principalProblem(key, value string, has bool) string {
 	case !c.rx.principal.MatchString(value):
 		return fmt.Sprintf("%s %q is not a team, group, role or CODEOWNERS principal", key, value)
 	case strings.HasPrefix(value, "@") && c.artifacts.Codeowners != nil &&
-		!slices.Contains(c.artifacts.Codeowners, value):
+		!slices.Contains(c.artifacts.Codeowners.Principals(), value):
 		return fmt.Sprintf("%s %s is not in CODEOWNERS", key, value)
 	default:
 		return ""
@@ -341,4 +352,250 @@ func covers(glob string, e *Entity) bool {
 		}
 	}
 	return false
+}
+
+// check16B applies §1.6-B: an entity whose attributes sit at the end of a
+// chain of thin lookup tables (address → city → state → country) needs a
+// join per link to rebuild one record.
+//
+// Deviation: the plan's second case, a translation table while only one
+// locale is configured, needs the locales setting, which mml.yaml does not
+// have yet.
+func check16B(c *catalog) []issue {
+	thin := map[*Entity]bool{}
+	for _, e := range c.entities {
+		thin[e] = c.thinLookup(e)
+	}
+	var out []issue
+	for _, root := range c.entities {
+		if thin[root] {
+			continue
+		}
+		chain := c.longestThinChain(root, thin)
+		if len(chain) < maxLookupChain {
+			continue
+		}
+		names := make([]string, 0, len(chain))
+		for _, e := range chain {
+			names = append(names, e.Name)
+		}
+		out = append(out, issue{
+			entity: root,
+			measured: fmt.Sprintf("%s needs %d joins through the thin lookup tables %s to "+
+				"rebuild one record", root.Name, len(chain), strings.Join(names, " → ")),
+			suggestion: fmt.Sprintf("Fold %s into columns of %s until a requirement for "+
+				"them appears (§1.6).", strings.Join(names, ", "), root.Name),
+		})
+	}
+	return out
+}
+
+// thinLookup reports whether e is a lookup with almost nothing of its own:
+// at most two fields that are neither keys nor audit columns, referenced by
+// exactly one other entity. A shared taxonomy has many referrers, and a
+// self-referencing hierarchy is one table, so neither is thin.
+func (c *catalog) thinLookup(e *Entity) bool {
+	selfReferencing := slices.ContainsFunc(e.Refs, func(r Ref) bool {
+		return c.lookup(r.Target, e.Source) == e
+	})
+	if len(e.PrimaryKey) == 0 || selfReferencing || c.inbound(e) != 1 {
+		return false
+	}
+	attributes := 0
+	for i := range e.Fields {
+		name := strings.ToLower(e.Fields[i].Name)
+		inKey := slices.ContainsFunc(
+			e.Keys(),
+			func(k []string) bool { return containsFold(k, name) },
+		)
+		audit := name == "created_at" || name == "updated_at" || strings.HasSuffix(name, "_by")
+		if !inKey && !audit {
+			attributes++
+		}
+	}
+	return attributes <= 2
+}
+
+// longestThinChain returns the longest path of thin lookups that e
+// references, nearest first.
+//
+// Ensures: it terminates. A thin lookup has exactly one referrer, so no
+// cycle of references is reachable through thin lookups: the first one
+// reached on a cycle would have a second referrer, the last one on it.
+func (c *catalog) longestThinChain(e *Entity, thin map[*Entity]bool) []*Entity {
+	var best []*Entity
+	for _, p := range c.parents(e) {
+		if !thin[p] {
+			continue
+		}
+		if chain := append([]*Entity{p}, c.longestThinChain(p, thin)...); len(chain) > len(best) {
+			best = chain
+		}
+	}
+	return best
+}
+
+// check17A applies §1.7-A: a model that looks like a scratchpad (by its
+// lifecycle, schema or name) must not have a consumer that is not one too,
+// since then a one-off has become something others rely on.
+func check17A(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		reason := c.scratchReason(e)
+		if reason == "" {
+			continue
+		}
+		if consumer := c.durableConsumer(e); consumer != "" {
+			out = append(out, issue{
+				entity: e,
+				measured: fmt.Sprintf("%s looks like a scratchpad model (%s), but %s depends "+
+					"on it", e.Name, reason, consumer),
+				suggestion: fmt.Sprintf("Promote %s: rename it to the convention (for example "+
+					"fct_ or dim_), add an owner, column descriptions and tests, and declare "+
+					"lifecycle=recurring (§1.7).", e.Name),
+			})
+		}
+	}
+	return out
+}
+
+// scratchReason says why e is classified as scratch, or returns "".
+func (c *catalog) scratchReason(e *Entity) string {
+	switch life, declared := e.Annotations.Get("lifecycle"); {
+	case life == "scratch":
+		return "lifecycle=scratch"
+	case declared:
+		return "" // a declared lifecycle overrides the schema and name
+	}
+	if schema := schemaOf(e); schema == "sandbox" || schema == "scratch" || schema == "tmp" ||
+		strings.HasPrefix(schema, "dev_") {
+		return "it is in schema " + schema
+	}
+	if c.rx.scratchName.MatchString(lastPart(e.Name)) {
+		return "its name is a scratch pattern"
+	}
+	return ""
+}
+
+// schemaOf returns the SQL schema e is qualified with, or "".
+func schemaOf(e *Entity) string {
+	name := strings.TrimPrefix(e.ID, "sql:")
+	if e.Source != SourceSQL || !strings.Contains(name, ".") {
+		return ""
+	}
+	schema, _, _ := strings.Cut(name, ".")
+	return strings.ToLower(schema)
+}
+
+// durableConsumer names the first entity or query that depends on scratch
+// entity e and is not scratch itself, or returns "" when there is none.
+func (c *catalog) durableConsumer(e *Entity) string {
+	for _, o := range c.entities {
+		if o != e && slices.Contains(c.parents(o), e) && c.scratchReason(o) == "" {
+			return memberName(o)
+		}
+	}
+	return c.durableReader(e)
+}
+
+// durableReader names the first query reading e whose result is not
+// scratch: a view, or any other query whose target is not scratch. Writing
+// to e, dropping it or truncating it is not depending on it.
+func (c *catalog) durableReader(e *Entity) string {
+	for i := range c.queries {
+		q := &c.queries[i]
+		if !c.reads(q, e) {
+			continue
+		}
+		if target := c.lookup(q.Target, SourceSQL); target != nil && c.scratchReason(target) != "" {
+			continue
+		}
+		if q.Kind == QueryCreateView {
+			return "view " + q.Target
+		}
+		return "the query at " + q.Pos.String()
+	}
+	return ""
+}
+
+// reads reports whether q reads e through a FROM item.
+func (c *catalog) reads(q *Query, e *Entity) bool {
+	return slices.ContainsFunc(q.Relations, func(r Relation) bool {
+		return !r.Derived && c.lookup(r.Name, SourceSQL) == e
+	})
+}
+
+// check12C applies §1.2-C: CODEOWNERS must route reviews of an entity's
+// defining file to the owner the entity declares. Without CODEOWNERS there
+// is nothing to compare (1.13-A asks for ownership records instead), and an
+// entity without an owner is 1.2-A's.
+//
+// Deviation: mml.yaml has no owner_aliases yet, so team:x and group:x match
+// any @org/x; the plan's skip_shared_files setting is not read either.
+func check12C(c *catalog) []issue {
+	co := c.artifacts.Codeowners
+	if co == nil {
+		return nil
+	}
+	var out []issue
+	for _, e := range c.entities {
+		owner, ok := e.Annotations.Get("owner")
+		// A role has no CODEOWNERS form until owner_aliases maps it to one.
+		if !ok || e.Pos.File == "" || !c.rx.principal.MatchString(owner) ||
+			strings.HasPrefix(owner, "role:") {
+			continue
+		}
+		owners, covered := co.Owners(e.Pos.File)
+		if slices.ContainsFunc(owners, func(o string) bool { return ownerMatches(owner, o) }) {
+			continue
+		}
+		assigned := "no CODEOWNERS rule covers it"
+		if covered {
+			assigned = "CODEOWNERS assigns it to " + ownerList(owners)
+		}
+		out = append(out, issue{
+			entity: e, pos: e.Annotations["owner"].Pos,
+			measured: fmt.Sprintf("%s declares owner %s, but its file %s is not routed to "+
+				"them: %s", e.Name, owner, e.Pos.File, assigned),
+			suggestion: fmt.Sprintf("Add a CODEOWNERS rule assigning %s to %s, or correct the "+
+				"owner, so reviews of the schema reach the definition owner (§1.2).",
+				e.Pos.File, codeownerFor(owner, co)),
+		})
+	}
+	return out
+}
+
+// ownerMatches reports whether a declared owner, a CODEOWNERS principal or
+// a team:x or group:x name, is the CODEOWNERS principal p: the same
+// principal, or the @org/x team of a team or group.
+func ownerMatches(owner, p string) bool {
+	if strings.EqualFold(owner, p) {
+		return true
+	}
+	_, name, named := strings.Cut(owner, ":")
+	_, team, isTeam := strings.Cut(p, "/")
+	return named && isTeam && strings.EqualFold(team, name)
+}
+
+// codeownerFor writes a declared owner as a CODEOWNERS principal: a
+// team:x or group:x name as an @org/x team, taking the organization from the
+// first team co names.
+func codeownerFor(owner string, co *Codeowners) string {
+	_, name, named := strings.Cut(owner, ":")
+	if !named {
+		return owner
+	}
+	for _, p := range co.Principals() {
+		if org, _, isTeam := strings.Cut(p, "/"); isTeam {
+			return org + "/" + name
+		}
+	}
+	return "@<org>/" + name
+}
+
+func ownerList(owners []string) string {
+	if len(owners) == 0 {
+		return "no one (a rule with no owners)"
+	}
+	return strings.Join(owners, ", ")
 }

@@ -25,6 +25,14 @@ func section5Designs() []design {
 			strength: Must,
 			check:    check51A,
 		},
+		{id: "5.1-B", title: "Time-column event naming", strength: Must, check: check51B},
+		{
+			id: "5.3-B", title: "NULL-unsafe aggregation", strength: Must, check: check53B,
+		},
+		{
+			id: "5.3-C", title: "Cross-form nullability consistency", strength: Must,
+			check: check53C,
+		},
 		{id: "5.5-A", title: "Numbered-sibling detector", strength: Should, check: check55A},
 	}
 }
@@ -85,6 +93,83 @@ func nameIssue(rx *lexicon, e *Entity, f *Field, categorical int) (issue, bool) 
 	base.suggestion = fmt.Sprintf("Rename %s to say what it records, for example %s.",
 		f.Name, renameCandidates(e, name))
 	return base, true
+}
+
+// check51B applies §5.1-B: a date or time column's name must end in a time
+// suffix and say, before it, which event it records. A bare type word (date,
+// timestamp) is left to 5.1-A, which already reports it as an error, and a
+// field with a declared time= role names its event there.
+func check51B(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		if thirdParty(e) {
+			continue
+		}
+		for i := range e.Fields {
+			f := &e.Fields[i]
+			if (!isTemporal(f.Type) && f.Type != TypeTime) || f.Annotations.Has("time") ||
+				c.rx.classifyName(strings.ToLower(f.Name)) != nameOK {
+				continue
+			}
+			if problem := eventNameProblem(c.rx, f.Name); problem != "" {
+				out = append(out, issue{
+					entity: e, field: f.Name, pos: f.Pos,
+					measured: fmt.Sprintf("%s.%s is a %s but its name %s", e.Name, f.Name,
+						f.Type, problem),
+					suggestion: fmt.Sprintf("Rename %s to <event>_%s, for example %s, so "+
+						"the name says which event it records (§5.1).", f.Name,
+						timeSuffixFor(f.Type), eventNameCandidates(f.Type)),
+				})
+			}
+		}
+	}
+	return out
+}
+
+// eventNameProblem says how name falls short of §5.1-B, or returns "": its
+// last word must be at, on, date, time or ts, and a word before it an event
+// word, either listed in lexicon/event_verbs.txt or a regular past
+// participle ending in -ed. A bound of a named period (period_start,
+// valid_to) also passes: the period is what it records, and §8.5-B and
+// §9.3-B ask for exactly those names.
+func eventNameProblem(rx *lexicon, name string) string {
+	ws := splitWords(name)
+	last := ""
+	if len(ws) >= 2 {
+		last = ws[len(ws)-1]
+	}
+	switch last {
+	case "start", "end", "from", "to", "until":
+		return ""
+	case "at", "on", "date", "time", "ts":
+	default:
+		return "does not end in _at, _on, _date, _time or _ts after the event it records"
+	}
+	for _, w := range ws[:len(ws)-1] {
+		if rx.eventWords[w] || (len(w) > 3 && strings.HasSuffix(w, "ed")) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("does not say which event it records: %s is not an event word",
+		strings.Join(ws[:len(ws)-1], "_"))
+}
+
+// timeSuffixFor is the suffix §5.1-B suggests for a type: _at for an
+// instant, _on for a calendar date, _time for a time of day.
+func timeSuffixFor(t LogicalType) string {
+	switch t {
+	case TypeDate:
+		return "on"
+	case TypeTime:
+		return "time"
+	default:
+		return "at"
+	}
+}
+
+func eventNameCandidates(t LogicalType) string {
+	suffix := timeSuffixFor(t)
+	return fmt.Sprintf("created_%s, shipped_%s or expires_%s", suffix, suffix, suffix)
 }
 
 func renameCandidates(e *Entity, name string) string {
@@ -200,9 +285,11 @@ func fixedArrays(e *Entity) []issue {
 	return out
 }
 
-// nullMeanings are the values null= may take (rule_plan.md §5.3-A).
+// nullMeanings are the values null= may take (rule_plan.md §5.3-A), plus
+// open, which §9.3-B asks an interval's nullable end to declare: the
+// interval has not ended yet.
 func nullMeanings() []string {
-	return []string{"missing", "unknown", "not_applicable", "zero", "forbidden"}
+	return []string{"missing", "unknown", "not_applicable", "zero", "forbidden", "open"}
 }
 
 func check53A(c *catalog) []issue {
@@ -296,4 +383,57 @@ func discriminatorHint(e *Entity) string {
 		}
 	}
 	return "<field> = '<value>'"
+}
+
+// check53C applies §5.3-C: fields that link across sources must agree on
+// whether they may be NULL. The finding is on the member that rejects NULL,
+// where a NULL from the other breaks. Reference fields are §6.2-C's.
+func check53C(c *catalog) []issue {
+	var out []issue
+	for _, g := range c.logicalGroups() {
+		for _, p := range linkedPairs(g) {
+			if p.aField.Nullable == p.bField.Nullable || groupReference(g, p.aField) {
+				continue
+			}
+			strict, sf, loose, lf := p.a, p.aField, p.b, p.bField
+			if sf.Nullable {
+				strict, sf, loose, lf = p.b, p.bField, p.a, p.aField
+			}
+			out = append(out, issue{
+				entity: strict, field: sf.Name, pos: sf.Pos,
+				measured: fmt.Sprintf("%s.%s may be NULL, but %s.%s, its form in %s, may "+
+					"not; there a NULL becomes %s", loose.Name, lf.Name, strict.Name, sf.Name,
+					memberName(strict), nullBreaks(strict)),
+				suggestion: fmt.Sprintf("Align them: make %s.%s %s, or make %s.%s NOT NULL "+
+					"(required) if it is never NULL (§5.3).", strict.Name, sf.Name,
+					acceptsNull(strict), loose.Name, lf.Name),
+			})
+		}
+	}
+	return out
+}
+
+// nullBreaks says what a NULL turns into in a member that does not allow
+// one.
+func nullBreaks(e *Entity) string {
+	switch e.Source {
+	case SourceGo:
+		return "a scan error with database/sql, or the zero value with some ORMs"
+	case SourceJSONSchema:
+		return "a payload that fails validation, since the property is required"
+	default:
+		return "a failed write, since the column is NOT NULL"
+	}
+}
+
+// acceptsNull says how a member of e's source allows NULL.
+func acceptsNull(e *Entity) string {
+	switch e.Source {
+	case SourceGo:
+		return "a pointer or sql.Null* field"
+	case SourceJSONSchema:
+		return "optional or nullable"
+	default:
+		return "nullable"
+	}
 }

@@ -9,6 +9,10 @@ import (
 
 func section6Designs() []design {
 	return []design{
+		{
+			id: "6.2-C", title: "Cross-source constraint parity", strength: Must,
+			check: check62C,
+		},
 		{id: "6.1-A", title: "Array-of-references detector", strength: Must, check: check61A},
 		{
 			id: "6.2-A", title: "Reference-shaped column without constraint", strength: Must,
@@ -212,4 +216,78 @@ func cardinalityLow(card string) int {
 		return 1
 	}
 	return n
+}
+
+// check62C applies §6.2-C: a reference one member of a logical entity
+// declares must be declared, and required, in the others. Only a SQL member
+// is asked to declare the reference itself: a Go ID field or a JSON
+// property holding an ID has no way to, but both say whether it is
+// required.
+func check62C(c *catalog) []issue {
+	var out []issue
+	for _, g := range c.logicalGroups() {
+		for _, a := range g {
+			for i := range a.Refs {
+				r := &a.Refs[i]
+				if r.Inferred {
+					continue // a guess is no evidence the reference exists
+				}
+				out = append(out, c.parityIssues(g, a, r)...)
+			}
+		}
+	}
+	return out
+}
+
+// parityIssues compares a's reference r with each member of g from another
+// source.
+func (c *catalog) parityIssues(g []*Entity, a *Entity, r *Ref) []issue {
+	var out []issue
+	for _, name := range r.Fields {
+		af, ok := a.Field(name)
+		if !ok {
+			continue
+		}
+		for _, b := range g {
+			bf := linkedField(b, af)
+			if b.Source == a.Source || bf == nil {
+				continue
+			}
+			if is, ok := c.parityIssue(a, af, r, b, bf); ok {
+				out = append(out, is)
+			}
+		}
+	}
+	return out
+}
+
+// parityIssue reports how b's field bf falls short of a's reference field
+// af: a SQL member that does not declare the foreign key, or any member
+// that makes a required reference optional.
+func (c *catalog) parityIssue(a *Entity, af *Field, r *Ref, b *Entity, bf *Field) (issue, bool) {
+	is := issue{entity: b, field: bf.Name, pos: bf.Pos}
+	switch {
+	case b.Source == SourceSQL && !slices.ContainsFunc(b.Refs, func(x Ref) bool {
+		return !x.Inferred && containsFold(x.Fields, bf.Name)
+	}):
+		is.measured = fmt.Sprintf("%s.%s references %s in %s (%s), but %s.%s is not a "+
+			"declared foreign key", a.Name, af.Name, r.Target, memberName(a), r.Pos, b.Name,
+			bf.Name)
+		target := r.Target
+		if t := c.lookup(r.Target, SourceSQL); t != nil {
+			target = t.Name // the table the Go or JSON target links to
+		}
+		is.suggestion = fmt.Sprintf("Add FOREIGN KEY (%s) REFERENCES %s to %s (§6.2).",
+			bf.Name, target, b.Name)
+	case !af.Nullable && bf.Nullable:
+		is.measured = fmt.Sprintf("%s.%s is a required reference to %s in %s (%s), but "+
+			"%s.%s is optional", a.Name, af.Name, r.Target, memberName(a), r.Pos, b.Name,
+			bf.Name)
+		is.suggestion = fmt.Sprintf("Make %s.%s required, as %s.%s is (§6.2). A read model "+
+			"that makes it optional on purpose declares waive.", b.Name, bf.Name, a.Name,
+			af.Name)
+	default:
+		return issue{}, false
+	}
+	return is, true
 }

@@ -82,6 +82,20 @@ func (s scope) entity(alias string) *Entity {
 	return s.entities[strings.ToLower(alias)]
 }
 
+// resolve returns the stored entity and field a column reference names: by
+// its qualifier, or by the query's only relation when it has none. Either
+// is nil when the reference is to a derived relation, an entity outside the
+// catalog, or a column the entity does not have.
+func (s scope) resolve(ref ColumnRef) (*Entity, *Field) {
+	alias := cmp.Or(ref.Relation, defaultAlias(s.q))
+	e := s.entity(alias)
+	if e == nil {
+		return nil, nil
+	}
+	f, _ := e.Field(ref.Column)
+	return e, f
+}
+
 // grainKey returns the columns that identify one row of e: its declared
 // grain's columns, or else its primary key.
 func (c *catalog) grainKey(e *Entity) []string {

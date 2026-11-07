@@ -8,10 +8,22 @@ import (
 	"strings"
 )
 
+// interval is a start and end field of one entity that bound one period.
+type interval struct {
+	start, end *Field
+}
+
 func section9Designs() []design {
 	return []design{
 		{id: "9.1-A", title: "Temporal role classifier", strength: Must, check: check91A},
+		{id: "9.1-B", title: "Reporting predicate audit", strength: Must, check: check91B},
+		{
+			id: "9.1-C", title: "Cross-source time-role consistency", strength: Must,
+			check: check91C,
+		},
 		{id: "9.2-A", title: "Native temporal types", strength: Must, check: check92A},
+		{id: "9.2-B", title: "Local time needs a zone", strength: Must, check: check92B},
+		{id: "9.3-B", title: "Duration and open-end contract", strength: Must, check: check93B},
 		{id: "9.4-A", title: "File-entity shape check", strength: Must, check: check94A},
 		{id: "9.4-B", title: "Dedup-key structural check", strength: Must, check: check94B},
 		{id: "9.8-A", title: "Declared-precision type check", strength: Should, check: check98A},
@@ -463,4 +475,287 @@ func precisionDigits(f *Field) int {
 	default:
 		return 6
 	}
+}
+
+func check92B(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		for i := range e.Fields {
+			f := &e.Fields[i]
+			if localTime(c, f) {
+				if is, ok := zoneIssue(c, e, f); ok {
+					out = append(out, is)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// localTime reports whether f holds a wall-clock time (§9.2-B): declared
+// tz=local, or a date or time named local_. The name alone is only trusted
+// on a temporal field, so local_currency is not a local time.
+func localTime(c *catalog, f *Field) bool {
+	if tz, ok := f.Annotations.Get("tz"); ok {
+		return tz == "local"
+	}
+	return c.rx.localName.MatchString(f.Name) && (isTemporal(f.Type) || temporalName(c, f.Name))
+}
+
+// zoneIssue checks that e stores the IANA zone that local time f is in: a
+// string field named like a zone, constrained to zone names by a reference,
+// an enum or a CHECK, with no value that is an offset or an abbreviation.
+func zoneIssue(c *catalog, e *Entity, f *Field) (issue, bool) {
+	zone := zoneField(c, e)
+	if zone == nil {
+		stem := strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(f.Name), "local_"), "_at")
+		return issue{
+			entity: e, field: f.Name, pos: f.Pos,
+			measured: fmt.Sprintf("%s.%s is local time but %s has no time-zone field", e.Name,
+				f.Name, e.Name),
+			suggestion: fmt.Sprintf("Add %[1]s_tz text NOT NULL REFERENCES time_zones(name), "+
+				"holding a name such as 'America/Denver'. Keep %[2]s as an absolute "+
+				"timestamptz and derive local time with AT TIME ZONE %[1]s_tz (§9.2).",
+				stem, f.Name),
+		}, true
+	}
+	is := issue{entity: e, field: zone.Name, pos: zone.Pos, suggestion: fmt.Sprintf(
+		"Constrain %s to IANA zone names such as 'America/Denver', with REFERENCES "+
+			"time_zones(name) or an enum generated from tzdata; abbreviations like MST and "+
+			"POSIX strings like 'UTC-7', whose sign PostgreSQL inverts, are ambiguous (§9.2).",
+		zone.Name)}
+	values, constrained := zoneValues(e, zone)
+	if !constrained {
+		is.measured = fmt.Sprintf("%s.%s holds the zone of %s but nothing constrains it to "+
+			"IANA zone names", e.Name, zone.Name, f.Name)
+		return is, true
+	}
+	for _, v := range values {
+		if !c.rx.ianaZone.MatchString(v) {
+			is.measured = fmt.Sprintf("%s.%s admits %q, which is an offset or an "+
+				"abbreviation, not an IANA zone name", e.Name, zone.Name, v)
+			return is, true
+		}
+	}
+	return issue{}, false
+}
+
+// zoneField returns e's string field named like a time zone, or nil.
+func zoneField(c *catalog, e *Entity) *Field {
+	for i := range e.Fields {
+		f := &e.Fields[i]
+		if f.Type == TypeString && c.rx.zoneName.MatchString(f.Name) {
+			return f
+		}
+	}
+	return nil
+}
+
+// zoneValues returns the values e allows in zone, from its enum, a CHECK
+// IN-list and its default, and whether anything constrains it at all: a
+// reference to another entity, an enum, a CHECK or a declared pattern.
+func zoneValues(e *Entity, zone *Field) (values []string, constrained bool) {
+	values = slices.Clone(zone.Enum)
+	constrained = len(zone.Enum) > 0 || zone.Annotations.Has("pattern") ||
+		slices.ContainsFunc(e.Refs, func(r Ref) bool { return containsFold(r.Fields, zone.Name) })
+	for _, ck := range e.Checks {
+		if strings.EqualFold(ck.Field, zone.Name) {
+			constrained = true
+			values = append(values, ck.Enum...)
+		}
+	}
+	if d := strings.Trim(strings.SplitN(zone.Default, "::", 2)[0], "' "); d != "" {
+		values = append(values, d)
+	}
+	return values, constrained
+}
+
+func check93B(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		for _, p := range intervalPairs(e) {
+			if missing := intervalGaps(p); len(missing) > 0 {
+				out = append(out, issue{
+					entity: e, field: p.end.Name, pos: p.end.Pos,
+					measured: fmt.Sprintf("%s has the interval (%s, %s) but %s", e.Name,
+						p.start.Name, p.end.Name, strings.Join(missing, "; ")),
+					suggestion: fmt.Sprintf("Declare end=exclusive (or inclusive) on %[2]s, "+
+						"null=open on it if the interval may still be running, make both "+
+						"columns %[3]s, and compute durations as COALESCE(%[2]s, "+
+						"CURRENT_TIMESTAMP) - %[1]s on UTC values (§9.3).", p.start.Name,
+						p.end.Name, intervalType(p)),
+				})
+			}
+		}
+	}
+	return out
+}
+
+// intervalPairs returns e's intervals (§9.3-B): the pair an interval=start,end
+// annotation names, which replaces stem pairing; or else every pair of
+// temporal fields whose names differ only in a start word and an end word
+// (valid_from and valid_to, trip_start and trip_end, started_at and
+// ended_at), and the life-cycle pair opened_at or created_at with closed_at
+// or resolved_at.
+func intervalPairs(e *Entity) []interval {
+	if v, ok := e.Annotations.Get("interval"); ok {
+		names := splitList(v)
+		if len(names) != 2 {
+			return nil
+		}
+		start, okStart := e.Field(names[0])
+		end, okEnd := e.Field(names[1])
+		if !okStart || !okEnd {
+			return nil
+		}
+		return []interval{{start: start, end: end}}
+	}
+	var out []interval
+	for i := range e.Fields {
+		start := &e.Fields[i]
+		if !isTemporal(start.Type) {
+			continue
+		}
+		if end := pairedEnd(e, start); end != nil {
+			out = append(out, interval{start: start, end: end})
+		}
+	}
+	// No stem pair ends in closed_at or resolved_at, so the life-cycle pair
+	// never repeats one.
+	if p, ok := lifecyclePair(e); ok {
+		out = append(out, p)
+	}
+	return out
+}
+
+// pairedEnd returns the temporal field whose name is start's with its start
+// word replaced by the matching end word, or nil.
+func pairedEnd(e *Entity, start *Field) *Field {
+	ws := splitWords(start.Name)
+	for i, w := range ws {
+		endWord, ok := intervalEnds()[w]
+		if !ok {
+			continue
+		}
+		name := strings.Join(slices.Concat(ws[:i], []string{endWord}, ws[i+1:]), "_")
+		if end, ok := e.Field(name); ok && isTemporal(end.Type) {
+			return end
+		}
+	}
+	return nil
+}
+
+// intervalEnds maps each start word to the end word it pairs with.
+func intervalEnds() map[string]string {
+	return map[string]string{
+		"start": "end", "started": "ended", "from": "to", "begin": "end", "begins": "ends",
+		"starts": "ends",
+	}
+}
+
+// lifecyclePair returns the pair opened_at (or else created_at) and
+// closed_at (or else resolved_at), when e has one of each.
+func lifecyclePair(e *Entity) (interval, bool) {
+	pick := func(names ...string) *Field {
+		for _, n := range names {
+			if f, ok := e.Field(n); ok && isTemporal(f.Type) {
+				return f
+			}
+		}
+		return nil
+	}
+	start, end := pick("opened_at", "created_at"), pick("closed_at", "resolved_at")
+	if start == nil || end == nil {
+		return interval{}, false
+	}
+	return interval{start: start, end: end}, true
+}
+
+// intervalGaps lists what §9.3-B requires of p that is missing.
+func intervalGaps(p interval) []string {
+	var gaps []string
+	if meaning, _ := p.end.Annotations.Get("null"); p.end.Nullable &&
+		meaning != "open" && meaning != "not_applicable" {
+		gaps = append(gaps, fmt.Sprintf("%s may be NULL without null=open saying the "+
+			"interval is still running", p.end.Name))
+	}
+	if bound, _ := p.end.Annotations.Get("end"); bound != "exclusive" && bound != "inclusive" {
+		gaps = append(gaps, fmt.Sprintf("%s does not declare end=exclusive or "+
+			"end=inclusive", p.end.Name))
+	}
+	if p.start.Type != p.end.Type {
+		gaps = append(gaps, fmt.Sprintf("%s is a %s but %s is a %s", p.start.Name,
+			p.start.Type, p.end.Name, p.end.Type))
+	}
+	return gaps
+}
+
+// intervalType is the type both ends of p should share: the start's, unless
+// it is a naive timestamp, which §9.2 forbids.
+func intervalType(p interval) LogicalType {
+	if p.start.Type == TypeTimestampNaive {
+		return TypeTimestamptz
+	}
+	return p.start.Type
+}
+
+// check91C applies §9.1-C: when a Go or JSON Schema member of a logical
+// entity carries event time, the SQL member that stores it must too, or the
+// event time is dropped on the way in (and is usually replaced by load
+// time).
+func check91C(c *catalog) []issue {
+	var out []issue
+	for _, g := range c.logicalGroups() {
+		for _, store := range g {
+			if store.Source != SourceSQL || eventTimeField(store) != nil {
+				continue
+			}
+			for _, up := range g {
+				ef := eventTimeField(up)
+				if up.Source == SourceSQL || ef == nil {
+					continue
+				}
+				out = append(out, issue{
+					entity: store,
+					measured: fmt.Sprintf(
+						"%s carries event time %s but %s stores %s",
+						memberName(up),
+						ef.Name,
+						memberName(store),
+						storedTimes(store),
+					),
+					suggestion: fmt.Sprintf("Persist %s as its own column of %s, declared "+
+						"time=event, and do not overwrite it with load time (§9.1).", ef.Name,
+						store.Name),
+				})
+				break
+			}
+		}
+	}
+	return out
+}
+
+// eventTimeField returns e's first date or timestamp that records when
+// something happened (§9.1-A's classification), or nil.
+func eventTimeField(e *Entity) *Field {
+	for i := range e.Fields {
+		if f := &e.Fields[i]; isTemporal(f.Type) && temporalRole(f) == roleEvent {
+			return f
+		}
+	}
+	return nil
+}
+
+// storedTimes lists e's temporal fields in prose, for a message.
+func storedTimes(e *Entity) string {
+	var names []string
+	for i := range e.Fields {
+		if isTemporal(e.Fields[i].Type) {
+			names = append(names, e.Fields[i].Name)
+		}
+	}
+	if len(names) == 0 {
+		return "no time at all"
+	}
+	return "only " + strings.Join(names, ", ")
 }

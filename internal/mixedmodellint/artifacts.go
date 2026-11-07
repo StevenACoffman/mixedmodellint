@@ -1,10 +1,5 @@
 package mixedmodellint
 
-import (
-	"slices"
-	"strings"
-)
-
 // Artifacts are the files other than model sources that designs read:
 // decision records and logical-model records (rule_plan.md §1, "artifact
 // corpus"). The zero value holds none, and the designs that need one report
@@ -13,9 +8,9 @@ type Artifacts struct {
 	ADRs      []Document
 	Logical   []LogicalRecord
 	Ownership []OwnershipRecord
-	// Codeowners are the principals CODEOWNERS names (@org/team, @user or an
-	// email address), or nil when the repository has no CODEOWNERS.
-	Codeowners []string
+	// Codeowners is the repository's CODEOWNERS file, or nil when it has
+	// none.
+	Codeowners *Codeowners
 }
 
 // Document is a text artifact, such as an architecture decision record.
@@ -54,24 +49,4 @@ type OwnershipRecord struct {
 type Decision struct {
 	Name           string
 	WithoutSignoff bool
-}
-
-// ParseCodeowners returns the principals a CODEOWNERS file assigns: every
-// owner after a path pattern, once each, in order. Comments and blank lines
-// are skipped.
-func ParseCodeowners(text string) []string {
-	out := []string{}
-	for line := range strings.Lines(text) {
-		line, _, _ = strings.Cut(line, "#")
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		for _, owner := range fields[1:] {
-			if !slices.Contains(out, owner) {
-				out = append(out, owner)
-			}
-		}
-	}
-	return out
 }

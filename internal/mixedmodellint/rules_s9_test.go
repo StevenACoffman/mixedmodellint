@@ -208,3 +208,232 @@ func TestFileEntities(t *testing.T) {
 		})
 	}
 }
+
+func TestLocalTimeNeedsAZone(t *testing.T) {
+	t.Parallel()
+	local := col("local_start_at", m.TypeTimestampNaive)
+	zone := col("start_tz", m.TypeString)
+	zoneRef := m.Ref{Fields: []string{"start_tz"}, Target: "time_zones"}
+	cases := map[string]struct {
+		fields []m.Field
+		refs   []m.Ref
+		checks []m.Check
+		want   []string
+	}{
+		"a zone constrained by a reference": {
+			fields: []m.Field{local, zone}, refs: []m.Ref{zoneRef},
+		},
+		"a zone constrained by a CHECK of IANA names": {
+			fields: []m.Field{local, zone},
+			checks: []m.Check{{Field: "start_tz", Enum: []string{"America/Denver", "UTC"}}},
+		},
+		"a zone with a pattern": {
+			fields: []m.Field{local, fieldWith("start_tz", m.TypeString, "pattern", "^UTC$")},
+		},
+		"no zone field": {
+			fields: []m.Field{local}, want: []string{"9.2-B events local_start_at"},
+		},
+		"a zone field that is not a string": {
+			fields: []m.Field{local, col("start_tz", m.TypeInt)},
+			want:   []string{"9.2-B events local_start_at"},
+		},
+		"an unconstrained zone": {
+			fields: []m.Field{local, zone}, want: []string{"9.2-B events start_tz"},
+		},
+		"an abbreviation in the enum": {
+			fields: []m.Field{local, {
+				Name: "start_tz", Type: m.TypeString,
+				Enum: []string{"America/Denver", "MST"},
+			}},
+			want: []string{"9.2-B events start_tz"},
+		},
+		"an offset as the default": {
+			fields: []m.Field{local, {
+				Name: "start_tz", Type: m.TypeString,
+				Default: "'UTC-7'::text",
+			}},
+			refs: []m.Ref{zoneRef}, want: []string{"9.2-B events start_tz"},
+		},
+		"declared local time": {
+			fields: []m.Field{fieldWith("starts_at", m.TypeTimestampNaive, "tz", "local")},
+			want:   []string{"9.2-B events starts_at"},
+		},
+		"declared UTC despite the name": {
+			fields: []m.Field{fieldWith("local_start_at", m.TypeTimestamptz, "tz", "utc")},
+		},
+		"local but not a time": {fields: []m.Field{col("local_currency", m.TypeString)}},
+		"a local time stored as a string is still local": {
+			fields: []m.Field{col("local_start_at", m.TypeString)},
+			want:   []string{"9.2-B events local_start_at"},
+		},
+		"the zone is the field named like one, not any string": {
+			fields: []m.Field{local, col("label", m.TypeString), zone}, refs: []m.Ref{zoneRef},
+		},
+		"an abbreviation in a CHECK": {
+			fields: []m.Field{local, zone},
+			checks: []m.Check{{Field: "start_tz", Enum: []string{"America/Denver", "EST"}}},
+			want:   []string{"9.2-B events start_tz"},
+		},
+		"a CHECK on another field does not constrain the zone": {
+			fields: []m.Field{local, zone, col("kind", m.TypeString)},
+			checks: []m.Check{{Field: "kind", Enum: []string{"a"}}},
+			want:   []string{"9.2-B events start_tz"},
+		},
+		"an IANA default with a cast": {
+			fields: []m.Field{local, {
+				Name: "start_tz", Type: m.TypeString,
+				Default: "'America/Denver'::text",
+			}},
+			refs: []m.Ref{zoneRef},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := table("events", nil, tc.fields...)
+			e.Refs, e.Checks = tc.refs, tc.checks
+			equals(t, tc.want, findingsOf(&m.Input{Sources: []m.Source{{
+				Entities: []m.Entity{e},
+			}}}, "9.2-B"))
+		})
+	}
+}
+
+func TestIntervalContract(t *testing.T) {
+	t.Parallel()
+	declared := func(name string, kv ...string) m.Field {
+		return fieldWith(name, m.TypeTimestamptz, kv...)
+	}
+	openEnd := func(name string) m.Field {
+		f := declared(name, "end", "exclusive", "null", "open")
+		f.Nullable = true
+		return f
+	}
+	cases := map[string]struct {
+		kv     []string
+		fields []m.Field
+		want   []string
+	}{
+		"a declared open, exclusive end": {
+			fields: []m.Field{col("valid_from", m.TypeTimestamptz), openEnd("valid_to")},
+		},
+		"no end bound declared": {
+			fields: []m.Field{
+				col("trip_start", m.TypeTimestamptz),
+				col("trip_end", m.TypeTimestamptz),
+			},
+			want: []string{"9.3-B stays trip_end"},
+		},
+		"a nullable end without null=open": {
+			fields: []m.Field{
+				col("started_at", m.TypeTimestamptz),
+				{
+					Name: "ended_at", Type: m.TypeTimestamptz, Nullable: true,
+					Annotations: ann("end", "exclusive"),
+				},
+			},
+			want: []string{"9.3-B stays ended_at"},
+		},
+		"not applicable also explains a NULL end": {
+			fields: []m.Field{
+				col("started_at", m.TypeTimestamptz),
+				{
+					Name: "ended_at", Type: m.TypeTimestamptz, Nullable: true,
+					Annotations: ann("end", "inclusive", "null", "not_applicable"),
+				},
+			},
+		},
+		"ends of different types": {
+			fields: []m.Field{
+				col("valid_from", m.TypeDate),
+				declared("valid_to", "end", "inclusive"),
+			},
+			want: []string{"9.3-B stays valid_to"},
+		},
+		"the life-cycle pair": {
+			fields: []m.Field{
+				col("created_at", m.TypeTimestamptz),
+				col("resolved_at", m.TypeTimestamptz),
+			},
+			want: []string{"9.3-B stays resolved_at"},
+		},
+		"opened_at is preferred to created_at": {
+			fields: []m.Field{
+				col("created_at", m.TypeDate),
+				col("opened_at", m.TypeTimestamptz),
+				declared("closed_at", "end", "exclusive"),
+			},
+		},
+		"a declared interval replaces stem pairing": {
+			kv: []string{"interval", "check_in, check_out"},
+			fields: []m.Field{
+				col("check_in", m.TypeDate),
+				col("check_out", m.TypeDate),
+				col("trip_start", m.TypeTimestamptz),
+				col("trip_end", m.TypeTimestamptz),
+			},
+			want: []string{"9.3-B stays check_out"},
+		},
+		"a declared interval naming a missing field": {
+			kv:     []string{"interval", "check_in, check_out"},
+			fields: []m.Field{col("check_in", m.TypeDate)},
+		},
+		"a declared interval with one field": {
+			kv:     []string{"interval", "check_in"},
+			fields: []m.Field{col("check_in", m.TypeDate)},
+		},
+		"a start with no end":  {fields: []m.Field{col("trip_start", m.TypeTimestamptz)}},
+		"an end with no start": {fields: []m.Field{col("resolved_at", m.TypeTimestamptz)}},
+		"a declared interval whose ends differ in type": {
+			kv: []string{"interval", "check_in, check_out"},
+			fields: []m.Field{
+				col("check_in", m.TypeDate),
+				fieldWith("check_out", m.TypeTimestamptz, "end", "inclusive"),
+			},
+			want: []string{"9.3-B stays check_out"},
+		},
+		"other fields before the pair": {
+			fields: []m.Field{
+				col("stay_id", m.TypeInt), col("trip_start", m.TypeTimestamptz),
+				col("trip_end", m.TypeTimestamptz),
+			},
+			want: []string{"9.3-B stays trip_end"},
+		},
+		"an end that is not a time": {
+			fields: []m.Field{col("trip_start", m.TypeTimestamptz), col("trip_end", m.TypeInt)},
+		},
+		"begin and end": {
+			fields: []m.Field{col("begin_date", m.TypeDate), col("end_date", m.TypeDate)},
+			want:   []string{"9.3-B stays end_date"},
+		},
+		"begins and ends": {
+			fields: []m.Field{
+				col("begins_at", m.TypeTimestamptz),
+				col("ends_at", m.TypeTimestamptz),
+			},
+			want: []string{"9.3-B stays ends_at"},
+		},
+		"starts and ends": {
+			fields: []m.Field{col("starts_on", m.TypeDate), col("ends_on", m.TypeDate)},
+			want:   []string{"9.3-B stays ends_on"},
+		},
+		"a life-cycle start that is not a time": {
+			fields: []m.Field{
+				col("created_at", m.TypeString),
+				col("resolved_at", m.TypeTimestamptz),
+			},
+		},
+		"names that pair but are not times": {
+			fields: []m.Field{col("range_start", m.TypeInt), col("range_end", m.TypeInt)},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := entityOf("stays", tc.kv, tc.fields...)
+			equals(t, tc.want, findingsOf(&m.Input{Sources: []m.Source{{
+				Entities: []m.Entity{e},
+			}}}, "9.3-B"))
+		})
+	}
+}

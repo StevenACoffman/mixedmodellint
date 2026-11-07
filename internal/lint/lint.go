@@ -271,9 +271,11 @@ func (in *inputs) store(kind, p string, src []byte) error {
 func (in *inputs) storeArtifact(kind, p string, src []byte) error {
 	switch kind {
 	case "codeowners":
-		in.artifacts.Codeowners = append(
-			in.artifacts.Codeowners,
-			mml.ParseCodeowners(string(src))...)
+		// GitHub reads the first of .github/CODEOWNERS, CODEOWNERS and
+		// docs/CODEOWNERS that exists, and the walk visits them in that order.
+		if in.artifacts.Codeowners == nil {
+			in.artifacts.Codeowners = mml.ParseCodeowners(string(src))
+		}
 	case "adr":
 		in.artifacts.ADRs = append(in.artifacts.ADRs, mml.Document{Path: p, Text: string(src)})
 	case "logical":

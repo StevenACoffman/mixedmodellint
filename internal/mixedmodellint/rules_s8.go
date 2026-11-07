@@ -17,6 +17,19 @@ func section8Designs() []design {
 			id: "8.4-A", title: "Stored ratio without components", strength: Must,
 			heuristic: true, check: check84A,
 		},
+		{
+			id: "8.3-B", title: "SUM over time of a semi-additive measure", strength: Must,
+			check: check83B,
+		},
+		{
+			id: "8.4-B", title: "Aggregate-of-aggregate query detector", strength: Must,
+			check: check84B,
+		},
+		{
+			id: "8.5-B", title: "Stored-aggregate bound contract", strength: Must,
+			check: check85B,
+		},
+		{id: "8.6-A", title: "Window-output entity contract", strength: Must, check: check86A},
 	}
 }
 
@@ -385,4 +398,173 @@ func overHint(class string) string {
 		return " over=time"
 	}
 	return ""
+}
+
+func check85B(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		g, _, _ := c.groupGrain(e)
+		layer, _ := e.Annotations.Get("layer")
+		if layer != "analytical" && !c.rx.periodGrain.MatchString(g.text) {
+			continue
+		}
+		if gaps := c.boundGaps(e); len(gaps) > 0 {
+			out = append(out, issue{
+				entity: e,
+				measured: fmt.Sprintf("%s stores aggregates but %s", e.Name,
+					strings.Join(gaps, "; ")),
+				suggestion: boundHint(e, c.periodKeyed(e)),
+			})
+		}
+	}
+	return out
+}
+
+// boundGaps lists what §8.5-B requires of aggregate entity e that is missing:
+// a period in its key (unless it declares period=all_time and has an as_of
+// field), and a dimensions= list whose every entry is a key column.
+func (c *catalog) boundGaps(e *Entity) []string {
+	var gaps []string
+	period, _ := e.Annotations.Get("period")
+	_, asOf := e.Field("as_of")
+	switch {
+	case period == "all_time" && !asOf:
+		gaps = append(gaps, "declares period=all_time without an as_of field recording "+
+			"when it was computed")
+	case period != "all_time" && !c.periodKeyed(e):
+		gaps = append(gaps, "no key column is a period (a date, period_start and "+
+			"period_end, or a reference to dim_date)")
+	}
+	dims, ok := e.Annotations.Get("dimensions")
+	if !ok {
+		return append(gaps, "it does not declare dimensions=")
+	}
+	for _, d := range splitList(dims) {
+		if !slices.ContainsFunc(e.Keys(), func(k []string) bool { return containsFold(k, d) }) {
+			gaps = append(gaps, fmt.Sprintf("dimension %s is not a key column", d))
+		}
+	}
+	return gaps
+}
+
+// periodKeyed reports whether a key of e holds its period: a date or
+// timestamp column, both period_start and period_end, or a column
+// referencing dim_date.
+func (c *catalog) periodKeyed(e *Entity) bool {
+	for _, k := range e.Keys() {
+		if containsFold(k, "period_start") && containsFold(k, "period_end") {
+			return true
+		}
+		for _, col := range k {
+			if f, ok := e.Field(col); ok && isTemporal(f.Type) {
+				return true
+			}
+		}
+	}
+	return slices.ContainsFunc(e.Refs, func(r Ref) bool {
+		target := c.lookup(r.Target, e.Source)
+		return target != nil && target.Canonical == "dim_date" &&
+			slices.ContainsFunc(e.Keys(), func(k []string) bool { return subsetFold(r.Fields, k) })
+	})
+}
+
+// boundHint says how to bound aggregate e: by its period, when no key holds
+// one, and by the dimensions it is computed over.
+func boundHint(e *Entity, periodKeyed bool) string {
+	var b strings.Builder
+	if !periodKeyed && !e.Annotations.Has("period") {
+		fmt.Fprintf(&b, "Add period_start DATE NOT NULL and period_end DATE NOT NULL to the "+
+			"key of %s, or reference dim_date; a deliberate all-time aggregate declares "+
+			"period=all_time and records as_of. ", e.Name)
+	}
+	fmt.Fprintf(&b, "Declare dimensions=%s, listing the key columns %s is computed over "+
+		"(§8.5).", dimensionHint(e), e.Name)
+	return b.String()
+}
+
+// dimensionHint proposes a dimensions= value: e's key columns that are not
+// temporal, or a placeholder.
+func dimensionHint(e *Entity) string {
+	var dims []string
+	for _, col := range e.PrimaryKey {
+		if f, ok := e.Field(col); ok && !isTemporal(f.Type) {
+			dims = append(dims, col)
+		}
+	}
+	if len(dims) == 0 {
+		return "<key columns>"
+	}
+	return strings.Join(dims, ",")
+}
+
+func check86A(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		_, start := e.Field("window_start")
+		_, end := e.Field("window_end")
+		if !start || !end {
+			continue
+		}
+		if gaps := c.windowGaps(e); len(gaps) > 0 {
+			out = append(out, issue{
+				entity: e,
+				measured: fmt.Sprintf("%s stores windowed aggregates but %s", e.Name,
+					strings.Join(gaps, "; ")),
+				suggestion: "Declare window=tumbling(5m), sliding(<size>,<slide>) or " +
+					"session(<gap>), lateness=<duration> and late_policy=drop|update|" +
+					"side_output (§8.6). A sliding window counts each event once per " +
+					"overlapping window, so its measures are measure=non_additive.",
+			})
+		}
+	}
+	return out
+}
+
+// windowGaps lists what §8.6-A requires of window output e that is missing
+// or wrong: a well-formed window, lateness and late_policy, and no additive
+// measure in a sliding window.
+func (c *catalog) windowGaps(e *Entity) []string {
+	var gaps []string
+	if missing := undeclared(e.Annotations, "window", "lateness", "late_policy"); len(missing) > 0 {
+		gaps = append(gaps, "it does not declare "+strings.Join(missing, ", "))
+	}
+	window, hasWindow := e.Annotations.Get("window")
+	if hasWindow && !c.rx.windowSpec.MatchString(window) {
+		gaps = append(gaps, fmt.Sprintf("window=%s is not tumbling(<size>), "+
+			"sliding(<size>,<slide>) or session(<gap>)", window))
+	}
+	policy, hasPolicy := e.Annotations.Get("late_policy")
+	if hasPolicy && !slices.Contains([]string{"drop", "update", "side_output"}, policy) {
+		gaps = append(gaps, fmt.Sprintf("late_policy=%s is not drop, update or side_output",
+			policy))
+	}
+	if strings.HasPrefix(window, "sliding(") {
+		gaps = append(gaps, slidingAdditive(e)...)
+	}
+	return gaps
+}
+
+// undeclared returns, as key=, each of keys that a does not declare, in
+// the order given.
+func undeclared(a Annotations, keys ...string) []string {
+	var out []string
+	for _, k := range keys {
+		if !a.Has(k) {
+			out = append(out, k+"=")
+		}
+	}
+	return out
+}
+
+// slidingAdditive reports each measure of e declared additive, which a
+// sliding window's overlap makes false.
+func slidingAdditive(e *Entity) []string {
+	var out []string
+	for i := range e.Fields {
+		if m, _ := e.Fields[i].Annotations.Get("measure"); m == "additive" {
+			out = append(out, fmt.Sprintf("its window slides, so %s is counted once per "+
+				"overlapping window and cannot be measure=additive", e.Fields[i].Name))
+		}
+	}
+	return out
 }

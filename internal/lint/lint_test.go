@@ -169,25 +169,13 @@ func gitRun(t *testing.T, dir string, cmd *exec.Cmd) {
 func TestReadsCodeowners(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, ".github"), 0o750); err != nil {
-		t.Fatal(err)
-	}
-	files := map[string]string{
+	writeTree(t, dir, map[string]string{
 		".github/CODEOWNERS": "* @acme/data\n",
 		"schema.sql": "-- mml:grain one row per order\n" +
 			"-- mml:definition A request from a customer to buy goods, placed at checkout and paid.\n" +
 			"-- mml:owner @acme/orders\n-- mml:escalation role:cto\n" +
 			"CREATE TABLE orders (order_id BIGINT PRIMARY KEY);\n",
-	}
-	for name, src := range files {
-		if err := os.WriteFile(
-			filepath.Join(dir, filepath.FromSlash(name)),
-			[]byte(src),
-			0o600,
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
+	})
 	report, err := lint.Run(t.Context(), dir, lint.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -199,4 +187,61 @@ func TestReadsCodeowners(t *testing.T) {
 		}
 	}
 	t.Fatal("an owner missing from .github/CODEOWNERS was not reported")
+}
+
+// TestFirstCodeownersWins checks that, as on GitHub, .github/CODEOWNERS is
+// used and a root CODEOWNERS beside it is ignored.
+func TestFirstCodeownersWins(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		files   map[string]string
+		wantMsg string
+	}{
+		".github over the root": {
+			files: map[string]string{
+				".github/CODEOWNERS": "* @acme/data\n", "CODEOWNERS": "* @acme/orders\n",
+			},
+			wantMsg: "CODEOWNERS assigns it to @acme/data",
+		},
+		"the root over docs": {
+			files: map[string]string{
+				"CODEOWNERS": "/docs/ @acme/orders\n", "docs/CODEOWNERS": "* @acme/orders\n",
+			},
+			wantMsg: "no CODEOWNERS rule covers it",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			tc.files["schema.sql"] = "-- mml:owner team:orders\n" +
+				"CREATE TABLE orders (order_id BIGINT PRIMARY KEY);\n"
+			writeTree(t, dir, tc.files)
+			report, err := lint.Run(t.Context(), dir, lint.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range report.Findings {
+				if f := &report.Findings[i]; f.Design == "1.2-C" &&
+					strings.Contains(f.Measured, tc.wantMsg) {
+					return
+				}
+			}
+			t.Fatalf("no 1.2-C finding saying %q in %+v", tc.wantMsg, report.Findings)
+		})
+	}
+}
+
+// writeTree writes files, by slash-separated path, under dir.
+func writeTree(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, src := range files {
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

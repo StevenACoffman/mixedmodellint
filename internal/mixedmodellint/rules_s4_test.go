@@ -1,6 +1,7 @@
 package mixedmodellint_test
 
 import (
+	"slices"
 	"testing"
 
 	m "github.com/StevenACoffman/mixedmodellint/internal/mixedmodellint"
@@ -273,12 +274,121 @@ func TestResolutionOwnerInCodeowners(t *testing.T) {
 		col("source_system", m.TypeString),
 		col("source_id", m.TypeString),
 	)
-	run := func(codeowners []string) []string {
+	run := func(codeowners string) []string {
 		return findingsOf(&m.Input{
 			Sources:   []m.Source{{Entities: []m.Entity{customers, idMap}}},
-			Artifacts: m.Artifacts{Codeowners: codeowners},
+			Artifacts: m.Artifacts{Codeowners: m.ParseCodeowners(codeowners)},
 		}, "4.2-A")
 	}
-	equals(t, []string(nil), run([]string{"@acme/sales"}))
-	equals(t, []string{"4.2-A customers"}, run([]string{"@acme/data"}))
+	equals(t, []string(nil), run("db/ @acme/sales"))
+	equals(t, []string{"4.2-A customers"}, run("db/ @acme/data"))
+}
+
+func TestLocationInKeyContract(t *testing.T) {
+	t.Parallel()
+	videoRef := m.Ref{Fields: []string{"video_id"}, Target: "videos"}
+	fields := []m.Field{
+		col("video_id", m.TypeInt), col("ts_start", m.TypeInt), col("ts_end", m.TypeInt),
+		col("label", m.TypeString),
+	}
+	cases := map[string]struct {
+		fileKV  []string
+		kv      []string
+		pk      []string
+		uniques [][]string
+		want    []string
+	}{
+		"location declared and keyed": {
+			fileKV: []string{"layer", "unstructured"},
+			kv:     []string{"location", "ts_start, ts_end"},
+			pk:     []string{"video_id", "ts_start", "ts_end"},
+		},
+		"keyed by a UNIQUE constraint": {
+			fileKV:  []string{"role", "file"},
+			kv:      []string{"location", "ts_start,ts_end"},
+			pk:      []string{"label"},
+			uniques: [][]string{{"video_id", "ts_start", "ts_end"}},
+		},
+		"a whole-file description opts out": {
+			fileKV: []string{"layer", "unstructured"},
+			kv:     []string{"location", "whole_file"},
+		},
+		"no location declared": {
+			fileKV: []string{"layer", "unstructured"},
+			pk:     []string{"video_id", "ts_start"},
+			want:   []string{"4.6-B detections"},
+		},
+		"a location field that does not exist": {
+			fileKV: []string{"layer", "unstructured"},
+			kv:     []string{"location", "frame"},
+			pk:     []string{"video_id", "frame"},
+			want:   []string{"4.6-B detections"},
+		},
+		"a location outside every key": {
+			fileKV: []string{"layer", "unstructured"},
+			kv:     []string{"location", "ts_start"},
+			pk:     []string{"video_id", "label"},
+			want:   []string{"4.6-B detections"},
+		},
+		"a parent that is not declared a file": {pk: []string{"video_id"}},
+	}
+	// Each case's detections also references an entity outside the catalog,
+	// and the videos table, first, so neither may stop the check.
+	otherRefs := []m.Ref{
+		{Fields: []string{"label"}, Target: "labels_elsewhere"},
+		{Fields: []string{"video_id"}, Target: "detections"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			videos := entityOf("videos", tc.fileKV, col("video_id", m.TypeInt))
+			videos.PrimaryKey = []string{"video_id"}
+			d := entityOf("detections", tc.kv, fields...)
+			d.PrimaryKey, d.Uniques = tc.pk, tc.uniques
+			d.Refs = append(slices.Clone(otherRefs), videoRef, videoRef)
+			equals(t, tc.want, findingsOf(&m.Input{Sources: []m.Source{{
+				Entities: []m.Entity{videos, d},
+			}}}, "4.6-B"))
+		})
+	}
+}
+
+// TestDerivedEntityReadsDeclaredLocation checks that 4.6-A takes the
+// location fields location= declares rather than guessing them from names.
+func TestDerivedEntityReadsDeclaredLocation(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		kv      []string
+		located bool
+		want    []string
+	}{
+		"declared fields that no name pattern matches": {
+			kv: []string{"derived_from", "videos", "location", "shot"},
+		},
+		"undeclared, so the names are guessed and none match": {
+			kv: []string{"derived_from", "videos"}, want: []string{"4.6-A clips"},
+		},
+		"whole_file falls back to the location names": {
+			kv: []string{"derived_from", "videos", "location", "whole_file"}, located: true,
+		},
+		"whole_file is not a location to key on": {
+			kv:   []string{"derived_from", "videos", "location", "whole_file"},
+			want: []string{"4.6-A clips"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			videos := table("videos", []string{"video_id"}, col("video_id", m.TypeInt))
+			clips := entityOf("clips", tc.kv, col("video_id", m.TypeInt), col("shot", m.TypeInt))
+			clips.PrimaryKey = []string{"video_id", "shot"}
+			if tc.located {
+				clips.Fields = append(clips.Fields, col("ts_start", m.TypeInt))
+				clips.PrimaryKey = []string{"video_id", "ts_start"}
+			}
+			equals(t, tc.want, findingsOf(&m.Input{Sources: []m.Source{{
+				Entities: []m.Entity{videos, clips},
+			}}}, "4.6-A"))
+		})
+	}
 }

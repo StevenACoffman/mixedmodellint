@@ -633,6 +633,15 @@ func TestDesignMessages(t *testing.T) {
 	for name, tc := range moreMessageCases(t) {
 		cases[name] = tc
 	}
+	for name, tc := range declarationMessageCases(t) {
+		cases[name] = tc
+	}
+	for name, tc := range linkedMessageCases(t) {
+		cases[name] = tc
+	}
+	for name, tc := range queryMessageCases(t) {
+		cases[name] = tc
+	}
 	names := make([]string, 0, len(cases))
 	for name := range cases {
 		names = append(names, name)

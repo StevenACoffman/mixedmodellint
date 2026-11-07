@@ -21,10 +21,15 @@ func section4Designs() []design {
 			check:    check41A,
 		},
 		{
+			id: "4.1-B", title: "Identifier continuity across forms", strength: Must,
+			check: check41B,
+		},
+		{
 			id: "4.2-A", title: "Multi-source entity requires a resolution contract",
 			strength: Must, check: check42A,
 		},
 		{id: "4.6-A", title: "Derived-entity shape check", strength: Must, check: check46A},
+		{id: "4.6-B", title: "Location-in-key contract", strength: Must, check: check46B},
 		{
 			id:       "4.3-A",
 			title:    "Key rename without a mapping table",
@@ -376,7 +381,8 @@ func (c *catalog) resolutionProblems(e *Entity, systems []string) []string {
 	} else {
 		problems = append(problems, c.mappingProblems(e, target, systems)...)
 	}
-	known := c.ownershipRecord(owner) != nil || slices.Contains(c.artifacts.Codeowners, owner)
+	known := c.ownershipRecord(owner) != nil || (c.artifacts.Codeowners != nil &&
+		slices.Contains(c.artifacts.Codeowners.Principals(), owner))
 	registered := len(c.artifacts.Ownership) > 0 || c.artifacts.Codeowners != nil
 	switch {
 	case !hasOwner:
@@ -537,8 +543,12 @@ func sourceIDField(c *catalog, e, source *Entity) string {
 }
 
 // locationFields returns e's fields that say where in its source an instance
-// is.
+// is: the ones location= declares (§4.6-B), or else those named like a
+// position, time, offset or index.
 func locationFields(c *catalog, e *Entity) []string {
+	if declared, ok := e.Annotations.Get("location"); ok && declared != "whole_file" {
+		return splitList(declared)
+	}
 	var out []string
 	for i := range e.Fields {
 		if c.rx.locationField.MatchString(e.Fields[i].Name) {
@@ -553,4 +563,169 @@ func sourceName(source *Entity) string {
 		return "its source"
 	}
 	return source.Canonical
+}
+
+// check46B applies §4.6-B: an entity referencing a declared file entity
+// (layer=unstructured or role=file) must declare, with location=, the
+// fields that say where in the file each of its instances is, and key on
+// them together with the reference. location=whole_file opts out an entity
+// that describes a whole file, such as its tags.
+func check46B(c *catalog) []issue {
+	var out []issue
+	for _, e := range c.entities {
+		for i := range e.Refs {
+			r := &e.Refs[i]
+			file := c.lookup(r.Target, e.Source)
+			if file == nil || file == e || !declaredFile(file) {
+				continue
+			}
+			if problem := locationProblem(e, r); problem != "" {
+				out = append(out, issue{
+					entity: e, pos: r.Pos,
+					measured: fmt.Sprintf("%s references the unstructured source %s but %s",
+						e.Name, file.Name, problem),
+					suggestion: fmt.Sprintf("Declare location=<fields> on %s naming the fields "+
+						"that locate each instance inside %s, and add UNIQUE (%s, <location "+
+						"fields>); declare location=whole_file if it describes the whole "+
+						"file (§4.6).", e.Name, file.Name, strings.Join(r.Fields, ", ")),
+				})
+			}
+			break // one finding per entity: the fix is one declaration
+		}
+	}
+	return out
+}
+
+// declaredFile reports whether e is declared to hold files (§4.6-B reads
+// only the declaration; 4.6-A and 9.4-A also infer it from shape).
+func declaredFile(e *Entity) bool {
+	layer, _ := e.Annotations.Get("layer")
+	role, _ := e.Annotations.Get("role")
+	return layer == "unstructured" || role == "file"
+}
+
+// locationProblem says what is wrong with e's location= for the reference
+// r to a file, or returns "".
+func locationProblem(e *Entity, r *Ref) string {
+	declared, ok := e.Annotations.Get("location")
+	switch {
+	case !ok:
+		return "does not declare location="
+	case declared == "whole_file":
+		return ""
+	}
+	fields := splitList(declared)
+	for _, f := range fields {
+		if _, ok := e.Field(f); !ok {
+			return fmt.Sprintf("location= names %s, which is not a field of %s", f, e.Name)
+		}
+	}
+	key := slices.Concat(r.Fields, fields)
+	if !slices.ContainsFunc(e.Keys(), func(k []string) bool { return subsetFold(key, k) }) {
+		return fmt.Sprintf("no key of %s covers (%s)", e.Name, strings.Join(key, ", "))
+	}
+	return ""
+}
+
+// check41B applies §4.1-B: every member of a logical entity must carry its
+// key, required and of a compatible type, so a row can be followed from one
+// form to another. The key is the SQL member's primary key, or else the
+// first member's that has one; an entity no member keys is 4.1-A's.
+//
+// Deviation: the plan also asks event and document schemas outside any link
+// for a required key-shaped field; 4.1-A's key presence check covers them.
+func check41B(c *catalog) []issue {
+	var out []issue
+	for _, g := range c.logicalGroups() {
+		owner := keyOwner(g)
+		if owner == nil {
+			continue
+		}
+		for _, b := range g {
+			if b == owner {
+				continue
+			}
+			if is, ok := continuityIssue(owner, b); ok {
+				out = append(out, is)
+			}
+		}
+	}
+	return out
+}
+
+// keyOwner returns the member of g whose primary key is the logical key.
+func keyOwner(g []*Entity) *Entity {
+	var first *Entity
+	for _, e := range g {
+		switch {
+		case len(e.PrimaryKey) == 0:
+		case e.Source == SourceSQL:
+			return e
+		case first == nil:
+			first = e
+		}
+	}
+	return first
+}
+
+// continuityIssue reports the first key field of owner that member b lacks,
+// holds optionally, or types incompatibly.
+func continuityIssue(owner, b *Entity) (issue, bool) {
+	for _, k := range owner.PrimaryKey {
+		kf, ok := owner.Field(k)
+		if !ok {
+			continue
+		}
+		bf := linkedField(b, kf)
+		is := issue{entity: b}
+		switch {
+		case bf == nil:
+			is.measured = fmt.Sprintf("%s represents %s but has no field matching its key "+
+				"%s.%s (%s)", memberName(b), Canonical(owner.Name), owner.Name, kf.Name, kf.Type)
+			is.suggestion = fmt.Sprintf("Add %s to %s as a required field of type %s "+
+				"(§4.1).", kf.Name, memberName(b), kf.Type)
+		case bf.Nullable:
+			is.field, is.pos = bf.Name, bf.Pos
+			is.measured = fmt.Sprintf("%s.%s holds the key %s.%s but is optional", b.Name,
+				bf.Name, owner.Name, kf.Name)
+			is.suggestion = fmt.Sprintf("Make %s.%s required (§4.1).", b.Name, bf.Name)
+		case !keyTypesAgree(kf, bf):
+			is.field, is.pos = bf.Name, bf.Pos
+			is.measured = fmt.Sprintf("%s.%s is %s but the key %s.%s is %s", b.Name, bf.Name,
+				aType(bf.Type), owner.Name, kf.Name, aType(kf.Type))
+			is.suggestion = fmt.Sprintf("Make %s.%s %s like %s.%s, or for a string form "+
+				"declare a pattern that admits only %s values (§4.1).", b.Name, bf.Name,
+				aType(kf.Type), owner.Name, kf.Name, kf.Type)
+		default:
+			continue
+		}
+		return is, true
+	}
+	return issue{}, false
+}
+
+// keyTypesAgree reports whether two forms of a key hold the same values. A
+// UUID and a string agree, since a UUID has one canonical text form; an
+// integer and a string agree only when the string declares a digits-only
+// pattern.
+func keyTypesAgree(a, b *Field) bool {
+	if a.Type == b.Type {
+		return true
+	}
+	pair := func(x, y LogicalType) bool {
+		return (a.Type == x && b.Type == y) || (a.Type == y && b.Type == x)
+	}
+	switch {
+	case pair(TypeUUID, TypeString):
+		return true
+	case pair(TypeInt, TypeString):
+		str := a
+		if b.Type == TypeString {
+			str = b
+		}
+		pattern, _ := str.Annotations.Get("pattern")
+		return pattern == `^[0-9]+$` || pattern == `^\d+$`
+	default:
+		return false
+	}
 }

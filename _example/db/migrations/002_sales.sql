@@ -1,6 +1,7 @@
 -- mml:grain one row per product per sale date
 -- mml:layer analytical
 -- mml:load incremental
+-- mml:dimensions product_id
 CREATE TABLE daily_product_sales (
     product_id       BIGINT NOT NULL,
     sale_date        DATE NOT NULL,

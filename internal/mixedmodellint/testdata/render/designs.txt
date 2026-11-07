@@ -46,6 +46,54 @@ orders.sql:1: error: [1.2-A] orders changed shape since its definition was writt
 mml.yaml:7: error: [1.2-A] orders changed shape since its definition was written (fp=000000000000, now 04e7b80a3817) (mml/stale-declaration)
     suggestion: Re-read the definition of orders against its fields, then update it to fp=04e7b80a3817.
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.2-C elsewhere
+mml.yaml:4: error: [1.2-C] orders declares owner team:orders, but its file db/orders.sql is not routed to them: CODEOWNERS assigns it to @acme/data, @bob
+    suggestion: Add a CODEOWNERS rule assigning db/orders.sql to @acme/orders, or correct the owner, so reviews of the schema reach the definition owner (§1.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.2-C no team to copy
+mml.yaml:4: error: [1.2-C] orders declares owner team:orders, but its file db/orders.sql is not routed to them: CODEOWNERS assigns it to @bob
+    suggestion: Add a CODEOWNERS rule assigning db/orders.sql to @<org>/orders, or correct the owner, so reviews of the schema reach the definition owner (§1.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.2-C uncovered
+mml.yaml:4: error: [1.2-C] orders declares owner team:orders, but its file db/orders.sql is not routed to them: no CODEOWNERS rule covers it
+    suggestion: Add a CODEOWNERS rule assigning db/orders.sql to @acme/orders, or correct the owner, so reviews of the schema reach the definition owner (§1.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.2-C unowned
+mml.yaml:4: error: [1.2-C] orders declares owner team:orders, but its file db/orders.sql is not routed to them: CODEOWNERS assigns it to no one (a rule with no owners)
+    suggestion: Add a CODEOWNERS rule assigning db/orders.sql to @acme/orders, or correct the owner, so reviews of the schema reach the definition owner (§1.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.2-C user
+mml.yaml:4: error: [1.2-C] orders declares owner @alice, but its file db/orders.sql is not routed to them: CODEOWNERS assigns it to @bob
+    suggestion: Add a CODEOWNERS rule assigning db/orders.sql to @alice, or correct the owner, so reviews of the schema reach the definition owner (§1.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.5-D modeled join
+report.sql:3: error: [1.5-D] the join order_lines.line_id = orders.order_id follows no reference between order_lines and orders
+    suggestion: The modeled join is order_lines.order_id = orders.order_id. Check the grain (§7.2) and correct the key, or declare the reference if it is real (§1.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.5-D modeled join reversed
+report.sql:3: error: [1.5-D] the join orders.order_id = order_lines.line_id follows no reference between orders and order_lines
+    suggestion: The modeled join is order_lines.order_id = orders.order_id. Check the grain (§7.2) and correct the key, or declare the reference if it is real (§1.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.5-D no reference
+report.sql:3: error: [1.5-D] the join order_items.return_id = orders.order_id follows no reference between order_items and orders
+    suggestion: No reference links order_items and orders. Check the grain (§7.2) and correct the key, or declare the reference if it is real (§1.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.6-B chain
+address.sql:1: error: [1.6-B] address needs 3 joins through the thin lookup tables city → state → country to rebuild one record
+    suggestion: Fold city, state, country into columns of address until a requirement for them appears (§1.6).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.7-A query
+tmp.sql:1: error: [1.7-A] tmp_orders looks like a scratchpad model (its name is a scratch pattern), but the query at report.sql:3 depends on it
+    suggestion: Promote tmp_orders: rename it to the convention (for example fct_ or dim_), add an owner, column descriptions and tests, and declare lifecycle=recurring (§1.7).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.7-A table
+tmp.sql:1: error: [1.7-A] tmp_orders looks like a scratchpad model (its name is a scratch pattern), but SQL table order_lines depends on it
+    suggestion: Promote tmp_orders: rename it to the convention (for example fct_ or dim_), add an owner, column descriptions and tests, and declare lifecycle=recurring (§1.7).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.7-A view
+tmp.sql:1: error: [1.7-A] tmp_orders looks like a scratchpad model (its name is a scratch pattern), but view order_report depends on it
+    suggestion: Promote tmp_orders: rename it to the convention (for example fct_ or dim_), add an owner, column descriptions and tests, and declare lifecycle=recurring (§1.7).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 3.1-A best of two
 tickets.sql:3: error: [3.1-A] tickets.status has an event history, but it lacks who (an actor_id or _by field), when (an event time)
     suggestion: Add ticket_events(ticket_id REFERENCES tickets, event_type, actor_id, occurred_at TIMESTAMPTZ NOT NULL), or keep temporal records (a ticket_versions table with valid_from/valid_to), or declare history_in=<event schema>. If only the latest state matters, declare history=latest_only (§3.1).
@@ -94,6 +142,18 @@ runs.sql:2: error: [4.1-A] runs.email is used as the primary key, but its value 
 runs.sql:3: error: [4.1-A] runs.started_at is used as the primary key, but two rows can share a time, and a re-run changes it
     suggestion: Add a surrogate run_id primary key and keep started_at as UNIQUE (or a plain indexed attribute if it can repeat) (§4.1).
 2 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.1-B key type
+model.go:2: error: [4.1-B] Order.OrderID is a string but the key orders.order_id is an int
+    suggestion: Make Order.OrderID an int like orders.order_id, or for a string form declare a pattern that admits only int values (§4.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.1-B missing key
+order.schema.json:1: error: [4.1-B] JSON Schema order represents order but has no field matching its key orders.order_id (int)
+    suggestion: Add order_id to JSON Schema order as a required field of type int (§4.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.1-B optional key
+order.schema.json:2: error: [4.1-B] order.order_id holds the key orders.order_id but is optional
+    suggestion: Make order.order_id required (§4.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 4.2-A bad mapping
 customers.sql:1: error: [4.2-A] customers merges records from several systems (crm, stripe), but resolution customer_map lacks source_id; customer_map does not allow source system stripe; resolution_owner "sales" is not a team, group, role or CODEOWNERS principal
     suggestion: Declare resolution=<the mapping entity from source IDs to customer_id> and resolution_owner=<team>, with a mapping of customer_id, source_system and source_id (§4.2, §4.3).
@@ -130,6 +190,34 @@ labels.sql:1: error: [4.6-A] labels is derived from video but has no location fi
 segments.sql:1: note: [4.6-A] segments looks derived from a source file, but only by its name or only by its shape
     suggestion: Declare derived_from=<source entity> on segments if it is cut out of a source, so its key can be checked (§4.6).
 0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
+== 4.6-B missing field
+detections.sql:5: error: [4.6-B] detections references the unstructured source videos but location= names frame, which is not a field of detections
+    suggestion: Declare location=<fields> on detections naming the fields that locate each instance inside videos, and add UNIQUE (video_id, <location fields>); declare location=whole_file if it describes the whole file (§4.6).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.6-B no location
+detections.sql:5: error: [4.6-B] detections references the unstructured source videos but does not declare location=
+    suggestion: Declare location=<fields> on detections naming the fields that locate each instance inside videos, and add UNIQUE (video_id, <location fields>); declare location=whole_file if it describes the whole file (§4.6).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.6-B not keyed
+detections.sql:5: error: [4.6-B] detections references the unstructured source videos but no key of detections covers (video_id, ts_start)
+    suggestion: Declare location=<fields> on detections naming the fields that locate each instance inside videos, and add UNIQUE (video_id, <location fields>); declare location=whole_file if it describes the whole file (§4.6).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.1-B bare suffix
+items.sql:2: error: [5.1-B] items.ts is a timestamptz but its name does not end in _at, _on, _date, _time or _ts after the event it records
+    suggestion: Rename ts to <event>_at, for example created_at, shipped_at or expires_at, so the name says which event it records (§5.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.1-B no event
+items.sql:2: error: [5.1-B] items.color_ts is a timestamptz but its name does not say which event it records: color is not an event word
+    suggestion: Rename color_ts to <event>_at, for example created_at, shipped_at or expires_at, so the name says which event it records (§5.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.1-B no suffix
+items.sql:2: error: [5.1-B] items.expiry is a date but its name does not end in _at, _on, _date, _time or _ts after the event it records
+    suggestion: Rename expiry to <event>_on, for example created_on, shipped_on or expires_on, so the name says which event it records (§5.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.1-B time of day
+items.sql:2: error: [5.1-B] items.shade_time is a time but its name does not say which event it records: shade is not an event word
+    suggestion: Rename shade_time to <event>_time, for example created_time, shipped_time or expires_time, so the name says which event it records (§5.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 5.3-A not applicable
 orders.sql:3: error: [5.3-A] orders.d is null when not applicable, but null_when does not name a field of orders
     suggestion: Add null_when: <predicate> naming the field that decides it, for example <field> = '<value>' (§5.3).
@@ -142,6 +230,42 @@ orders.sql:5: error: [5.3-A] orders.b declares null=absent, which is not a meani
 orders.sql:6: error: [5.3-A] orders.c declares null=forbidden but allows NULL
     suggestion: Declare null=missing|unknown|not_applicable|zero on c; for not_applicable also null_when naming the discriminator (e.g. order_type = '<value>'). If NULL should never happen, make it NOT NULL (§5.3).
 3 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-B ambiguous
+report.sql:2: warning: [5.3-B] AVG(discount) skips NULLs of orders.discount, which does not declare what NULL means, so whether that is right is ambiguous
+    suggestion: Declare null= on orders.discount so this aggregate can be checked (§5.3).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-B count
+report.sql:2: error: [5.3-B] COUNT(discount) skips NULLs, but orders.discount declares that NULL means zero, so rows recorded as zero are not counted
+    suggestion: Use COUNT(*) for a row count, or COUNT(*) FILTER (WHERE discount <> 0) for rows with a non-zero value (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-B zero
+report.sql:2: error: [5.3-B] SUM(discount) skips NULLs, but orders.discount declares that NULL means zero, so a group whose rows are all NULL sums to NULL instead of 0
+    suggestion: Use SUM(COALESCE(discount, 0)) (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-B zero avg
+report.sql:2: error: [5.3-B] AVG(discount) skips NULLs, but orders.discount declares that NULL means zero, so the average leaves the zeros out of the count
+    suggestion: Use AVG(COALESCE(discount, 0)) (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-B zero max
+report.sql:2: error: [5.3-B] MAX(discount) skips NULLs, but orders.discount declares that NULL means zero, so the zeros are never the maximum
+    suggestion: Use MAX(COALESCE(discount, 0)) (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-B zero min
+report.sql:2: error: [5.3-B] MIN(discount) skips NULLs, but orders.discount declares that NULL means zero, so the zeros are never the minimum
+    suggestion: Use MIN(COALESCE(discount, 0)) (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-C Go
+model.go:3: error: [5.3-C] orders.note may be NULL, but Order.Note, its form in Go struct Order, may not; there a NULL becomes a scan error with database/sql, or the zero value with some ORMs
+    suggestion: Align them: make Order.Note a pointer or sql.Null* field, or make orders.note NOT NULL (required) if it is never NULL (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-C JSON
+order.schema.json:3: error: [5.3-C] orders.note may be NULL, but order.note, its form in JSON Schema order, may not; there a NULL becomes a payload that fails validation, since the property is required
+    suggestion: Align them: make order.note optional or nullable, or make orders.note NOT NULL (required) if it is never NULL (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.3-C SQL
+orders.sql:3: error: [5.3-C] order.note may be NULL, but orders.note, its form in SQL table orders, may not; there a NULL becomes a failed write, since the column is NOT NULL
+    suggestion: Align them: make orders.note nullable, or make order.note NOT NULL (required) if it is never NULL (§5.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 6.1-A lists
 posts.sql:3: error: [6.1-A] posts.tag_ids stores a list of tag references, so the pairs cannot be constrained, indexed or joined
     suggestion: Replace it with a junction table post_tag(post_id REFERENCES posts, tag_id REFERENCES tag, PRIMARY KEY (post_id, tag_id)), one row per pair (§6.1).
@@ -157,6 +281,14 @@ lines.sql:3: error: [6.2-B] lines.order_id is a mandatory reference to orders bu
 == 6.2-B undeclared
 lines.sql:3: error: [6.2-B] lines.order_id is an undeclared-cardinality reference to orders but allows NULL, so orphans are possible
     suggestion: Add NOT NULL (Go: a value instead of a pointer; JSON: list "order_id" in required), or declare card=0..N with null=not_applicable if the parent is truly optional (§6.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.2-C not declared
+orders.sql:3: error: [6.2-C] Order.CustomerID references Customer in Go struct Order (model.go:7), but orders.customer_id is not a declared foreign key
+    suggestion: Add FOREIGN KEY (customer_id) REFERENCES customers to orders (§6.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.2-C optional
+order.schema.json:3: error: [6.2-C] orders.customer_id is a required reference to customers in SQL table orders (orders.sql:9), but order.customer_id is optional
+    suggestion: Make order.customer_id required, as orders.customer_id is (§6.2). A read model that makes it optional on purpose declares waive.
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 7.4-A three ways
 lines.sql:4: note: [7.4-A] order_lines.order_note is named after orders, a coarser grain, so it repeats on every order_line row and inflates sums
@@ -210,6 +342,42 @@ sales.sql:3: error: [8.3-A] sales.units declares measure=summable, which is not 
 sales.sql:3: error: [8.3-A] sales.stock_level has no additivity class
     suggestion: Its name suggests semi_additive. Declare measure=semi_additive over=time so the query checks can protect it (§8.3).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.3-B balance
+report.sql:2: error: [8.3-B] SUM(balance) adds balances.balance across snapshot_date, but balance is semi-additive over snapshot_date
+    suggestion: Sum across the other dimensions for one snapshot_date (WHERE snapshot_date = $1), or take each key's latest value (DISTINCT ON (<key>) ... ORDER BY <key>, snapshot_date DESC) (§8.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.4-B average
+report.sql:2: error: [8.4-B] AVG(conversion) re-aggregates daily_stats.conversion, which cannot be summed or averaged again: every group gets equal weight
+    suggestion: Recompute from the components over the atomic rows, such as SUM(<numerator>)::numeric / NULLIF(SUM(<denominator>), 0), or COUNT(DISTINCT <key>), instead of re-aggregating conversion (§8.4).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.5-B all time
+sales.sql:1: error: [8.5-B] store_sales stores aggregates but declares period=all_time without an as_of field recording when it was computed; it does not declare dimensions=
+    suggestion: Declare dimensions=store_id, listing the key columns store_sales is computed over (§8.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.5-B dimensions
+sales.sql:1: error: [8.5-B] store_sales stores aggregates but dimension region is not a key column
+    suggestion: Declare dimensions=store_id, listing the key columns store_sales is computed over (§8.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.5-B no key
+sales.sql:1: error: [8.5-B] store_sales stores aggregates but no key column is a period (a date, period_start and period_end, or a reference to dim_date); it does not declare dimensions=
+    suggestion: Add period_start DATE NOT NULL and period_end DATE NOT NULL to the key of store_sales, or reference dim_date; a deliberate all-time aggregate declares period=all_time and records as_of. Declare dimensions=<key columns>, listing the key columns store_sales is computed over (§8.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.5-B no period
+sales.sql:1: error: [8.5-B] store_sales stores aggregates but no key column is a period (a date, period_start and period_end, or a reference to dim_date)
+    suggestion: Add period_start DATE NOT NULL and period_end DATE NOT NULL to the key of store_sales, or reference dim_date; a deliberate all-time aggregate declares period=all_time and records as_of. Declare dimensions=store_id, listing the key columns store_sales is computed over (§8.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.6-A malformed sliding
+clicks_5m.sql:1: error: [8.6-A] clicks_5m stores windowed aggregates but it does not declare lateness=; late_policy=ignore is not drop, update or side_output; its window slides, so clicks is counted once per overlapping window and cannot be measure=additive
+    suggestion: Declare window=tumbling(5m), sliding(<size>,<slide>) or session(<gap>), lateness=<duration> and late_policy=drop|update|side_output (§8.6). A sliding window counts each event once per overlapping window, so its measures are measure=non_additive.
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.6-A malformed window
+clicks_5m.sql:1: error: [8.6-A] clicks_5m stores windowed aggregates but window=hopping is not tumbling(<size>), sliding(<size>,<slide>) or session(<gap>)
+    suggestion: Declare window=tumbling(5m), sliding(<size>,<slide>) or session(<gap>), lateness=<duration> and late_policy=drop|update|side_output (§8.6). A sliding window counts each event once per overlapping window, so its measures are measure=non_additive.
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.6-A undeclared
+clicks_5m.sql:1: error: [8.6-A] clicks_5m stores windowed aggregates but it does not declare window=, lateness=, late_policy=
+    suggestion: Declare window=tumbling(5m), sliding(<size>,<slide>) or session(<gap>), lateness=<duration> and late_policy=drop|update|side_output (§8.6). A sliding window counts each event once per overlapping window, so its measures are measure=non_additive.
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 9.1-A conflict
 loads.sql:2: error: [9.1-A] loads.loaded_event_at is named as two kinds of time at once
     suggestion: Rename loaded_event_at, or declare time=event|ingested|processed on it (§9.1).
@@ -221,6 +389,18 @@ clicks.sql:1: warning: [9.1-A] clicks holds landed data but has no ingestion-tim
 == 9.1-A system only
 loads.sql:1: error: [9.1-A] loads records time only as loaded_at, which is when a system saw each row, not when it happened
     suggestion: Add an event-time column (e.g. load_occurred_at timestamptz NOT NULL) populated from the source, keep loaded_at as the ingestion or processing time, and declare time=event|ingested|processed on each (§9.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.1-B load time
+report.sql:1: error: [9.1-B] the query buckets or filters by clicks.loaded_at, which is when a system saw each row, not when it happened
+    suggestion: Use clicked_at instead, for example date_trunc('day', clicked_at): by loaded_at, late-arriving rows land in the wrong period. A freshness monitor declares waive (§9.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.1-C dropped
+orders.sql:1: error: [9.1-C] JSON Schema order carries event time placed_at but SQL table orders stores only loaded_at
+    suggestion: Persist placed_at as its own column of orders, declared time=event, and do not overwrite it with load time (§9.1).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.1-C nothing stored
+orders.sql:1: error: [9.1-C] JSON Schema order carries event time placed_at but SQL table orders stores no time at all
+    suggestion: Persist placed_at as its own column of orders, declared time=event, and do not overwrite it with load time (§9.1).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 9.2-A per source
 model.go:3: error: [9.2-A] Visit.seen_at is named as a date or time but is a string
@@ -234,6 +414,26 @@ visits.sql:4: error: [9.2-A] visits.left_at is named as a date or time but is an
 visits.sql:5: error: [9.2-A] visits.day_on is named as a date or time but is varchar(10)
     suggestion: Store it as date or timestamptz: ALTER TABLE visits ALTER COLUMN day_on TYPE timestamptz USING to_timestamp(day_on, '<format>');
 5 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.2-B abbreviation
+events.sql:3: error: [9.2-B] events.start_tz admits "MST", which is an offset or an abbreviation, not an IANA zone name
+    suggestion: Constrain start_tz to IANA zone names such as 'America/Denver', with REFERENCES time_zones(name) or an enum generated from tzdata; abbreviations like MST and POSIX strings like 'UTC-7', whose sign PostgreSQL inverts, are ambiguous (§9.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.2-B no zone
+events.sql:2: error: [9.2-B] events.local_start_at is local time but events has no time-zone field
+    suggestion: Add start_tz text NOT NULL REFERENCES time_zones(name), holding a name such as 'America/Denver'. Keep local_start_at as an absolute timestamptz and derive local time with AT TIME ZONE start_tz (§9.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.2-B unconstrained
+events.sql:3: error: [9.2-B] events.start_tz holds the zone of local_start_at but nothing constrains it to IANA zone names
+    suggestion: Constrain start_tz to IANA zone names such as 'America/Denver', with REFERENCES time_zones(name) or an enum generated from tzdata; abbreviations like MST and POSIX strings like 'UTC-7', whose sign PostgreSQL inverts, are ambiguous (§9.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.3-B everything missing
+stays.sql:3: error: [9.3-B] stays has the interval (valid_from, valid_to) but valid_to may be NULL without null=open saying the interval is still running; valid_to does not declare end=exclusive or end=inclusive; valid_from is a date but valid_to is a timestamptz
+    suggestion: Declare end=exclusive (or inclusive) on valid_to, null=open on it if the interval may still be running, make both columns date, and compute durations as COALESCE(valid_to, CURRENT_TIMESTAMP) - valid_from on UTC values (§9.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.3-B naive
+stays.sql:3: error: [9.3-B] stays has the interval (valid_from, valid_to) but valid_to does not declare end=exclusive or end=inclusive
+    suggestion: Declare end=exclusive (or inclusive) on valid_to, null=open on it if the interval may still be running, make both columns timestamptz, and compute durations as COALESCE(valid_to, CURRENT_TIMESTAMP) - valid_from on UTC values (§9.3).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 9.4-A event times only
 photos.sql:1: error: [9.4-A] photos is a file entity but lacks an ingestion-time field (when it arrived)
     suggestion: Add captured_at timestamptz (from EXIF DateTimeOriginal with OffsetTimeOriginal, or document metadata) and ingested_at timestamptz NOT NULL DEFAULT now(). To deduplicate, add content_sha256 char(64) NOT NULL, or declare dedup=captured_at,ingested_at to compare by those times (§9.4).

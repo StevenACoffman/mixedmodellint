@@ -223,3 +223,168 @@ func TestMeasureContradictionIsANote(t *testing.T) {
 	}
 	t.Fatal("no 8.3-A finding")
 }
+
+func TestStoredAggregateBounds(t *testing.T) {
+	t.Parallel()
+	daily := "one row per store per day"
+	storeCol, dateCol := col("store_id", m.TypeInt), col("sale_date", m.TypeDate)
+	revenue := col("revenue", m.TypeDecimal)
+	cases := map[string]struct {
+		kv     []string
+		pk     []string
+		fields []m.Field
+		refs   []m.Ref
+		want   []string
+	}{
+		"a date in the key and declared dimensions": {
+			kv: []string{"grain", daily, "dimensions", "store_id"},
+			pk: []string{"store_id", "sale_date"}, fields: []m.Field{storeCol, dateCol, revenue},
+		},
+		"period bounds in the key": {
+			kv: []string{"layer", "analytical", "dimensions", "store_id"},
+			pk: []string{"store_id", "period_start", "period_end"},
+			fields: []m.Field{
+				storeCol, col("period_start", m.TypeInt),
+				col("period_end", m.TypeInt), revenue,
+			},
+		},
+		"a reference to dim_date in the key": {
+			kv:     []string{"layer", "analytical", "dimensions", "store_id"},
+			pk:     []string{"store_id", "date_key"},
+			fields: []m.Field{storeCol, col("date_key", m.TypeInt), revenue},
+			refs:   []m.Ref{{Fields: []string{"date_key"}, Target: "dim_date"}},
+		},
+		"no period in the key": {
+			kv: []string{"layer", "analytical", "dimensions", "store_id"},
+			pk: []string{"store_id"}, fields: []m.Field{storeCol, revenue},
+			want: []string{"8.5-B store_sales"},
+		},
+		"a period outside the key": {
+			kv: []string{"grain", daily, "dimensions", "store_id"},
+			pk: []string{"store_id"}, fields: []m.Field{storeCol, dateCol, revenue},
+			want: []string{"8.5-B store_sales"},
+		},
+		"no dimensions declared": {
+			kv: []string{"grain", daily}, pk: []string{"store_id", "sale_date"},
+			fields: []m.Field{storeCol, dateCol, revenue},
+			want:   []string{"8.5-B store_sales"},
+		},
+		"a dimension that is not a key column": {
+			kv:     []string{"grain", daily, "dimensions", "store_id, region"},
+			pk:     []string{"store_id", "sale_date"},
+			fields: []m.Field{storeCol, dateCol, col("region", m.TypeString), revenue},
+			want:   []string{"8.5-B store_sales"},
+		},
+		"an all-time aggregate with as_of": {
+			kv:     []string{"layer", "analytical", "period", "all_time", "dimensions", "store_id"},
+			pk:     []string{"store_id"},
+			fields: []m.Field{storeCol, col("as_of", m.TypeTimestamptz), revenue},
+		},
+		"an all-time aggregate without as_of": {
+			kv: []string{"layer", "analytical", "period", "all_time", "dimensions", "store_id"},
+			pk: []string{"store_id"}, fields: []m.Field{storeCol, revenue},
+			want: []string{"8.5-B store_sales"},
+		},
+		"only one period bound in the key": {
+			kv: []string{"layer", "analytical", "dimensions", "store_id"},
+			pk: []string{"store_id", "period_start"},
+			fields: []m.Field{
+				storeCol, col("period_start", m.TypeInt),
+				col("period_end", m.TypeInt), revenue,
+			},
+			want: []string{"8.5-B store_sales"},
+		},
+		"a reference to dim_date outside the key": {
+			kv:     []string{"layer", "analytical", "dimensions", "store_id"},
+			pk:     []string{"store_id"},
+			fields: []m.Field{storeCol, col("date_key", m.TypeInt), revenue},
+			refs:   []m.Ref{{Fields: []string{"date_key"}, Target: "dim_date"}},
+			want:   []string{"8.5-B store_sales"},
+		},
+		"a key reference to another dimension": {
+			kv:     []string{"layer", "analytical", "dimensions", "store_id"},
+			pk:     []string{"store_id", "region_key"},
+			fields: []m.Field{storeCol, col("region_key", m.TypeInt), revenue},
+			refs:   []m.Ref{{Fields: []string{"region_key"}, Target: "dim_region"}},
+			want:   []string{"8.5-B store_sales"},
+		},
+		"a key reference to a dim_date the catalog lacks": {
+			kv:     []string{"layer", "analytical", "dimensions", "store_id"},
+			pk:     []string{"store_id", "date_key"},
+			fields: []m.Field{storeCol, col("date_key", m.TypeInt), revenue},
+			refs:   []m.Ref{{Fields: []string{"date_key"}, Target: "dim_calendar"}},
+			want:   []string{"8.5-B store_sales"},
+		},
+		"an atomic table is not an aggregate": {
+			kv: []string{"grain", "one row per sale"}, pk: []string{"store_id"},
+			fields: []m.Field{storeCol, revenue},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := entityOf("store_sales", tc.kv, tc.fields...)
+			e.PrimaryKey, e.Refs = tc.pk, tc.refs
+			dimDate := table("dim_date", []string{"date_key"}, col("date_key", m.TypeInt))
+			dimRegion := table("dim_region", []string{"region_key"}, col("region_key", m.TypeInt))
+			equals(t, tc.want, findingsOf(&m.Input{Sources: []m.Source{{
+				Entities: []m.Entity{dimDate, dimRegion, e},
+			}}}, "8.5-B"))
+		})
+	}
+}
+
+func TestWindowOutputContract(t *testing.T) {
+	t.Parallel()
+	start, end := col("window_start", m.TypeTimestamptz), col("window_end", m.TypeTimestamptz)
+	declared := []string{"window", "tumbling(5m)", "lateness", "10m", "late_policy", "update"}
+	cases := map[string]struct {
+		kv     []string
+		fields []m.Field
+		want   []string
+	}{
+		"a fully declared tumbling window": {kv: declared, fields: []m.Field{start, end}},
+		"nothing declared": {
+			fields: []m.Field{start, end}, want: []string{"8.6-A clicks_5m"},
+		},
+		"a malformed window": {
+			kv:     []string{"window", "hopping", "lateness", "1m", "late_policy", "drop"},
+			fields: []m.Field{start, end}, want: []string{"8.6-A clicks_5m"},
+		},
+		"an unknown late policy": {
+			kv:     []string{"window", "session(30m)", "lateness", "1m", "late_policy", "ignore"},
+			fields: []m.Field{start, end}, want: []string{"8.6-A clicks_5m"},
+		},
+		"no lateness": {
+			kv:     []string{"window", "session(30m)", "late_policy", "side_output"},
+			fields: []m.Field{start, end}, want: []string{"8.6-A clicks_5m"},
+		},
+		"a sliding window with a non-additive measure": {
+			kv: []string{"window", "sliding(10m, 5m)", "lateness", "1m", "late_policy", "drop"},
+			fields: []m.Field{
+				start, end,
+				fieldWith("clicks", m.TypeInt, "measure", "non_additive"),
+			},
+		},
+		"a sliding window with an additive measure": {
+			kv:     []string{"window", "sliding(10m,5m)", "lateness", "1m", "late_policy", "drop"},
+			fields: []m.Field{start, end, fieldWith("clicks", m.TypeInt, "measure", "additive")},
+			want:   []string{"8.6-A clicks_5m"},
+		},
+		"a tumbling window may add up": {
+			kv:     declared,
+			fields: []m.Field{start, end, fieldWith("clicks", m.TypeInt, "measure", "additive")},
+		},
+		"only a window start": {fields: []m.Field{start}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := entityOf("clicks_5m", tc.kv, tc.fields...)
+			plain := table("clicks", nil, col("clicked_at", m.TypeTimestamptz))
+			equals(t, tc.want, findingsOf(&m.Input{Sources: []m.Source{{
+				Entities: []m.Entity{plain, e},
+			}}}, "8.6-A"))
+		})
+	}
+}
