@@ -127,6 +127,14 @@ type Grant struct {
 	Pos        Position
 }
 
+// Change is a DDL statement that modifies an existing table rather than
+// creating it: Statement is one of "ALTER TABLE", "RENAME", "CREATE INDEX" or
+// "CREATE TRIGGER", so a design can report it without reading SQL.
+type Change struct {
+	Statement string
+	Pos       Position
+}
+
 // Entity is one table, view, persisted Go struct, or JSON Schema object
 // definition, after every ALTER in the migration sequence has been applied.
 //
@@ -134,6 +142,10 @@ type Grant struct {
 // "go:example.com/model.Order", "json:schemas/order.json#/$defs/Line").
 // Canonical is the folded name used to link the same logical entity across
 // sources (see Canonical); an `entity` annotation overrides it.
+//
+// Indexes lists the columns of every index, unique or not, in index order,
+// so a design can ask whether a column leads one. Changes lists the
+// statements after the CREATE that modified the table.
 type Entity struct {
 	ID          string
 	Kind        EntityKind
@@ -148,6 +160,8 @@ type Entity struct {
 	Refs        []Ref
 	Checks      []Check
 	Grants      []Grant
+	Indexes     [][]string
+	Changes     []Change
 	Pos         Position
 }
 
