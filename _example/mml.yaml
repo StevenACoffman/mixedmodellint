@@ -1,23 +1,29 @@
 entities:
   customer:
+    status: validated
     definition: A person or business that signed up and may place orders with us.
     owner: team:accounts
     escalation: role:head-of-commerce
   order:
+    status: validated
     definition: A customer's request to buy one or more products, placed at checkout and paid together.
     owner: team:orders
     escalation: role:head-of-commerce
   order_line:
+    status: validated
     definition: One product and quantity within an order, priced when the order was placed.
     owner: team:orders
     escalation: role:head-of-commerce
     fields:
       unit_price_usd:
+        currency: USD
         measure: non_additive
         captured_at_transaction: "true"
       quantity:
+        unit: "{item}"
         measure: additive
   daily_product_sale:
+    status: validated
     definition: Units and revenue of one product summed over the orders placed on one calendar day.
     owner: team:analytics
     escalation: role:head-of-data
@@ -25,6 +31,7 @@ entities:
       units_sold:
         measure: additive
       revenue_usd_sum:
+        currency: USD
         measure: additive
       order_line_count:
         measure: additive

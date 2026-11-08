@@ -5,10 +5,22 @@
   "type": "object",
   "x-mml-grain": "one row per order placed",
   "x-mml-key": ["event_id"],
+  "x-mml-status": "validated",
   "required": ["event_id", "order_id", "placed_at"],
   "properties": {
-    "event_id": { "type": "string", "format": "uuid" },
-    "order_id": { "type": "integer" },
-    "placed_at": { "type": "string", "format": "date-time" }
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Identifies this publication of the event, for deduplication."
+    },
+    "order_id": {
+      "type": "integer",
+      "description": "The order the customer placed."
+    },
+    "placed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the customer confirmed the order at checkout."
+    }
   }
 }
