@@ -5,6 +5,8 @@ CREATE TABLE customers (
     signed_up_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE UNIQUE INDEX customers_email ON customers (email);
+
 -- mml:grain one row per order
 CREATE TABLE orders (
     order_id    BIGINT PRIMARY KEY,
