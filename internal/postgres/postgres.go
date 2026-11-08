@@ -7,6 +7,8 @@
 package postgres
 
 import (
+	"cmp"
+	"slices"
 	"strings"
 
 	pg "github.com/pganalyze/pg_query_go/v6"
@@ -209,6 +211,8 @@ func (l *loader) loadStmt(ctx *stmtCtx, n *pg.Node) {
 		l.rename(n.GetRenameStmt())
 	case n.GetViewStmt() != nil:
 		l.createView(ctx, n.GetViewStmt())
+	case n.GetGrantStmt() != nil:
+		l.grant(ctx, n.GetGrantStmt())
 	default:
 		l.out.Queries = append(l.out.Queries, buildQueries(ctx, n)...)
 	}
@@ -327,6 +331,56 @@ func (l *loader) comment(ctx *stmtCtx, cs *pg.CommentStmt) {
 	}
 }
 
+// grant applies GRANT and REVOKE on tables to each table's Grants. Other
+// targets (schemas, sequences, functions, ALL TABLES IN SCHEMA) are not
+// entities, so they are skipped.
+func (l *loader) grant(ctx *stmtCtx, gs *pg.GrantStmt) {
+	if gs.GetObjtype() != pg.ObjectType_OBJECT_TABLE ||
+		gs.GetTargtype() != pg.GrantTargetType_ACL_TARGET_OBJECT {
+		return
+	}
+	privs := grantedPrivileges(gs)
+	for _, obj := range gs.GetObjects() {
+		e, ok := l.find(strings.Split(tableKey(obj.GetRangeVar()), "."))
+		if !ok {
+			continue
+		}
+		for _, g := range gs.GetGrantees() {
+			role := cmp.Or(g.GetRoleSpec().GetRolename(), "public")
+			if gs.GetIsGrant() {
+				e.Grants = append(e.Grants, mml.Grant{
+					Role: role, Privileges: privs, Pos: ctx.pos(ctx.start),
+				})
+			} else {
+				revoke(e, role, privs)
+			}
+		}
+	}
+}
+
+// grantedPrivileges returns the privileges a GRANT or REVOKE names, upper
+// case, with ALL (an empty list in the parse tree) expanded.
+func grantedPrivileges(gs *pg.GrantStmt) []string {
+	if len(gs.GetPrivileges()) == 0 {
+		return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
+	}
+	privs := make([]string, 0, len(gs.GetPrivileges()))
+	for _, p := range gs.GetPrivileges() {
+		privs = append(privs, strings.ToUpper(p.GetAccessPriv().GetPrivName()))
+	}
+	return privs
+}
+
+// revoke removes privs from every grant role holds on e.
+func revoke(e *mml.Entity, role string, privs []string) {
+	for i := range e.Grants {
+		if e.Grants[i].Role == role {
+			e.Grants[i].Privileges = slices.DeleteFunc(slices.Clone(e.Grants[i].Privileges),
+				func(p string) bool { return slices.Contains(privs, p) })
+		}
+	}
+}
+
 func (l *loader) drop(ctx *stmtCtx, ds *pg.DropStmt) {
 	if ds.GetRemoveType() != pg.ObjectType_OBJECT_TABLE &&
 		ds.GetRemoveType() != pg.ObjectType_OBJECT_VIEW {
@@ -394,6 +448,7 @@ func renameColumn(e *mml.Entity, from, to string) {
 		if strings.EqualFold(e.Checks[i].Field, from) {
 			e.Checks[i].Field = to
 		}
+		rename(e.Checks[i].Columns)
 	}
 }
 

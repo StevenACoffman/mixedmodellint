@@ -337,3 +337,109 @@ CREATE TABLE items (
 		{Field: "grade", Enum: []string{"a", "b"}},
 	}, entity(t, src, "items").Checks)
 }
+
+func TestLoadGrants(t *testing.T) {
+	t.Parallel()
+	ddl := "CREATE TABLE orders (order_id BIGINT PRIMARY KEY);\n" +
+		"CREATE TABLE sales.refunds (refund_id BIGINT PRIMARY KEY);\n"
+	cases := map[string]struct {
+		sql   string
+		table string
+		want  []mml.Grant
+	}{
+		"privileges to a role": {
+			sql:   "GRANT INSERT, UPDATE ON orders TO support_agent;",
+			table: "orders",
+			want: []mml.Grant{{
+				Role: "support_agent", Privileges: []string{"INSERT", "UPDATE"},
+				Pos: mml.Position{File: "grants.sql", Line: 3, Col: 1},
+			}},
+		},
+		"ALL expands": {
+			sql:   "GRANT ALL ON TABLE sales.refunds TO llm_writer;",
+			table: "refunds",
+			want: []mml.Grant{{
+				Role: "llm_writer",
+				Privileges: []string{
+					"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER",
+				},
+				Pos: mml.Position{File: "grants.sql", Line: 3, Col: 1},
+			}},
+		},
+		"REVOKE takes privileges back": {
+			sql: "GRANT INSERT, DELETE ON orders TO bot;\n" +
+				"REVOKE DELETE ON orders FROM bot;",
+			table: "orders",
+			want: []mml.Grant{{
+				Role: "bot", Privileges: []string{"INSERT"},
+				Pos: mml.Position{File: "grants.sql", Line: 3, Col: 1},
+			}},
+		},
+		"a grant on a schema is not a table's": {
+			sql:   "GRANT USAGE ON SCHEMA sales TO bot;",
+			table: "refunds",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			src := postgres.Load(
+				[]postgres.File{{Path: "grants.sql", Src: []byte(ddl + tc.sql)}},
+				nil,
+			)
+			equals(t, tc.want, entity(t, src, tc.table).Grants)
+		})
+	}
+}
+
+func TestLoadMultiColumnChecks(t *testing.T) {
+	t.Parallel()
+	ddl := "CREATE TABLE samples (\n" +
+		"  is_synthetic BOOLEAN NOT NULL,\n  generator_version TEXT,\n" +
+		"  CHECK (NOT is_synthetic OR generator_version IS NOT NULL)\n);\n"
+	cases := map[string]struct {
+		after string
+		want  []mml.Check
+	}{
+		"columns of the expression": {
+			want: []mml.Check{{Columns: []string{"is_synthetic", "generator_version"}}},
+		},
+		"a rename follows the column": {
+			after: "ALTER TABLE samples RENAME COLUMN generator_version TO generator;",
+			want:  []mml.Check{{Columns: []string{"is_synthetic", "generator"}}},
+		},
+		"dropping a column drops the check": {
+			after: "ALTER TABLE samples DROP COLUMN generator_version;",
+			want:  []mml.Check{},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			src := postgres.Load([]postgres.File{{Path: "s.sql", Src: []byte(ddl + tc.after)}}, nil)
+			equals(t, tc.want, entity(t, src, "samples").Checks)
+		})
+	}
+}
+
+func TestLoadOnDelete(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		ref  string
+		want string
+	}{
+		"unspecified is no action": {"REFERENCES nodes (node_id)", "no action"},
+		"cascade":                  {"REFERENCES nodes (node_id) ON DELETE CASCADE", "cascade"},
+		"set null":                 {"REFERENCES nodes (node_id) ON DELETE SET NULL", "set null"},
+		"restrict":                 {"REFERENCES nodes (node_id) ON DELETE RESTRICT", "restrict"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ddl := "CREATE TABLE nodes (node_id BIGINT PRIMARY KEY);\n" +
+				"CREATE TABLE edges (from_node_id BIGINT " + tc.ref + ");\n"
+			src := postgres.Load([]postgres.File{{Path: "g.sql", Src: []byte(ddl)}}, nil)
+			equals(t, tc.want, entity(t, src, "edges").Refs[0].OnDelete)
+		})
+	}
+}

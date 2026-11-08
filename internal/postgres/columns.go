@@ -104,10 +104,9 @@ func dropColumn(e *mml.Entity, name string) {
 	}
 	e.Uniques = slices.DeleteFunc(e.Uniques, drop)
 	e.Refs = slices.DeleteFunc(e.Refs, func(r mml.Ref) bool { return drop(r.Fields) })
-	e.Checks = slices.DeleteFunc(
-		e.Checks,
-		func(c mml.Check) bool { return strings.EqualFold(c.Field, name) },
-	)
+	e.Checks = slices.DeleteFunc(e.Checks, func(c mml.Check) bool {
+		return strings.EqualFold(c.Field, name) || containsFold(c.Columns, name)
+	})
 }
 
 // addConstraint records a constraint on e. column is set for a column
@@ -124,20 +123,28 @@ func addConstraint(e *mml.Entity, con *pg.Constraint, column string) {
 	case pg.ConstrType_CONSTR_UNIQUE:
 		e.Uniques = append(e.Uniques, cols)
 	case pg.ConstrType_CONSTR_FOREIGN:
-		fk := names(con.GetFkAttrs())
-		if column != "" {
-			fk = []string{column}
-		}
-		e.Refs = append(e.Refs, mml.Ref{
-			Fields: fk, Target: tableKey(con.GetPktable()), TargetFields: names(con.GetPkAttrs()),
-		})
+		e.Refs = append(e.Refs, foreignKey(con, column))
 	case pg.ConstrType_CONSTR_CHECK:
-		if ch, ok := inListCheck(con.GetRawExpr()); ok {
-			e.Checks = append(e.Checks, ch)
-		} else if ch, ok := comparisonCheck(con.GetRawExpr()); ok {
+		if ch, ok := readCheck(con.GetRawExpr()); ok {
 			e.Checks = append(e.Checks, ch)
 		}
 	default:
+	}
+}
+
+// foreignKey reads a FOREIGN KEY or REFERENCES constraint; column is set for
+// a column constraint, whose referencing column is that column.
+func foreignKey(con *pg.Constraint, column string) mml.Ref {
+	fk := names(con.GetFkAttrs())
+	if column != "" {
+		fk = []string{column}
+	}
+	actions := map[string]string{
+		"a": "no action", "r": "restrict", "c": "cascade", "n": "set null", "d": "set default",
+	}
+	return mml.Ref{
+		Fields: fk, Target: tableKey(con.GetPktable()), TargetFields: names(con.GetPkAttrs()),
+		OnDelete: actions[con.GetFkDelAction()],
 	}
 }
 
@@ -154,6 +161,35 @@ func setPrimaryKey(e *mml.Entity, cols []string) {
 
 func containsFold(list []string, s string) bool {
 	return slices.ContainsFunc(list, func(x string) bool { return strings.EqualFold(x, s) })
+}
+
+// readCheck reads a CHECK expression in the most specific form that fits:
+// an IN-list, a comparison of one column with a constant, or the columns of
+// an expression over several columns. A CHECK on one column that is none of
+// these says nothing a design reads, so it is not kept.
+func readCheck(n *pg.Node) (mml.Check, bool) {
+	if ch, ok := inListCheck(n); ok {
+		return ch, true
+	}
+	if ch, ok := comparisonCheck(n); ok {
+		return ch, true
+	}
+	if cols := checkColumns(n); len(cols) >= 2 {
+		return mml.Check{Columns: cols}, true
+	}
+	return mml.Check{}, false
+}
+
+// checkColumns returns the columns a CHECK expression reads, each once, in
+// the order they first appear.
+func checkColumns(n *pg.Node) []string {
+	var cols []string
+	walkAll(n, func(m *pg.Node) {
+		if c := columnName(m); c != "" && !containsFold(cols, c) {
+			cols = append(cols, c)
+		}
+	})
+	return cols
 }
 
 // inListCheck recognizes CHECK (col IN ('a', 'b')), the form §7.4-B and §5.1
