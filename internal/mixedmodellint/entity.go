@@ -92,21 +92,39 @@ type Field struct {
 // Target is the referenced entity's name as written; linking resolves it.
 // Inferred is true for a reference guessed from a name such as customer_id,
 // which some designs weigh less.
+//
+// OnDelete is a SQL foreign key's ON DELETE action ("cascade", "restrict",
+// "set null", "set default" or "no action"), or "" for a reference no
+// database enforces.
 type Ref struct {
 	Fields       []string
 	Target       string
 	TargetFields []string
 	Inferred     bool
+	OnDelete     string
 	Pos          Position
 }
 
 // Check is a declared value constraint on one field: a SQL CHECK with an
 // IN-list, a JSON Schema enum or const, or a Go validate oneof tag. Expr holds
-// the constraint as written when it is not a plain list.
+// the constraint as written when it is not a plain list. A CHECK over
+// several columns, such as NOT is_synthetic OR generator_version IS NOT
+// NULL, has no Field; Columns lists the columns it reads, so a design can
+// ask whether two columns are tied together.
 type Check struct {
-	Field string
-	Enum  []string
-	Expr  string
+	Field   string
+	Enum    []string
+	Expr    string
+	Columns []string
+}
+
+// Grant is what GRANT and REVOKE leave a database role allowed to do with a
+// table. Privileges are upper case, with ALL expanded, so a design can ask
+// whether a role may INSERT without knowing how the grant was written.
+type Grant struct {
+	Role       string
+	Privileges []string
+	Pos        Position
 }
 
 // Entity is one table, view, persisted Go struct, or JSON Schema object
@@ -129,6 +147,7 @@ type Entity struct {
 	Uniques     [][]string
 	Refs        []Ref
 	Checks      []Check
+	Grants      []Grant
 	Pos         Position
 }
 
