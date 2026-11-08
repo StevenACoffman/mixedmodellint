@@ -94,6 +94,90 @@ tmp.sql:1: error: [1.7-A] tmp_orders looks like a scratchpad model (its name is 
 tmp.sql:1: error: [1.7-A] tmp_orders looks like a scratchpad model (its name is a scratch pattern), but view order_report depends on it
     suggestion: Promote tmp_orders: rename it to the convention (for example fct_ or dim_), add an owner, column descriptions and tests, and declare lifecycle=recurring (§1.7).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.1-A unclassified
+customers.sql:3: warning: [10.1-A] customers.updated_at is a metadata attribute that does not say whether it records the business or the system
+    suggestion: Rename it customer_updated_at (business: when the customer changed) or _loaded_at (system: when the pipeline wrote the row), or annotate time=business|system (meta= for a field that is not a time), and describe it as such (§10.1).
+customers.sql:4: warning: [10.1-A] customers._loaded_at is system metadata, but no description says so
+    suggestion: Describe it in the catalog as system metadata, e.g. COMMENT ON COLUMN customers._loaded_at IS '<what it records> (system time)' (§10.1).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.10-A endpoints
+edges.sql:3: warning: [10.10-A] edges.from_node_id can point at a node that no longer exists: it is SET NULL when its node is deleted
+    suggestion: Declare from_node_id NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE (or RESTRICT, if deletes must re-point edges first) (§10.10).
+edges.sql:4: warning: [10.10-A] edges.to_node_id can point at a node that no longer exists: it has no foreign key, and it may be NULL
+    suggestion: Declare to_node_id NOT NULL REFERENCES <node>(<key>) ON DELETE CASCADE (or RESTRICT, if deletes must re-point edges first) (§10.10).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.10-B closed
+edges.sql:5: note: [10.10-B] edges.rel_type fixes the relationship types to a closed list, so adding one takes a migration
+    suggestion: Keep relationship types as rows of relationship_types(relationship_type_id, name) and reference it, so a new type is a new row (§10.10).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
+== 10.2-A payload
+events.sql:3: warning: [10.2-A] events keeps its record in payload, with 0 typed columns beside it
+    suggestion: Shred the stable fields into typed columns (the fields every row has) and keep only the variable remainder in payload, as properties (§10.2).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.2-A remainder
+orders.sql:1: warning: [10.2-A] orders has no column for the variable "attributes" fields JSON Schema Order declares, so every new key will need a migration
+    suggestion: Add attributes jsonb (or json.RawMessage in Go) to hold the remainder (§10.2).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.2-B union
+order.schema.json:3: warning: [10.2-B] category in Order can be any of array, object, string
+    suggestion: Give category one shape and move variable fields under a declared extension object (x-mml-extension: attributes) with "additionalProperties": false at the root (§10.2).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.3-A content
+documents.sql:3: warning: [10.3-A] documents.body stores file content in the row
+    suggestion: Store the object in object storage and keep document_uri text NOT NULL, uploaded_at, uploaded_by, content_type and content_sha256 here instead (§10.3).
+documents.sql:4: warning: [10.3-A] documents.file_uri references a stored object, but documents does not record who stored it, or what it is, or which version it is
+    suggestion: Add uploaded_by, content_type, content_sha256 beside file_uri, so who stored the object, when, what it is and which version are all known (§10.3).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.4-A blended
+reviews.sql:3: warning: [10.4-A] reviews.sentiment_score blends every aspect into one score, so opposing opinions cancel out
+    suggestion: Store one score per aspect, as columns such as sentiment_product and sentiment_shipping, or as rows of review_aspect_sentiment(review_id, aspect, score) with aspect constrained to an enum (§10.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.6-A context
+agent.sql:1: error: [10.6-A] agent_actions records agent actions without the prompt (prompt, input_context, messages or prompt_ref); the tools available (tools_available or tool_manifest); a required model (it may be missing)
+    suggestion: Add prompt jsonb NOT NULL (or prompt_ref text NOT NULL), tools_available jsonb NOT NULL and model_version text NOT NULL, so each action can be replayed and debugged (§10.6).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.7-A artifacts
+agent.sql:1: warning: [10.7-A] agent_actions records agent actions, but the schema lacks an agent_run entity, a tool_call entity
+    suggestion: Model the artifacts as data: add agent_runs(agent_run_id PRIMARY KEY, prompt, tools_available, model_version) and tool_calls(call_id PRIMARY KEY, agent_run_id REFERENCES agent_runs, tool_name, arguments jsonb, result jsonb, called_at timestamptz) (§10.7).
+features.sql:1: warning: [10.7-A] customer_features is training or feature data, but the schema lacks a model_version entity
+    suggestion: Model the artifacts as data: add model_versions(model_version_id, dataset_id REFERENCES training_datasets, run_id REFERENCES training_runs, feature_set_id REFERENCES feature_sets, hyperparameters jsonb) (§10.7).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.9-A markers
+examples.sql:1: error: [10.9-A] training_examples may contain synthetic records but has no generator_version, no source_dataset_id, no CHECK tying generator_version to is_synthetic
+    suggestion: Add is_synthetic boolean NOT NULL DEFAULT false, generator_version text, source_dataset_id NOT NULL (referencing the dataset), and CHECK (NOT is_synthetic OR generator_version IS NOT NULL) (§10.9).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.9-A quality
+marked.sql:1: note: [10.9-A] synthetic_orders marks synthetic records but records nothing about their quality
+    suggestion: Add synthetic_order_quality_score, or point quality= at the test or validation that checks the generated data (§10.9).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
+== 2.2-A crossing
+support.sql:3: error: [2.2-A] tickets (support) references customers (crm) directly, with no recorded agreement on what "customer" means in both domains
+    suggestion: Record the agreed meaning of "customer" on the reference (mml:"mapping=<ADR link>", x-mml-mapping, or @mapping: in a column comment), or route it through a mapping entity support_customer_map annotated translates from=support to=crm (§2.2).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 2.3-A free text
+products.sql:3: warning: [2.3-A] products.category stores a category as free text, so every writer can invent its own values
+    suggestion: Replace it with category_id REFERENCES a shared category taxonomy, or constrain it to the taxonomy's node list with an enum or CHECK (§2.3).
+products.sql:4: warning: [2.3-A] products.sales_region stores a region as free text, so every writer can invent its own values
+    suggestion: Replace it with region_id REFERENCES regions (taxonomy found), or constrain it to the taxonomy's node list with an enum or CHECK (§2.3).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 2.5-A gaps
+orders.sql:1: warning: [2.5-A] the business metadata of orders is incomplete: status "done" is not draft, validated or deprecated; 0% of columns are described (need 90%), missing: order_id, total; no unit or currency on total
+    suggestion: Declare status (draft, validated or deprecated), describe what each column means in more than its name, and give measures a unit or currency, e.g. COMMENT ON COLUMN orders.order_id IS '<meaning>, in <unit>. @unit: USD' (§2.5).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 2.7-A unstated
+patients.sql:2: note: [2.7-A] patients.diagnosis_code looks like a diagnosis code but does not say which standard it follows
+    suggestion: Use ICD-10 or SNOMED CT rather than a local list and name it in the field's standard annotation (standard=ICD-10), or record standard=local reason="..." to keep the local list deliberately (§2.7).
+patients.sql:3: warning: [2.7-A] patients.country looks like a country code but does not say which standard it follows; 50% of its values are already ISO 3166-1 alpha-2 codes
+    suggestion: Use ISO 3166-1 rather than a local list and name it in the field's standard annotation (standard=ISO 3166-1), or record standard=local reason="..." to keep the local list deliberately (§2.7).
+0 error(s), 1 warning(s), 1 note(s) in 0 entities and 0 queries
+== 2.7-B variants
+shipments.sql:2: warning: [2.7-B] 100% of the values shipments.destination allows are ISO 3166-1 alpha-2 codes, but it uses UK for GB, and it does not declare the standard
+    suggestion: Adopt the ISO 3166-1 alpha-2 codes, replacing UK with GB, and annotate standard=ISO 3166-1 alpha-2, or record standard=local reason="..." if the local list is deliberate (§2.7).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 2.8-A contradicted
+tickets.sql:1: note: [2.8-A] agents may change tickets (support_agent is granted UPDATE), but status has no transition encoding; agent_ops omits write, yet support_agent is granted UPDATE
+    suggestion: Declare the operations agents may perform (agent_ops=read,write,...), matching what the database grants them, and encode each status field's allowed moves as data, e.g. a table ticket_status_transitions(from_state, to_state, policy) or a transitions annotation (§2.8).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
 == 3.1-A best of two
 tickets.sql:3: error: [3.1-A] tickets.status has an event history, but it lacks who (an actor_id or _by field), when (an event time)
     suggestion: Add ticket_events(ticket_id REFERENCES tickets, event_type, actor_id, occurred_at TIMESTAMPTZ NOT NULL), or keep temporal records (a ticket_versions table with valid_from/valid_to), or declare history_in=<event schema>. If only the latest state matters, declare history=latest_only (§3.1).

@@ -59,19 +59,6 @@ func (c *catalog) stateField(e *Entity, f *Field) bool {
 	return len(enumValues(e, f)) >= 3 && c.updates(e, f.Name)
 }
 
-// enumValues returns the values f is constrained to, by an enum or a CHECK.
-func enumValues(e *Entity, f *Field) []string {
-	if len(f.Enum) > 0 {
-		return f.Enum
-	}
-	for _, ch := range e.Checks {
-		if strings.EqualFold(ch.Field, f.Name) && len(ch.Enum) > 0 {
-			return ch.Enum
-		}
-	}
-	return nil
-}
-
 // updates reports whether an UPDATE in the corpus sets e's column col.
 func (c *catalog) updates(e *Entity, col string) bool {
 	return slices.ContainsFunc(c.writes(), func(w write) bool {

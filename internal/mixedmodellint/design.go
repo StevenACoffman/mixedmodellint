@@ -154,6 +154,9 @@ func run(c *catalog, designs []design) []Finding {
 func allDesigns() []design {
 	var ds []design
 	ds = append(ds, section1Designs()...)
+	ds = append(ds, section2Designs()...)
+	ds = append(ds, section2VocabDesigns()...)
+	ds = append(ds, section2OpsDesigns()...)
 	ds = append(ds, section3Designs()...)
 	ds = append(ds, section4Designs()...)
 	ds = append(ds, section5Designs()...)
@@ -162,6 +165,9 @@ func allDesigns() []design {
 	ds = append(ds, section7QueryDesigns()...)
 	ds = append(ds, section8Designs()...)
 	ds = append(ds, section9Designs()...)
+	ds = append(ds, section10Designs()...)
+	ds = append(ds, section10AgentDesigns()...)
+	ds = append(ds, section10GraphDesigns()...)
 	return ds
 }
 

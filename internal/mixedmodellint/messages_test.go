@@ -642,6 +642,12 @@ func TestDesignMessages(t *testing.T) {
 	for name, tc := range queryMessageCases(t) {
 		cases[name] = tc
 	}
+	for name, tc := range s2MessageCases(t) {
+		cases[name] = tc
+	}
+	for name, tc := range s10MessageCases(t) {
+		cases[name] = tc
+	}
 	names := make([]string, 0, len(cases))
 	for name := range cases {
 		names = append(names, name)

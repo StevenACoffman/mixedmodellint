@@ -14,7 +14,7 @@ func knownKey(key string) bool {
 		"ownership", "ai_systems_reason", "producers", "status", "standard", "agent_exposed",
 		"agent_ops", "transitions", "translates", "mapping", "taxonomy", "contract", "term",
 		"version", "renamed_from", "history_of", "history_in", "denormalized_for",
-		"captured_at_transaction", "upstream", "master", "required", "enforced_in", "history",
+		"captured_at_transaction", "domain", "upstream", "master", "required", "enforced_in", "history",
 		"reviewed_version", "resolution", "resolution_owner", "sources", "refers",
 		"derived_from", "location", "denormalized_from", "split_reason", "pattern",
 		"pattern_adr", "removal_candidate", "null_when", "consumers", "consequential",

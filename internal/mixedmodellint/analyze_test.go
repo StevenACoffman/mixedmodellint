@@ -23,7 +23,7 @@ func ann(kv ...string) m.Annotations {
 // table, where its fixtures are built for it.
 func contractDesigns() []string {
 	return []string{
-		"1.2-A", "1.13-A", "3.1-A", "4.1-A", "4.2-A", "4.6-A", "4.6-B", "5.1-B", "5.3-A",
+		"1.2-A", "1.13-A", "2.5-A", "3.1-A", "4.1-A", "4.2-A", "4.6-A", "4.6-B", "5.1-B", "5.3-A",
 		"6.1-A", "6.2-A", "6.2-B", "8.2-A", "8.3-A", "8.5-B", "8.6-A", "9.1-A", "9.2-B",
 		"9.3-B", "9.4-A", "9.4-B",
 	}

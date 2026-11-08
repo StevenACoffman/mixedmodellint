@@ -77,6 +77,10 @@ type lexicon struct {
 	postgresReserved map[string]bool // 5.1-A list 1
 	sql2016Reserved  map[string]bool // 5.1-A list 2
 	eventWords       map[string]bool // 5.1-B: verbs, participles and event nouns
+
+	meaningLexicon
+	agentLexicon
+	contentLexicon
 }
 
 func newLexicon() *lexicon {
@@ -84,6 +88,9 @@ func newLexicon() *lexicon {
 		postgresReserved: wordSet(postgresKeywords),
 		sql2016Reserved:  wordSet(sql2016Keywords),
 		eventWords:       wordSet(eventVerbs),
+		meaningLexicon:   newMeaningLexicon(),
+		agentLexicon:     newAgentLexicon(),
+		contentLexicon:   newContentLexicon(),
 		numbered: regexp.MustCompile(
 			`^(?P<stem>[a-z][a-z_]*?)_?(?P<n>\d+)(?P<suffix>_[a-z]+)?$`,
 		),
@@ -123,7 +130,8 @@ func newLexicon() *lexicon {
 		zoneName:           regexp.MustCompile(`(?i)(_tz|timezone|time_zone|_zone)$`),
 		ianaZone:           regexp.MustCompile(`^(UTC|[A-Za-z]+(/[A-Za-z0-9_+-]+)+)$`),
 		quantityField:      regexp.MustCompile(`(_qty|_quantity|_weight|_length)$`),
-		widerToken:         regexp.MustCompile(`(^|_)(lifetime|header|overall)(_|$)`),
+
+		widerToken: regexp.MustCompile(`(^|_)(lifetime|header|overall)(_|$)`),
 		masterName: regexp.MustCompile(
 			`(?i)(item|sku|product|location|unit|currency|supplier)`),
 		placeholderDefinition: regexp.MustCompile(
