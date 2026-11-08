@@ -10,6 +10,7 @@ require (
 	github.com/peterbourgon/ff/v4 v4.0.0-beta.1
 	github.com/pganalyze/pg_query_go/v6 v6.2.5
 	github.com/wasilibs/go-pgquery v0.0.0-20261027025405-3048dd293555
+	golang.org/x/text v0.43.0
 	golang.org/x/tools v0.52.0
 	google.golang.org/protobuf v1.36.12
 	pgregory.net/rapid v1.3.0
