@@ -221,14 +221,19 @@ func scalarType(t, format string) mml.LogicalType {
 // annotations collects x-mml-* keywords. A list value is joined with ", " and
 // an object or boolean value is kept as its JSON-ish text, since annotation
 // values are plain strings (rule_plan.md §2).
+//
+// maxItems is the JSON spelling of the max-items annotation, so a schema that
+// already bounds an array need not say it twice; x-mml-max-items wins.
 func annotations(d *doc, n *node) mml.Annotations {
 	out := mml.Annotations{}
 	for _, m := range n.membersOrNil() {
 		key, ok := strings.CutPrefix(m.key, annotationPrefix)
-		if !ok {
-			continue
+		if m.key == "maxItems" && !out.Has("max-items") {
+			key, ok = "max-items", true
 		}
-		out[key] = mml.Annotation{Value: scalarText(m.val), Pos: d.pos(m.keyOff)}
+		if ok {
+			out[key] = mml.Annotation{Value: scalarText(m.val), Pos: d.pos(m.keyOff)}
+		}
 	}
 	return out
 }

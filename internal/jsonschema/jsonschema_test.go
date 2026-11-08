@@ -157,3 +157,32 @@ func TestLoadPropertyShapes(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadMaxItems(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		prop string
+		want string
+	}{
+		"maxItems": {`{"type": "array", "maxItems": 20}`, "20"},
+		"x-mml-max-items wins": {
+			`{"type": "array", "x-mml-max-items": "50", "maxItems": 20}`,
+			"50",
+		},
+		"x-mml-max-items after": {
+			`{"type": "array", "maxItems": 20, "x-mml-max-items": "50"}`,
+			"50",
+		},
+		"an unbounded array has none": {`{"type": "array"}`, ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			src := `{"$schema": "x", "type": "object", "properties": {"p": ` + tc.prop + `}}`
+			out := jsonschema.Load([]jsonschema.File{{Path: "thing.schema.json", Src: []byte(src)}})
+			p, _ := out.Entities[0].Field("p")
+			got, _ := p.Annotations.Get("max-items")
+			equals(t, tc.want, got)
+		})
+	}
+}
