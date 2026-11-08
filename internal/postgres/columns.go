@@ -103,6 +103,7 @@ func dropColumn(e *mml.Entity, name string) {
 		e.PrimaryKey = nil
 	}
 	e.Uniques = slices.DeleteFunc(e.Uniques, drop)
+	e.Indexes = slices.DeleteFunc(e.Indexes, drop)
 	e.Refs = slices.DeleteFunc(e.Refs, func(r mml.Ref) bool { return drop(r.Fields) })
 	e.Checks = slices.DeleteFunc(e.Checks, func(c mml.Check) bool {
 		return strings.EqualFold(c.Field, name) || containsFold(c.Columns, name)

@@ -443,3 +443,67 @@ func TestLoadOnDelete(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadIndexesAndChanges(t *testing.T) {
+	t.Parallel()
+	ddl := "CREATE TABLE vendor_orders (id BIGINT PRIMARY KEY, erp_id TEXT, total NUMERIC);\n"
+	at := func(line int) mml.Position {
+		return mml.Position{File: "changes.sql", Line: line, Col: 1}
+	}
+	cases := map[string]struct {
+		sql         string
+		wantIndexes [][]string
+		wantChanges []mml.Change
+	}{
+		"CREATE TABLE alone changes nothing": {},
+		"an index lists its columns": {
+			sql:         "CREATE UNIQUE INDEX ON vendor_orders (erp_id, total);",
+			wantIndexes: [][]string{{"erp_id", "total"}},
+			wantChanges: []mml.Change{{Statement: "CREATE INDEX", Pos: at(2)}},
+		},
+		"an expression ends the column list": {
+			sql:         "CREATE INDEX ON vendor_orders (erp_id, lower(total::text));",
+			wantIndexes: [][]string{{"erp_id"}},
+			wantChanges: []mml.Change{{Statement: "CREATE INDEX", Pos: at(2)}},
+		},
+		"a renamed column renames its index": {
+			sql: "CREATE INDEX ON vendor_orders (erp_id);\n" +
+				"ALTER TABLE vendor_orders RENAME COLUMN erp_id TO source_id;",
+			wantIndexes: [][]string{{"source_id"}},
+			wantChanges: []mml.Change{
+				{Statement: "CREATE INDEX", Pos: at(2)},
+				{Statement: "RENAME", Pos: at(3)},
+			},
+		},
+		"a dropped column drops its index": {
+			sql: "CREATE INDEX ON vendor_orders (erp_id);\n" +
+				"ALTER TABLE vendor_orders DROP COLUMN erp_id;",
+			wantIndexes: [][]string{},
+			wantChanges: []mml.Change{
+				{Statement: "CREATE INDEX", Pos: at(2)},
+				{Statement: "ALTER TABLE", Pos: at(3)},
+			},
+		},
+		"a trigger": {
+			sql: "CREATE TRIGGER audit AFTER UPDATE ON vendor_orders " +
+				"FOR EACH ROW EXECUTE FUNCTION audit();",
+			wantChanges: []mml.Change{{Statement: "CREATE TRIGGER", Pos: at(2)}},
+		},
+		"another table's statements are not this one's": {
+			sql: "CREATE TABLE notes (id BIGINT PRIMARY KEY);\n" +
+				"CREATE INDEX ON notes (id);",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			src := postgres.Load(
+				[]postgres.File{{Path: "changes.sql", Src: []byte(ddl + tc.sql)}},
+				nil,
+			)
+			e := entity(t, src, "vendor_orders")
+			equals(t, tc.wantIndexes, e.Indexes)
+			equals(t, tc.wantChanges, e.Changes)
+		})
+	}
+}

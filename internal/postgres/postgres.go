@@ -208,13 +208,13 @@ func (l *loader) loadStmt(ctx *stmtCtx, n *pg.Node) {
 	case n.GetDropStmt() != nil:
 		l.drop(ctx, n.GetDropStmt())
 	case n.GetRenameStmt() != nil:
-		l.rename(n.GetRenameStmt())
+		l.rename(ctx, n.GetRenameStmt())
 	case n.GetViewStmt() != nil:
 		l.createView(ctx, n.GetViewStmt())
-	case n.GetGrantStmt() != nil:
-		l.grant(ctx, n.GetGrantStmt())
 	default:
-		l.out.Queries = append(l.out.Queries, buildQueries(ctx, n)...)
+		if !l.loadAttached(ctx, n) {
+			l.out.Queries = append(l.out.Queries, buildQueries(ctx, n)...)
+		}
 	}
 }
 
@@ -275,6 +275,7 @@ func (l *loader) alterTable(ctx *stmtCtx, as *pg.AlterTableStmt) {
 	for _, c := range as.GetCmds() {
 		alterCmd(ctx, e, c.GetAlterTableCmd())
 	}
+	recordChange(ctx, e, changeAlter)
 }
 
 // alterCmd applies one ALTER TABLE subcommand. Subcommands that do not change
@@ -402,11 +403,12 @@ func (l *loader) drop(ctx *stmtCtx, ds *pg.DropStmt) {
 // rename applies ALTER TABLE ... RENAME COLUMN and ALTER TABLE ... RENAME TO,
 // so the replayed model has the names the database ends up with. Keys,
 // references and checks naming a renamed column follow it.
-func (l *loader) rename(rs *pg.RenameStmt) {
+func (l *loader) rename(ctx *stmtCtx, rs *pg.RenameStmt) {
 	e, ok := l.find(strings.Split(tableKey(rs.GetRelation()), "."))
 	if !ok {
 		return
 	}
+	recordChange(ctx, e, changeRename)
 	switch rs.GetRenameType() {
 	case pg.ObjectType_OBJECT_COLUMN:
 		renameColumn(e, rs.GetSubname(), rs.GetNewname())
@@ -440,6 +442,9 @@ func renameColumn(e *mml.Entity, from, to string) {
 	rename(e.PrimaryKey)
 	for _, u := range e.Uniques {
 		rename(u)
+	}
+	for _, ix := range e.Indexes {
+		rename(ix)
 	}
 	for i := range e.Refs {
 		rename(e.Refs[i].Fields)
