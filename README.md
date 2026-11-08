@@ -55,7 +55,7 @@ mixedmodellint explain  DESIGN|RULE                   # e.g. explain 7.1-B
 
 | Source      | Files                                                     | Entities                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ----------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SQL         | `*.sql`, replayed in path order                           | `CREATE TABLE` and `CREATE VIEW` after every `ALTER` and `DROP`. Other statements form the query corpus.                                                                                                                                                                                                                                                                                                  |
+| SQL         | `*.sql`, replayed in path order                           | `CREATE TABLE` and `CREATE VIEW` after every `ALTER` and `DROP`, with their grants, indexes, and the statements that changed a table after its `CREATE`. Other statements form the query corpus.                                                                                                                                                                                                          |
 | Go          | Each Go module (a `go.mod`), loaded with type information | Structs with a storage tag (`db`, `gorm`, `bun`, `sql`, `bson`, `parquet`, `avro`), an `mml` tag, or an `//mml:` directive, including fields embedded from other packages. A struct with only `json` tags is a payload, not stored data. SQL passed to `database/sql`, pgx, sqlx or gorm, and to any interface method named like a `database/sql` method (such as sqlc's `DBTX`), joins the query corpus. |
 | JSON Schema | `*.schema.json`, or JSON with `"$schema"`                 | The root object and each object in `$defs` or `definitions`                                                                                                                                                                                                                                                                                                                                               |
 | Sidecar     | `mml.yaml` at the root                                    | Annotations for any entity, and the `owners:` ownership records (§1.13)                                                                                                                                                                                                                                                                                                                                   |
@@ -85,12 +85,12 @@ findings about it are not reported twice.
 
 Some designs also read artifacts other than the model:
 
-| Artifact          | Files                                                    | Read by       |
-| ----------------- | -------------------------------------------------------- | ------------- |
-| Decision records  | `docs/adr/*.md`                                          | 1.1-B         |
-| Logical model     | `model/logical/*.yaml` (`entity`, `attributes`, `keys`)  | 1.1-B         |
-| Ownership records | `model/ownership/<owner>.yaml`, or `owners:` in mml.yaml | 1.13-A, 4.2-A |
-| CODEOWNERS        | `CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS`    | 1.2-A, 4.2-A  |
+| Artifact          | Files                                                    | Read by              |
+| ----------------- | -------------------------------------------------------- | -------------------- |
+| Decision records  | `docs/adr/*.md`                                          | 1.1-B, 1.9-B, 4.11-B |
+| Logical model     | `model/logical/*.yaml` (`entity`, `attributes`, `keys`)  | 1.1-B                |
+| Ownership records | `model/ownership/<owner>.yaml`, or `owners:` in mml.yaml | 1.13-A, 4.2-A        |
+| CODEOWNERS        | `CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS`    | 1.2-A, 4.2-A         |
 
 The walk skips hidden directories other than `.github`, and directories
 whose names start with `_`. It also skips `vendor`, `node_modules`,
@@ -119,6 +119,9 @@ type Order struct {
 { "x-mml-grain": "one row per order", "properties": { "total": { "x-mml-unit": "USD" } } }
 ```
 
+JSON Schema's own `maxItems` counts as `x-mml-max-items`, so a bounded
+array need not say so twice.
+
 A waiver needs a reason. A waiver without one waives nothing and is itself
 reported:
 
@@ -141,6 +144,7 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 1.5-D   | Every join in the query corpus follows a reference, or a shared dimension, between its two sides        |
 | 1.6-B   | Three or more thin lookup tables in a chain (`address → city → state → country`)                        |
 | 1.7-A   | A scratch-named or scratch-schema model that a durable view, query or table depends on                  |
+| 1.9-B   | Shortcut markers (`for now`, TODO) in descriptions name an ADR with Rationale and Cost sections         |
 | 2.2-A   | A declared reference across a domain boundary (schema, package, directory) records its mapping          |
 | 2.3-A   | A classification (`category`, `region`, `tier`…) stored as free text, not a taxonomy reference          |
 | 2.5-A   | Published entities declare a status, describe 90% of columns and give measures a unit or currency       |
@@ -149,23 +153,45 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 2.8-A   | Entities agents may change declare `agent_ops`, matching the grants, and encode status transitions      |
 | 3.1-A   | A life-cycle state that needs history has an event entity, versions or a declared stream                |
 | 3.2-A   | An operational copy of a referenced entity's field states its reason                                    |
+| 3.3-B   | Wide (50+ columns), `obt_` or `layer=obt` tables declare their layer, grain and core `upstream=`        |
 | 3.4-A   | Master and reference data rejects bad records: required, quantity, unit and hierarchy checks            |
+| 3.5-A   | No ALTER, RENAME, index or trigger on a `source=legacy\|third_party` table after its copied schema      |
 | 4.1-A   | Every entity has a primary key, and no key is a mutable value or a bare time                            |
 | 4.1-B   | Every Go and JSON Schema form of an entity carries its key, required and of a compatible type           |
 | 4.2-A   | An entity fed by several systems declares its identity resolution and its owner                         |
 | 4.3-A   | A key renamed since the lock, or rewritten by an UPDATE, without an identity map                        |
+| 4.4-A   | Composite primary keys with natural columns; a natural primary key on a multi-source entity             |
+| 4.4-B   | Natural and legacy IDs (`legacy_*_id`, `email`, `sku`, `natural_key`) lead an index or unique key       |
+| 4.5-A   | A display value of another entity (`customer_name`, `author_email`) with no ID beside it                |
 | 4.6-A   | Entities cut out of a file are keyed by source ID and location                                          |
 | 4.6-B   | An entity referencing a declared file entity declares `location=` and keys on it with the reference     |
+| 4.7-A   | Hash-named primary keys; file entities keyed by name, path or anything but a UUID                       |
+| 4.8-A   | Thirty or more attributes, with nullable prefix groups that apply only to some rows                     |
+| 4.8-B   | A field named for another entity; a warning when this entity references that one (M5)                   |
+| 4.9-A   | A link table's definition names the entities it links, unless it is a `removal_candidate`               |
+| 4.10-A  | Entities split by channel or generic noun (`chat_tickets`, `email_tickets`) with matching fields        |
+| 4.11-A  | Three or more entities repeating a contact, location, agreement or account cluster                      |
+| 4.11-B  | Cluster members, and entities new or redesigned since the lock, record a current `pattern=`             |
 | 5.1-A   | PostgreSQL and SQL:2016 reserved words, bare type words, generic and weakly ambiguous names             |
 | 5.1-B   | Date and time columns are named `<event>_at\|on\|date\|time\|ts` after an event word                    |
+| 5.2-A   | Names follow the dominant case style and table number; no field spelled two ways                        |
+| 5.2-B   | Cryptic abbreviations (`qty`, `cust`) and letters-and-a-number names (`c_3`)                            |
 | 5.3-A   | Every nullable field says what NULL means                                                               |
 | 5.3-B   | `AVG`/`SUM`/`MIN`/`MAX`/`COUNT` of a column whose NULL means zero, or whose NULL is undeclared          |
 | 5.3-C   | Linked Go, SQL and JSON Schema fields agree on whether they may be NULL                                 |
+| 5.4-A   | Status, type, reason and code fields have an allowed list, CHECK or lookup reference                    |
+| 5.4-B   | Every form of a field allows the same codes; no code written twice or as a near-synonym                 |
 | 5.5-A   | Numbered sibling columns (`phone1`…`phone3`) and fixed-size Go arrays                                   |
 | 6.1-A   | Arrays of references instead of a junction table                                                        |
 | 6.2-A   | A column named like a reference with no foreign key or `ref=` declaration                               |
 | 6.2-B   | A nullable reference whose cardinality is mandatory or undeclared                                       |
 | 6.2-C   | A reference declared in one form is a foreign key, and as required, in the others                       |
+| 6.4-A   | A reference with relationship attributes (`spouse_since`); a warning on a self-reference (M5)           |
+| 6.4-B   | A junction with attributes of its own, used as an entity, keyed only by its references                  |
+| 6.4-C   | A change since the lock that adds `_since`, `_role` or a second side to a reference                     |
+| 6.5-B   | Embedded lists named for growth (`history`, `events`) without `maxItems` of at most 100 (a note)        |
+| 6.6-A   | Line items keep the master's price or cost; a warning when the master has validity columns              |
+| 6.7-A   | Inferred-link entities record a confidence, a method and a review status with a pending state           |
 | 7.1-A   | Every entity has a well-formed grain statement whose nouns resolve; a stale `fp=` is reported (M1)      |
 | 7.1-B   | The declared grain matches a primary or unique key                                                      |
 | 7.1-C   | Upsert keys in the query corpus match the declared grain                                                |
@@ -180,6 +206,7 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 7.5-B   | Atomic data dropped, truncated or deleted while an aggregate summarizes it                              |
 | 7.5-C   | Event tables stored as daily counts                                                                     |
 | 7.5-D   | Queries asking for a finer unit than a column holds: by its type, its writes or the grain               |
+| 7.6-A   | Agent-exposed entities declare a grain and coarser roll-ups; chunks state size and overlap (a note)     |
 | 8.2-A   | A junction between a measure-bearing entity and another declares its `m2m` policy                       |
 | 8.3-A   | Every measure declares its additivity class                                                             |
 | 8.3-B   | `SUM` of a semi-additive measure across the dimension it is semi-additive over                          |
@@ -187,6 +214,8 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 8.4-B   | `SUM` or `AVG` of a stored average, ratio or distinct count                                             |
 | 8.5-B   | Stored aggregates key on a period and declare `dimensions=` naming key columns                          |
 | 8.6-A   | Window outputs declare `window=`, `lateness=`, `late_policy=`; sliding windows have no additive measure |
+| 8.8-A   | Identifiers and codes declared as measures; embeddings without a `pooling=` declaration                 |
+| 8.9-B   | Key metrics declare `reconciles_with=` an additive measure on another entity, in the same units         |
 | 9.1-A   | Event, ingestion and processing time are told apart                                                     |
 | 9.1-B   | Aggregations bucketed or filtered by load or processing time while event time exists                    |
 | 9.1-C   | Event time a Go or JSON Schema form carries is stored by the SQL form                                   |
@@ -298,6 +327,53 @@ The heavy lifting is done by libraries focused on each job:
   are not read.
 - **10.9-A** asks for the CHECK in SQL only; a JSON Schema `if`/`then` is not
   read.
+- **1.9-B** reads a `deviation=` annotation naming an ADR by path or file
+  name, inline or in the sidecar, until `mml.yaml` has a `deviations:` list.
+  An issue reference alone does not count. Scratch work is not checked.
+- **3.3-B** uses a fixed 50-column threshold. **3.5-A** treats statements in
+  the file that creates a vendor table as part of the copied schema, does not
+  report a `DROP` (the entity is gone), and knows foreign tables by
+  `source=legacy|third_party` rather than `sources.foreign_schemas`.
+- **4.4-A** counts line ordinals (`line_no`, `seq`, `position`), `valid_from`,
+  `version` and dates as positions or periods rather than natural values, and
+  exempts stored aggregates (`layer=analytical|obt|feature`, `dimensions=`, or
+  a grain per calendar period). In Go and JSON Schema a surrogate key is
+  known by its name. Design C's fan-out count is part of 4.4-A's message.
+  **4.4-B** checks SQL tables only, and not natural keys dropped since the
+  lock.
+- **4.5-A** knows roles (reviewer, author, uploader, owner) from a fixed list;
+  `refers=` names the entity a role stands for.
+- **4.7-A** has no `allow_identity` setting, so a file entity keyed by an
+  integer is reported.
+- **4.8-A** groups sparse fields by name prefix only, not by a CHECK tying
+  them to a discriminator. **4.8-B** leaves copies of a parent's field to
+  3.2-A and does not yet report unnamed foreign groups.
+- **4.9-A** checks that an existing definition names what the link table
+  links; a missing, thin or stale definition is 1.2-A's.
+- **4.10-A** has two of its three signals: the UNION-back query (Design B)
+  is not read yet.
+- **4.11-A** keeps its clusters in code rather than
+  `lexicon/pattern_clusters.yaml`. **4.11-B** does not report repeated
+  identical reasons.
+- **5.2-A** judges SQL and JSON Schema names, not Go's, and says nothing when
+  no style dominates. **5.2-B** knows cryptic tokens from a bundled table,
+  `lexicon/abbreviations.txt`, not an English dictionary, and does not split
+  run-together words (`orderdate`).
+- **5.4-A** skips Go fields, whose const blocks are not loaded, and
+  lookup-table keys, and leaves classifications and regulated codes to 2.3-A
+  and 2.7-A. **5.4-B** counts inserted letters, not changed ones, as a
+  near-synonym: `canceled` and `cancelled`, but not `shipped` and `skipped`.
+- **6.4-A** treats only a self-reference as a peer. **6.4-B** has no glossary
+  exemption.
+- **6.5-A** waits for inline object shapes, which no loader keeps. **6.5-B**
+  reads growth from a list's name only, not from its items' timestamps.
+- **6.6-A** confirms that a price changes from validity columns only; the
+  update-path signal needs the Phase 2 query check.
+- **7.6-A** checks roll-ups against time units and entity names; comparing
+  them with the aggregates derived from the entity needs lineage.
+- **8.8-A** shares its list of identifier and code names with 8.3-A, which
+  now accepts `measure=nominal`.
+- **8.9-B** does not check that the target sits upstream at a finer grain.
 - **`annotate`** prints stubs rather than editing files, and has no
   `--refresh` yet.
 - **`mml.lock.json`** does not record the seed rows of reference entities.
