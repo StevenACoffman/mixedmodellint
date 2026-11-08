@@ -119,3 +119,41 @@ func TestLoadSchemaForms(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadPropertyShapes(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		prop     string
+		wantType mml.LogicalType
+		wantRaw  string
+	}{
+		"one type":          {`{"type": "string"}`, mml.TypeString, "string"},
+		"nullable one type": {`{"type": ["string", "null"]}`, mml.TypeString, "string"},
+		"a union of kinds": {
+			`{"type": ["array", "object", "string"]}`,
+			mml.TypeUnknown,
+			"array|object|string",
+		},
+		"oneOf": {
+			`{"oneOf": [{"type": "string"}, {"type": "integer"}]}`,
+			mml.TypeUnknown,
+			"oneOf",
+		},
+		"anyOf": {
+			`{"anyOf": [{"type": "string"}, {"type": "integer"}]}`,
+			mml.TypeUnknown,
+			"anyOf",
+		},
+		"no type at all": {`{"description": "anything"}`, mml.TypeUnknown, ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			src := `{"$schema": "x", "type": "object", "properties": {"p": ` + tc.prop + `}}`
+			out := jsonschema.Load([]jsonschema.File{{Path: "thing.schema.json", Src: []byte(src)}})
+			p, _ := out.Entities[0].Field("p")
+			equals(t, tc.wantType, p.Type)
+			equals(t, tc.wantRaw, p.RawType)
+		})
+	}
+}

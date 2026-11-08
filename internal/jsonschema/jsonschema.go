@@ -137,26 +137,50 @@ func field(d *doc, m member, p *schemas.Type, required bool) (mml.Field, string)
 		Pos:         d.pos(m.keyOff),
 		Annotations: annotations(d, m.val),
 	}
+	f.Type, f.RawType = propertyType(p)
 	ref := refName(p.Ref)
+	if ref == "" && f.Type == mml.TypeArray && p.Items != nil {
+		ref = refName(p.Items.Ref)
+	}
+	return f, ref
+}
+
+// propertyType maps a property's schema to a logical type and the raw type
+// messages show. A union of kinds has no one logical type, so the raw type
+// keeps the kinds, which lets §10.2-B tell a union from a property with no
+// type; oneOf and anyOf are named, since their branches are not loaded.
+func propertyType(p *schemas.Type) (mml.LogicalType, string) {
+	if ref := refName(p.Ref); ref != "" {
+		return mml.TypeObject, "$ref:" + ref
+	}
 	nonNull := slices.DeleteFunc(
 		slices.Clone([]string(p.Type)),
 		func(t string) bool { return t == "null" },
 	)
 	switch {
-	case ref != "":
-		f.Type, f.RawType = mml.TypeObject, "$ref:"+ref
-	case len(nonNull) == 1 && nonNull[0] == "array":
-		f.Type, f.RawType = mml.TypeArray, "array"
-		if p.Items != nil {
-			ref = refName(p.Items.Ref)
-		}
 	case len(nonNull) == 1:
-		f.Type, f.RawType = scalarType(nonNull[0], p.Format), nonNull[0]
-		if p.Format != "" {
-			f.RawType += " (format " + p.Format + ")"
-		}
+		return singleType(nonNull[0], p.Format)
+	case len(nonNull) > 1:
+		return mml.TypeUnknown, strings.Join(nonNull, "|")
+	case len(p.OneOf) > 0:
+		return mml.TypeUnknown, "oneOf"
+	case len(p.AnyOf) > 0:
+		return mml.TypeUnknown, "anyOf"
+	default:
+		return mml.TypeUnknown, ""
 	}
-	return f, ref
+}
+
+// singleType maps a property of one JSON kind, with its format, if any.
+func singleType(kind, format string) (mml.LogicalType, string) {
+	switch {
+	case kind == "array":
+		return mml.TypeArray, "array"
+	case format != "":
+		return scalarType(kind, format), kind + " (format " + format + ")"
+	default:
+		return scalarType(kind, format), kind
+	}
 }
 
 // anyStrings returns the string members of an enum.
