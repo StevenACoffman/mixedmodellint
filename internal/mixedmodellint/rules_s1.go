@@ -37,13 +37,9 @@ func check11B(c *catalog) []issue {
 	if c.previous == nil {
 		return nil
 	}
-	before := map[string]bool{}
-	for _, e := range c.previous {
-		before[e.ID] = true
-	}
 	var out []issue
 	for _, e := range c.entities {
-		if before[e.ID] || modelGateExempt(e) {
+		if _, existed := c.previousOf(e.ID); existed || modelGateExempt(e) {
 			continue
 		}
 		if is, ok := c.newEntityIssue(e); ok {

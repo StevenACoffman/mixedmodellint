@@ -245,7 +245,7 @@ func TestDesigns(t *testing.T) {
 					{Name: "status", Type: m.TypeString},
 				},
 			}},
-			want: []string{"5.1-A"},
+			want: []string{"5.1-A", "5.4-A"},
 		},
 		"5.1-A third-party schema exempt": {
 			entities: []m.Entity{{

@@ -1,0 +1,40 @@
+# Cryptic abbreviations for rule_plan.md §5.2-B, each with the word it
+# stands for: a name token equal to the first column is reported, and the
+# suggestion spells it out as the second. Curated by hand; standard
+# abbreviations a reader knows (id, url, utc, usd, sku, min, max, avg) are
+# deliberately absent.
+acct account
+addr address
+adj adjusted
+amt amount
+cat category
+cd code
+cnt count
+cust customer
+dept department
+dst destination
+dt date
+emp employee
+flg flag
+hr hour
+ind indicator
+inv invoice
+mgr manager
+mo month
+msg message
+nm name
+num number
+ord order
+pct percent
+prc price
+prod product
+pwd password
+qty quantity
+stat status
+tm time
+tmp temporary
+txn transaction
+usr user
+val value
+wk week
+yr year

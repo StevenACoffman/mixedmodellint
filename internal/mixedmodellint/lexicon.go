@@ -81,6 +81,7 @@ type lexicon struct {
 	meaningLexicon
 	agentLexicon
 	contentLexicon
+	shapeLexicon
 }
 
 func newLexicon() *lexicon {
@@ -91,6 +92,7 @@ func newLexicon() *lexicon {
 		meaningLexicon:   newMeaningLexicon(),
 		agentLexicon:     newAgentLexicon(),
 		contentLexicon:   newContentLexicon(),
+		shapeLexicon:     newShapeLexicon(),
 		numbered: regexp.MustCompile(
 			`^(?P<stem>[a-z][a-z_]*?)_?(?P<n>\d+)(?P<suffix>_[a-z]+)?$`,
 		),

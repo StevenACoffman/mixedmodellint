@@ -336,11 +336,13 @@ func declaredMeasureIssue(e *Entity, f *Field, declared string) (issue, bool) {
 	guess := measureGuess(f.Name)
 	is := issue{entity: e, field: f.Name, pos: f.Pos}
 	switch {
+	case class == "nominal":
+		return issue{}, false // a label, not a quantity (§8.8)
 	case class != "additive" && class != "semi_additive" && class != "non_additive":
 		is.measured = fmt.Sprintf("%s.%s declares measure=%s, which is not a class", e.Name,
 			f.Name, declared)
-		is.suggestion = "Use measure=additive, semi_additive (with over=<dimension>) or " +
-			"non_additive (§8.3)."
+		is.suggestion = "Use measure=additive, semi_additive (with over=<dimension>), " +
+			"non_additive, or nominal for a code (§8.3, §8.8)."
 	case class == "semi_additive" && !f.Annotations.Has("over"):
 		is.measured = fmt.Sprintf("%s.%s is semi-additive but does not say over which "+
 			"dimension it must not be summed", e.Name, f.Name)
@@ -360,8 +362,21 @@ func declaredMeasureIssue(e *Entity, f *Field, declared string) (issue, bool) {
 // measureCandidate reports whether f is a number that is a quantity rather
 // than a key, a reference or a code.
 func measureCandidate(e *Entity, f *Field) bool {
-	return isNumeric(f.Type) && !isKeyOrRef(e, f.Name) &&
-		!strings.HasSuffix(strings.ToLower(f.Name), "_id") && len(f.Enum) == 0 && !hasEnum(e, f)
+	return isNumeric(f.Type) && !isKeyOrRef(e, f.Name) && !nominalName(f.Name) &&
+		len(f.Enum) == 0 && !hasEnum(e, f)
+}
+
+// nominalName reports whether a name says its field identifies or codes
+// something (customer_id, zip_code, sku), so its numbers are labels, not
+// quantities (§8.8).
+func nominalName(name string) bool {
+	n := snakeName(name)
+	for _, suffix := range []string{"_id", "_code", "_key", "zip", "postal", "sku", "phone"} {
+		if strings.HasSuffix(n, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // measureGuess proposes a class from a field's name, additive when the

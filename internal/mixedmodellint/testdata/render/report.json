@@ -40,6 +40,20 @@
       "fingerprint": "065e51f97be64299"
     },
     {
+      "rule": "5.4",
+      "design": "5.4-A",
+      "severity": "warning",
+      "entity": "order_lines",
+      "entity_id": "sql:order_lines",
+      "field": "code",
+      "file": "db/schema.sql",
+      "line": 12,
+      "column": 1,
+      "measured": "order_lines.code is a coded value with no allowed list, so any string can be written to it",
+      "suggestion": "Add CHECK (code IN ('<value1>', '<value2>', ...)), or reference a lookup table of the codes; waive this with a reason if it is free text (§5.4).",
+      "fingerprint": "d5a82dbf4c7b3999"
+    },
+    {
       "rule": "5.1",
       "design": "5.1-A",
       "severity": "error",
@@ -68,6 +82,20 @@
       "fingerprint": "0f009a754b7d153d"
     },
     {
+      "rule": "5.4",
+      "design": "5.4-A",
+      "severity": "warning",
+      "entity": "order_lines",
+      "entity_id": "sql:order_lines",
+      "field": "kind",
+      "file": "db/schema.sql",
+      "line": 16,
+      "column": 3,
+      "measured": "order_lines.kind is a coded value with no allowed list, so any string can be written to it",
+      "suggestion": "Add CHECK (kind IN ('<value1>', '<value2>', ...)), or reference a lookup table of the codes; waive this with a reason if it is free text (§5.4).",
+      "fingerprint": "dc1dabc8a1ea9280"
+    },
+    {
       "rule": "5.1",
       "design": "5.1-A",
       "severity": "warning",
@@ -84,7 +112,7 @@
   ],
   "summary": {
     "errors": 5,
-    "warnings": 1,
+    "warnings": 3,
     "notes": 1,
     "entities": 2,
     "queries": 0,

@@ -24,7 +24,7 @@ func knownKey(key string) bool {
 		"breakdowns", "scale", "pooling", "key_metric", "reconciles_with", "tolerance",
 		"encoding", "end", "interval", "lifespan", "audit", "precision", "synthetic", "core",
 		"extension", "dedup", "derived", "aspects", "label", "observation_time", "actor",
-		"monitored_by", "meta", "quality", "graph":
+		"monitored_by", "meta", "quality", "graph", "embedding":
 		return true
 	default:
 		return false

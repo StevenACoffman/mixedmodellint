@@ -2,6 +2,7 @@ package mixedmodellint
 
 import (
 	"cmp"
+	"slices"
 	"strings"
 )
 
@@ -85,6 +86,16 @@ func (c *catalog) lookup(name string, from SourceKind) *Entity {
 	return nil
 }
 
+// previousOf returns the entity with ID id in the previous model, and false
+// when there is no previous model or id is new in this change.
+func (c *catalog) previousOf(id string) (*Entity, bool) {
+	i := slices.IndexFunc(c.previous, func(e *Entity) bool { return e.ID == id })
+	if i < 0 {
+		return nil, false
+	}
+	return c.previous[i], true
+}
+
 // parents returns the entities e references, each once, in reference order.
 func (c *catalog) parents(e *Entity) []*Entity {
 	var out []*Entity
@@ -154,16 +165,27 @@ func run(c *catalog, designs []design) []Finding {
 func allDesigns() []design {
 	var ds []design
 	ds = append(ds, section1Designs()...)
+	ds = append(ds, section1DeviationDesigns()...)
 	ds = append(ds, section2Designs()...)
 	ds = append(ds, section2VocabDesigns()...)
 	ds = append(ds, section2OpsDesigns()...)
 	ds = append(ds, section3Designs()...)
+	ds = append(ds, section3LayerDesigns()...)
 	ds = append(ds, section4Designs()...)
+	ds = append(ds, section4KeyDesigns()...)
+	ds = append(ds, section4SplitDesigns()...)
+	ds = append(ds, section4PatternDesigns()...)
 	ds = append(ds, section5Designs()...)
+	ds = append(ds, section5NameDesigns()...)
+	ds = append(ds, section5CodeDesigns()...)
 	ds = append(ds, section6Designs()...)
+	ds = append(ds, section6PromoteDesigns()...)
+	ds = append(ds, section6CaptureDesigns()...)
 	ds = append(ds, section7Designs()...)
 	ds = append(ds, section7QueryDesigns()...)
+	ds = append(ds, section7ExposedDesigns()...)
 	ds = append(ds, section8Designs()...)
+	ds = append(ds, section8MetricDesigns()...)
 	ds = append(ds, section9Designs()...)
 	ds = append(ds, section10Designs()...)
 	ds = append(ds, section10AgentDesigns()...)

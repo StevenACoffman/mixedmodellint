@@ -94,6 +94,14 @@ tmp.sql:1: error: [1.7-A] tmp_orders looks like a scratchpad model (its name is 
 tmp.sql:1: error: [1.7-A] tmp_orders looks like a scratchpad model (its name is a scratch pattern), but view order_report depends on it
     suggestion: Promote tmp_orders: rename it to the convention (for example fct_ or dim_), add an owner, column descriptions and tests, and declare lifecycle=recurring (§1.7).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.9-B no cost
+products.sql:3: warning: [1.9-B] the description of products.attributes says "for now", and its ADR docs/adr/0007-catalog-json.md has no filled-in Cost section
+    suggestion: Complete docs/adr/0007-catalog-json.md with a Rationale section (why the shortcut was taken) and a Cost section (what it costs, such as every analytics extract having to unpack it), or remove the marker if it is not a modeling shortcut (§1.9).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 1.9-B no record
+products.sql:3: warning: [1.9-B] the description of products.attributes says "for now", and no deviation record states its rationale and cost
+    suggestion: Annotate products.attributes with deviation=<ADR path> and give that ADR a Rationale section (why the shortcut was taken) and a Cost section (what it costs, such as every analytics extract having to unpack it), or remove the marker if it is not a modeling shortcut (§1.9).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
 == 10.1-A unclassified
 customers.sql:3: warning: [10.1-A] customers.updated_at is a metadata attribute that does not say whether it records the business or the system
     suggestion: Rename it customer_updated_at (business: when the customer changed) or _loaded_at (system: when the pipeline wrote the row), or annotate time=business|system (meta= for a field that is not a time), and describe it as such (§10.1).
@@ -208,6 +216,14 @@ orders.sql:3: warning: [3.2-A] orders.email, invoices.email copies customers.ema
 orders.sql:4: warning: [3.2-A] orders.customer_tier, invoices.customer_tier copies customers.tier without a stated reason
     suggestion: Read tier through the join to customers, or state why it is denormalized: denormalized_for=latency_sla:<what must answer how fast>, access_pattern:<the read that needs it> or other:<reason>, in at least three words (§3.2).
 0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 3.3-B bad upstream
+report.sql:1: warning: [3.3-B] wide table order_report (50 columns) declares no grain; its upstream names unknown entities: carts; its upstream names entities that are not layer=core: stg_orders
+    suggestion: Annotate order_report with layer=obt, its grain and upstream=<the core entities it is built from>, or reduce it to a modeled entity (§3.3).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 3.3-B no contract
+wide.sql:1: warning: [3.3-B] wide table order_report (50 columns) declares no layer, grain or upstream
+    suggestion: Annotate order_report with layer=obt, its grain and upstream=<the core entities it is built from>, or reduce it to a modeled entity (§3.3).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
 == 3.4-A candidate
 products.sql:1: note: [3.4-A] products is referenced by 5 entities and named like master data, but is not declared master or reference data
     suggestion: Declare master=true (or layer=reference) so its write-time checks are enforced, or master=false if it is not (§3.4).
@@ -215,6 +231,10 @@ products.sql:1: note: [3.4-A] products is referenced by 5 entities and named lik
 == 3.4-A unchecked
 items.sql:3: warning: [3.4-A] master entity items: pack_qty is a quantity with no range check (CHECK (pack_qty > 0))
     suggestion: Add NOT NULL and a CHECK on pack_qty so bad records are rejected at write time (§3.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 3.5-A alter
+db/007_extend.sql:3: warning: [3.5-A] db/007_extend.sql runs ALTER TABLE on vendor_orders, a third-party table this team does not control
+    suggestion: Leave vendor_orders untouched: put extra columns in vendor_orders_ext in a schema you own, keyed by its id, or build what you need downstream in staging; waive this with a reason for a vendor-sanctioned extension point (§3.5).
 0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
 == 4.1-A no key
 runs.sql:1: error: [4.1-A] runs has no primary key
@@ -238,6 +258,34 @@ order.schema.json:1: error: [4.1-B] JSON Schema order represents order but has n
 order.schema.json:2: error: [4.1-B] order.order_id holds the key orders.order_id but is optional
     suggestion: Make order.order_id required (§4.1).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.10-A channels
+chat_tickets.sql:1: warning: [4.10-A] chat_tickets and email_tickets differ only by chat or email in their names, and 100% of their fields match
+    suggestion: Merge chat_tickets and email_tickets into one entity with a column that says which kind each row is, or, if the split is deliberate (performance or access control), key both by one shared ID and declare split_reason (§4.10).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.10-A structure
+support_requests.sql:1: note: [4.10-A] support_requests and complaints have unrelated names, but 100% of their fields match
+    suggestion: Merge support_requests and complaints into one entity with a column that says which kind each row is, or, if the split is deliberate (performance or access control), key both by one shared ID and declare split_reason (§4.10).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
+== 4.11-A cluster
+customers.sql:1: warning: [4.11-A] 3 entities (customers, employees, vendors) each repeat the party contact attributes (name, email, phone, address_line1, city, postal_code, country)
+    suggestion: Before adding another, evaluate the party_role pattern: a party(party_id, party_type) with party_role(party_id, role) and contact_method(party_id, kind, value), each entity keyed by party_id. Weigh its cost (self-joins, generic names stakeholders do not use), then record the decision on each entity with pattern=party_role=adopted|rejected reason="..." (§4.11).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.11-B grown group
+customers.sql:1: warning: [4.11-B] customers is one of 3 entities repeating the party contact attributes, but its decision was weighed when there were 2
+    suggestion: Weigh whether the party_role pattern fits it now, and record pattern=party_role=adopted|adapted|rejected reason="..." members=3, or pattern=none-applicable reason="..." (§4.11).
+employees.sql:1: warning: [4.11-B] employees is one of 3 entities repeating the party contact attributes, but its decision was weighed when there were 2
+    suggestion: Weigh whether the party_role pattern fits it now, and record pattern=party_role=adopted|adapted|rejected reason="..." members=3, or pattern=none-applicable reason="..." (§4.11).
+vendors.sql:1: warning: [4.11-B] vendors is one of 3 entities repeating the party contact attributes, but its decision was weighed when there were 2
+    suggestion: Weigh whether the party_role pattern fits it now, and record pattern=party_role=adopted|adapted|rejected reason="..." members=3, or pattern=none-applicable reason="..." (§4.11).
+0 error(s), 3 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.11-B no record
+customers.sql:1: warning: [4.11-B] customers is one of 3 entities repeating the party contact attributes, but it records no pattern decision
+    suggestion: Weigh whether the party_role pattern fits it now, and record pattern=party_role=adopted|adapted|rejected reason="..." members=3, or pattern=none-applicable reason="..." (§4.11).
+employees.sql:1: warning: [4.11-B] employees is one of 3 entities repeating the party contact attributes, but it records no pattern decision
+    suggestion: Weigh whether the party_role pattern fits it now, and record pattern=party_role=adopted|adapted|rejected reason="..." members=3, or pattern=none-applicable reason="..." (§4.11).
+vendors.sql:1: warning: [4.11-B] vendors is one of 3 entities repeating the party contact attributes, but it records no pattern decision
+    suggestion: Weigh whether the party_role pattern fits it now, and record pattern=party_role=adopted|adapted|rejected reason="..." members=3, or pattern=none-applicable reason="..." (§4.11).
+0 error(s), 3 warning(s), 0 note(s) in 0 entities and 0 queries
 == 4.2-A bad mapping
 customers.sql:1: error: [4.2-A] customers merges records from several systems (crm, stripe), but resolution customer_map lacks source_id; customer_map does not allow source system stripe; resolution_owner "sales" is not a team, group, role or CODEOWNERS principal
     suggestion: Declare resolution=<the mapping entity from source IDs to customer_id> and resolution_owner=<team>, with a mapping of customer_id, source_system and source_id (§4.2, §4.3).
@@ -258,6 +306,24 @@ accounts.sql:2: warning: [4.3-A] identifier accounts.account_id was renamed to a
 q.sql:4: warning: [4.3-A] an UPDATE rewrites the identifier accounts.account_id in place, and no entity references accounts
     suggestion: Introduce account_id_map(account_id, source_system, source_id) and move consumers to it before changing identifiers in place (§4.3). Then run mixedmodellint lock to record the new shape.
 0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.4-A composite
+people.sql:1: warning: [4.4-A] people's primary key (first_name, last_name) is composite and includes natural values (first_name, last_name); references from visits repeat all 2 key columns, where a surrogate key would need one
+    suggestion: Add person_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY and keep (first_name, last_name) as a unique index for lookups (§4.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.4-A merged
+customers.sql:1: warning: [4.4-A] customers is keyed by the natural value email, but it merges records from several systems (crm, erp), which can disagree about it
+    suggestion: Add customer_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY and keep (email) as a unique index for lookups (§4.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.4-B unindexed
+accounts.sql:3: warning: [4.4-B] accounts.legacy_crm_id looks like a natural or legacy identifier, but no index or unique key starts with it
+    suggestion: Add CREATE UNIQUE INDEX ON accounts (legacy_crm_id), or a non-unique index if duplicates are expected (§4.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.5-A display
+tickets.sql:2: warning: [4.5-A] tickets.customer_name identifies a customer by a display value that can change, and tickets has no customer_id
+    suggestion: Add customer_id referencing customers.customer_id and keep customer_name only as a denormalized label (§4.5).
+tickets.sql:3: warning: [4.5-A] tickets.reviewer_email identifies a reviewer by a display value that can change, and tickets has no reviewer_id
+    suggestion: Add reviewer_id referencing reviewer.reviewer_id and keep reviewer_email only as a denormalized label (§4.5).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
 == 4.6-A by filename
 detections.sql:1: error: [4.6-A] detections is derived from its source but refers to its source by file name or path; has no field referencing the source by ID
     suggestion: Identify each instance by (its source_id, <location fields>), for example detections(video_id, ts_start, ts_end, bbox, label), with UNIQUE (its source_id, <location fields>) (§4.6).
@@ -286,6 +352,26 @@ detections.sql:5: error: [4.6-B] detections references the unstructured source v
 detections.sql:5: error: [4.6-B] detections references the unstructured source videos but no key of detections covers (video_id, ts_start)
     suggestion: Declare location=<fields> on detections naming the fields that locate each instance inside videos, and add UNIQUE (video_id, <location fields>); declare location=whole_file if it describes the whole file (§4.6).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.7-A hash key
+images.sql:2: warning: [4.7-A] images is keyed by sha256, a hash of its content, which changes whenever the content is edited and orphans every reference
+    suggestion: Use image_id UUID PRIMARY KEY DEFAULT gen_random_uuid() and keep sha256 as a non-key attribute (for a hash, content_sha256 CHAR(64)), or key a separate image_versions table by it (§4.7).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.8-A sparse groups
+customers.sql:1: warning: [4.8-A] customers has 31 attributes, of which 3, in nullable groups sharing a prefix (billing_*), appear to apply only to some rows
+    suggestion: Move each group to its own entity keyed by customer_id (for example customer_billing), or split customers into subtype tables by a discriminator (§4.8).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.8-B name only
+orders.sql:3: note: [4.8-B] orders.customer_loyalty_tier is named for customers, so it may describe customers rather than orders
+    suggestion: Move customer_loyalty_tier to customers and reference customers from orders, or annotate denormalized_from=customers if it is a deliberate copy (§4.8).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
+== 4.8-B referenced
+orders.sql:4: warning: [4.8-B] orders.customer_loyalty_tier is named for customers, which orders references, so it describes customers rather than orders
+    suggestion: Move customer_loyalty_tier to customers and read it through the reference, or annotate denormalized_from=customers if it is a deliberate copy (§4.8).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 4.9-A unnamed sides
+xref.sql:1: warning: [4.9-A] customer_product_xref links customers and products, but its definition does not mention customers or products
+    suggestion: Ask the domain experts what customer_product_xref records and define it as that business relationship (for example, a customer has saved a product to a wishlist), naming what it links; if no one can say, mark it removal_candidate=<ticket> (§4.9).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
 == 5.1-B bare suffix
 items.sql:2: error: [5.1-B] items.ts is a timestamptz but its name does not end in _at, _on, _date, _time or _ts after the event it records
     suggestion: Rename ts to <event>_at, for example created_at, shipped_at or expires_at, so the name says which event it records (§5.1).
@@ -302,6 +388,22 @@ items.sql:2: error: [5.1-B] items.expiry is a date but its name does not end in 
 items.sql:2: error: [5.1-B] items.shade_time is a time but its name does not say which event it records: shade is not an event word
     suggestion: Rename shade_time to <event>_time, for example created_time, shipped_time or expires_time, so the name says which event it records (§5.1).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.2-A number
+e.sql:1: warning: [5.2-A] shipment is not plural, though most SQL entity names are
+    suggestion: Name it in the plural like the others (§5.2).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.2-A style and spelling
+orders.sql:7: warning: [5.2-A] orders.shippedAt is camelCase, but 71% of the model's SQL field names are snake_case
+    suggestion: Rename it to shipped_at: ALTER TABLE orders RENAME COLUMN shippedAt TO shipped_at (§5.2).
+orders.sql:8: warning: [5.2-A] orders.placed_at and orders.PlacedAt are the same words spelled two ways, so they read as two attributes
+    suggestion: Keep one spelling, in the model's convention, and merge or rename the other (§5.2).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.2-B cryptic
+lines.sql:2: warning: [5.2-B] order_lines.cust_qty uses the abbreviation cust and qty
+    suggestion: Spell it out as customer_quantity (§5.2).
+lines.sql:3: warning: [5.2-B] order_lines.c_3 is a few letters and a number, which says nothing about what it holds
+    suggestion: Name it for what it holds, in the business's words (§5.2).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
 == 5.3-A not applicable
 orders.sql:3: error: [5.3-A] orders.d is null when not applicable, but null_when does not name a field of orders
     suggestion: Add null_when: <predicate> naming the field that decides it, for example <field> = '<value>' (§5.3).
@@ -350,6 +452,18 @@ order.schema.json:3: error: [5.3-C] orders.note may be NULL, but order.note, its
 orders.sql:3: error: [5.3-C] order.note may be NULL, but orders.note, its form in SQL table orders, may not; there a NULL becomes a failed write, since the column is NOT NULL
     suggestion: Align them: make orders.note nullable, or make order.note NOT NULL (required) if it is never NULL (§5.3).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.4-A and B codes
+orders.sql:2: warning: [5.4-A] orders.status is a coded value with no allowed list, so any string can be written to it
+    suggestion: Add CHECK (status IN ('<value1>', '<value2>', ...)), or reference a lookup table of the codes; waive this with a reason if it is free text (§5.4).
+orders.sql:3: warning: [5.4-B] in the allowed list of orders.hold_reason, "defect" and "defective" look like variants of one code
+    suggestion: Keep one canonical code for each and map the others to it in a lookup table; waive this with a reason if they are distinct codes (§5.4).
+orders.sql:3: error: [5.4-B] in the allowed list of orders.hold_reason, "fraud" and "FRAUD" are the same code written differently
+    suggestion: Keep one canonical code for each and map the others to it in a lookup table; waive this with a reason if they are distinct codes (§5.4).
+1 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
+== 5.4-B forms disagree
+orders.sql:2: error: [5.4-B] orders.status and order.status allow different values: "held" is missing from the SQL table orders
+    suggestion: Make every form allow the same codes, generating them from one list if you can (§5.4).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 6.1-A lists
 posts.sql:3: error: [6.1-A] posts.tag_ids stores a list of tag references, so the pairs cannot be constrained, indexed or joined
     suggestion: Replace it with a junction table post_tag(post_id REFERENCES posts, tag_id REFERENCES tag, PRIMARY KEY (post_id, tag_id)), one row per pair (§6.1).
@@ -374,6 +488,30 @@ orders.sql:3: error: [6.2-C] Order.CustomerID references Customer in Go struct O
 order.schema.json:3: error: [6.2-C] orders.customer_id is a required reference to customers in SQL table orders (orders.sql:9), but order.customer_id is optional
     suggestion: Make order.customer_id required, as orders.customer_id is (§6.2). A read model that makes it optional on purpose declares waive.
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.4-A self pair
+people.sql:4: warning: [6.4-A] people.spouse_id carries relationship data (spouse_since), and it refers to another person, so the data belongs to the pair
+    suggestion: Promote the relationship to an entity, person_spouse(person_spouse_id, person_a_id, person_b_id, spouse_since), and drop spouse_id and its satellites from people (§6.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.4-B fat junction
+student_courses.sql:1: warning: [6.4-B] student_courses links by (student_id, course_id) but has 2 attributes of its own (grade, enrolled_on), and transcripts references it
+    suggestion: Give it a surrogate key student_course_id, keep (student_id, course_id) UNIQUE, and name it for the business relationship (enrollment, not student_course) (§6.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.4-C since the lock
+people.sql:4: warning: [6.4-C] this change adds spouse_since to people, data about its spouse relationship
+    suggestion: Model the spouse relationship as its own entity, keyed by both sides, instead of widening people (§6.4).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.5-B unbounded
+customer.schema.json:2: note: [6.5-B] customer.order_history embeds a list named like one that only grows, with no bound of at most 100 items
+    suggestion: Move the items to their own collection keyed by customer_id, or declare max-items (JSON Schema: maxItems) of at most 100 if the list is truly bounded (§6.5).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
+== 6.6-A no snapshot
+order_lines.sql:1: warning: [6.6-A] order_lines references products but keeps no copy of products.unit_price from when the transaction happened; products has validity columns, so unit_price changes by design
+    suggestion: Add order_lines.unit_price NUMERIC(12,2) NOT NULL, copied from products at insert, so historical totals do not change when unit_price does (§6.6).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.7-A incomplete
+matches.sql:1: note: [6.7-A] customer_matches records inferred links but lacks a match method or model version and a review status with a pending-review state
+    suggestion: Add confidence NUMERIC NOT NULL, match_method TEXT NOT NULL and review_status CHECK (review_status IN ('auto_applied', 'pending_review', 'rejected', 'confirmed')) (§6.7).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
 == 7.4-A three ways
 lines.sql:4: note: [7.4-A] order_lines.order_note is named after orders, a coarser grain, so it repeats on every order_line row and inflates sums
     suggestion: Move order_note to orders, or mark it measure=non_additive and declare denormalized_for=<reason> (§7.4).
@@ -398,6 +536,10 @@ q.sql:9: warning: [7.5-B] a retention DELETE removes rows of clicks while daily_
 q.sql:9: warning: [7.5-B] a TRUNCATE empties clicks while daily_clicks summarizes it, so the aggregate can no longer be drilled into or re-cut
     suggestion: Archive clicks to cold storage instead, or, if an upstream system still holds the same events, declare recoverable_from: <upstream> on it (in mml.yaml for a dropped table) and keep its keys on daily_clicks (§7.5).
 0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 7.6-A rollups
+readings.sql:1: note: [7.6-A] readings is exposed to agents, but these roll-ups are not coarser than its grain: hour; these roll-ups name neither a time unit nor an entity: weekly_readings
+    suggestion: Give readings a grain (grain="one row per ...") and rollups=<time units coarser than the grain, or the aggregate entities that serve them>, so agents answer from the coarsest entity that can (§7.6).
+0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
 == 8.2-A hazard
 order_tags.sql:1: warning: [8.2-A] order_tags links orders and tags many-to-many, so summing orders.order_total grouped by tags counts each order once per tag and the groups overlap
     suggestion: Declare m2m=overlapping on order_tags and label reports as overlapping; or add allocation_weight NUMERIC NOT NULL CHECK (allocation_weight BETWEEN 0 AND 1) summing to 1 per order and declare m2m=allocated(allocation_weight); or add is_primary BOOLEAN with a partial unique index and declare m2m=primary(is_primary) (§8.2).
@@ -420,7 +562,7 @@ sales.sql:3: error: [8.3-A] sales.units is semi-additive but does not say over w
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 8.3-A not a class
 sales.sql:3: error: [8.3-A] sales.units declares measure=summable, which is not a class
-    suggestion: Use measure=additive, semi_additive (with over=<dimension>) or non_additive (§8.3).
+    suggestion: Use measure=additive, semi_additive (with over=<dimension>), non_additive, or nominal for a code (§8.3, §8.8).
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 8.3-A undeclared
 sales.sql:3: error: [8.3-A] sales.stock_level has no additivity class
@@ -462,6 +604,22 @@ clicks_5m.sql:1: error: [8.6-A] clicks_5m stores windowed aggregates but window=
 clicks_5m.sql:1: error: [8.6-A] clicks_5m stores windowed aggregates but it does not declare window=, lateness=, late_policy=
     suggestion: Declare window=tumbling(5m), sliding(<size>,<slide>) or session(<gap>), lateness=<duration> and late_policy=drop|update|side_output (§8.6). A sliding window counts each event once per overlapping window, so its measures are measure=non_additive.
 1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.8-A nominal
+customers.sql:2: warning: [8.8-A] customers.store_id identifies or codes something, so its average is meaningless, but it is declared measure=additive
+    suggestion: Remove the measure declaration from store_id, or declare measure=nominal; if it is a coded scale that may be averaged, declare scale=ordinal or scale=interval (§8.8).
+customers.sql:3: note: [8.8-A] customers.zip_code is named like an identifier or code, so its average is likely meaningless, but it is declared measure=additive
+    suggestion: Store zip_code as text so arithmetic cannot apply, or declare measure=nominal; if it is a coded scale that may be averaged, declare scale=ordinal or scale=interval (§8.8).
+customers.sql:4: warning: [8.8-A] customers.embedding is an embedding with no valid pooling declaration, so nothing stops it being averaged across topics
+    suggestion: Declare pooling=none, or pooling=same_topic(<cluster column>) if vectors may be averaged within one cluster (§8.8).
+0 error(s), 2 warning(s), 1 note(s) in 0 entities and 0 queries
+== 8.9-B none
+r.sql:2: warning: [8.9-B] daily_revenue.revenue_usd is a key metric, but it declares no reconciles_with
+    suggestion: Declare reconciles_with=<atomic entity>.<additive measure> on daily_revenue.revenue_usd, with tolerance= if they may differ, so CI can check that both ways of computing it agree (§8.9).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 8.9-B units
+daily_revenue.sql:2: warning: [8.9-B] daily_revenue.revenue_usd is a key metric, but its currency, USD, differs from that of order_lines.revenue_eur, EUR
+    suggestion: Declare reconciles_with=<atomic entity>.<additive measure> on daily_revenue.revenue_usd, with tolerance= if they may differ, so CI can check that both ways of computing it agree (§8.9).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
 == 9.1-A conflict
 loads.sql:2: error: [9.1-A] loads.loaded_event_at is named as two kinds of time at once
     suggestion: Rename loaded_event_at, or declare time=event|ingested|processed on it (§9.1).

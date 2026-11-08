@@ -45,12 +45,8 @@ func section4Designs() []design {
 // assigns a primary-key column.
 func check43A(c *catalog) []issue {
 	var out []issue
-	before := map[string]*Entity{}
-	for _, e := range c.previous {
-		before[e.ID] = e
-	}
 	for _, e := range c.entities {
-		old, ok := before[e.ID]
+		old, ok := c.previousOf(e.ID)
 		if !ok {
 			continue
 		}
