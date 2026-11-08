@@ -141,6 +141,12 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 1.5-D   | Every join in the query corpus follows a reference, or a shared dimension, between its two sides        |
 | 1.6-B   | Three or more thin lookup tables in a chain (`address → city → state → country`)                        |
 | 1.7-A   | A scratch-named or scratch-schema model that a durable view, query or table depends on                  |
+| 2.2-A   | A declared reference across a domain boundary (schema, package, directory) records its mapping          |
+| 2.3-A   | A classification (`category`, `region`, `tier`…) stored as free text, not a taxonomy reference          |
+| 2.5-A   | Published entities declare a status, describe 90% of columns and give measures a unit or currency       |
+| 2.7-A   | A diagnosis, country, currency or similar code names its standard; raised by a second signal (M5)       |
+| 2.7-B   | An enum whose values are mostly ISO 3166, ISO 4217 or ISO 639 codes declares the standard and uses it   |
+| 2.8-A   | Entities agents may change declare `agent_ops`, matching the grants, and encode status transitions      |
 | 3.1-A   | A life-cycle state that needs history has an event entity, versions or a declared stream                |
 | 3.2-A   | An operational copy of a referenced entity's field states its reason                                    |
 | 3.4-A   | Master and reference data rejects bad records: required, quantity, unit and hierarchy checks            |
@@ -191,6 +197,16 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 9.4-B   | File entities are not deduplicated by file name                                                         |
 | 9.8-A   | Event time stored with less precision than its source provides                                          |
 | 9.8-B   | Event time truncated on the way to storage (`date_trunc`, `::timestamp(0)`, `Truncate`, `Format`)       |
+| 10.1-A  | Audit and load columns say whether they record the business or the system, and describe it              |
+| 10.2-A  | Records kept in a JSON column instead of typed columns, or no column for a schema's extension           |
+| 10.2-B  | Required or core JSON Schema properties with a union of kinds or no type                                |
+| 10.3-A  | File content stored in a row; stored-object references without who, when, what and version              |
+| 10.4-A  | One blended sentiment score with no per-aspect scores                                                   |
+| 10.6-A  | Agent-action entities keep the prompt, the tools available and the model, all required                  |
+| 10.7-A  | Training or agent data comes with model_version, agent_run and tool_call entities and their links       |
+| 10.9-A  | Data that may be synthetic carries `is_synthetic`, `generator_version`, `source_dataset_id` and a CHECK |
+| 10.10-A | Graph edge endpoints are enforced, required foreign keys that do not SET NULL                           |
+| 10.10-B | Relationship types kept as rows, not one table per relationship or a closed enum (a note)               |
 | `mml/*` | Parse errors, unknown annotation keys, inline/sidecar conflicts, waivers without a reason, a stale lock |
 
 The heavy lifting is done by libraries focused on each job:
@@ -255,6 +271,33 @@ The heavy lifting is done by libraries focused on each job:
 - **9.1-C** compares event time only; it does not read Go tags that map an
   event field onto an ingestion column.
 - **9.2-B** trusts a `local_` name only on a date or time field.
+- **2.2-A** takes domains from a `domain` annotation, the SQL schema
+  (`public` is none), the Go package or the JSON Schema directory, until
+  `mml.yaml` has `domains.<name>.paths`. A mapping is recorded on the
+  referencing field (`mapping=`), not in a sidecar `boundaries:` list.
+- **2.5-A** leaves the definition and owner to 1.2-A, which asks the same
+  entities for them. Its thresholds (four words, 90% of columns) are fixed.
+  Views are not checked.
+- **2.7-A** has no regulated-domain signal, which needs `domains[].regulated`.
+  **2.7-B**'s ISO lists are generated from `golang.org/x/text` by
+  `internal/tools/genvaluesets`; codes ISO has withdrawn but CLDR still knows
+  (`YU`, `SU`) count as standard.
+- **2.8-A** knows an agent's database role by its name (`agent`, `llm`, `ai`,
+  `bot`…) rather than an `agents.roles` setting, and does not compare a
+  transitions table's values with the status enum, which needs seed rows.
+- **10.1-A** counts only names in its metadata lexicon (`updated_at`,
+  `_loaded_at`, `batch_id`…); rule_plan.md also counts every other temporal
+  field, which §9.1 already asks to declare its kind.
+- **10.2-A** reads an extension point from `x-mml-extension` only, not from
+  `additionalProperties`. **10.2-B** leaves `oneOf` and `anyOf` alone, since
+  their branches are not loaded.
+- **10.3-A** treats `file_url`, `image_key`, `object_key` and similar as
+  references to stored objects, not any `_url`, so a `website_url` is not one.
+- **10.7-A** takes its signals from the model alone (training or feature
+  layers, agent-action entities); MLflow, wandb, model files and SDK imports
+  are not read.
+- **10.9-A** asks for the CHECK in SQL only; a JSON Schema `if`/`then` is not
+  read.
 - **`annotate`** prints stubs rather than editing files, and has no
   `--refresh` yet.
 - **`mml.lock.json`** does not record the seed rows of reference entities.
