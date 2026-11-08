@@ -14,12 +14,13 @@ type Status string
 //
 //mml:grain one row per order
 type Order struct {
-	ID          int64       `db:"id"`
-	CustomerID  int64       `db:"customer_id"`
-	Status      Status      `db:"status"`
-	Lines       []OrderLine `db:"-"`
-	ShippingFee int64       `db:"shipping_fee"`
-	PlacedAt    time.Time   `db:"placed_at"`
+	ID         int64       `db:"id"`
+	CustomerID int64       `db:"customer_id"`
+	Status     Status      `db:"status"`
+	Lines      []OrderLine `db:"-"`
+	// ShippingFee is what the customer pays for delivery, in cents.
+	ShippingFee int64     `db:"shipping_fee"`
+	PlacedAt    time.Time `db:"placed_at"`
 	audit.Stamps
 }
 
@@ -28,7 +29,7 @@ type OrderLine struct {
 	OrderID int64  `db:"order_id" mml:"pk"`
 	LineNo  int    `db:"line_no" mml:"pk"`
 	Order   *Order `db:"-"`
-	Note    string `json:"note,omitempty" db:"note"`
+	Note    string `json:"note,omitempty" db:"note"` // what the customer asked for
 }
 
 // Response is serialized but not stored.

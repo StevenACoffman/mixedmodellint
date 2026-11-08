@@ -5,6 +5,7 @@ import "time"
 
 // Stamps is embedded in every persisted struct.
 type Stamps struct {
+	// CreatedAt is when the row was first written.
 	CreatedAt time.Time  `db:"created_at"`
 	UpdatedAt *time.Time `db:"updated_at"`
 }

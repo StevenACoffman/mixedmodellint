@@ -1,9 +1,11 @@
 package gopackages
 
 import (
+	"cmp"
 	"go/ast"
 	"go/token"
 	"go/types"
+	"iter"
 	"reflect"
 	"slices"
 	"strings"
@@ -45,6 +47,7 @@ func entities(
 		byObj[decls[i].obj] = &decls[i]
 	}
 	mixins := embeddedTypes(decls)
+	docs := fieldDocs(pkgs, rel)
 	persisted = map[*types.TypeName]bool{}
 	for i := range decls {
 		d := &decls[i]
@@ -53,11 +56,49 @@ func entities(
 			continue
 		}
 		if e, ok := toEntity(d, anns, byObj, rel); ok {
+			for j := range e.Fields {
+				e.Fields[j].Doc = docs[e.Fields[j].Pos]
+			}
 			out = append(out, e)
 			persisted[d.obj] = true
 		}
 	}
 	return out, persisted
+}
+
+// fieldDocs returns the doc comment, or failing that the line comment, of
+// every named struct field in pkgs, keyed by the position of its name. A
+// field's types.Var has that same position but no comments, and an embedded
+// struct may come from another package, so the comments are collected from
+// all the syntax once rather than from the declaration being converted.
+func fieldDocs(
+	pkgs []*packages.Package, rel func(token.Position) mml.Position,
+) map[mml.Position]string {
+	out := map[mml.Position]string{}
+	for fset, f := range astFields(pkgs) {
+		if doc := cmp.Or(docText(f.Doc), docText(f.Comment)); doc != "" {
+			for _, name := range f.Names {
+				out[rel(fset.Position(name.Pos()))] = doc
+			}
+		}
+	}
+	return out
+}
+
+// astFields yields every field of every struct, interface and parameter
+// list in pkgs' syntax, with the file set that positions it.
+func astFields(pkgs []*packages.Package) iter.Seq2[*token.FileSet, *ast.Field] {
+	return func(yield func(*token.FileSet, *ast.Field) bool) {
+		for _, p := range pkgs {
+			for _, file := range p.Syntax {
+				for n := range ast.Preorder(file) {
+					if f, ok := n.(*ast.Field); ok && !yield(p.Fset, f) {
+						return
+					}
+				}
+			}
+		}
+	}
 }
 
 // structDecls finds every named struct type declared at package level, in

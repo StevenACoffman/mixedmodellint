@@ -45,6 +45,9 @@ func TestLoadEntities(t *testing.T) {
 	grain, _ := order.Annotations.Get("grain")
 	status, _ := order.Field("status")
 	updated, _ := order.Field("updated_at")
+	fee, _ := order.Field("shipping_fee")
+	created, _ := order.Field("created_at")
+	note, _ := line.Field("note")
 
 	cases := map[string]struct{ exp, act any }{
 		"no load problems":    {0, len(res.Source.Problems)},
@@ -62,6 +65,15 @@ func TestLoadEntities(t *testing.T) {
 		"pointer is nullable":             {true, updated.Nullable},
 		"mml pk tags":                     {[]string{"order_id", "line_no"}, line.PrimaryKey},
 		"position relative to the module": {"model/model.go", order.Pos.File},
+		"field doc comment": {
+			"ShippingFee is what the customer pays for delivery, in cents.", fee.Doc,
+		},
+		"field line comment": {"what the customer asked for", note.Doc},
+		"embedded field doc comment": {
+			"CreatedAt is when the row was first written.",
+			created.Doc,
+		},
+		"undocumented field has none": {"", updated.Doc},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
