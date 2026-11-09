@@ -181,15 +181,19 @@ func allDesigns() []design {
 	ds = append(ds, section6Designs()...)
 	ds = append(ds, section6PromoteDesigns()...)
 	ds = append(ds, section6CaptureDesigns()...)
+	ds = append(ds, section6EmbedDesigns()...)
 	ds = append(ds, section7Designs()...)
 	ds = append(ds, section7QueryDesigns()...)
 	ds = append(ds, section7ExposedDesigns()...)
 	ds = append(ds, section8Designs()...)
 	ds = append(ds, section8MetricDesigns()...)
 	ds = append(ds, section9Designs()...)
+	ds = append(ds, section9ValidityDesigns()...)
+	ds = append(ds, section9CalendarDesigns()...)
 	ds = append(ds, section10Designs()...)
 	ds = append(ds, section10AgentDesigns()...)
 	ds = append(ds, section10GraphDesigns()...)
+	ds = append(ds, section10TrainingDesigns()...)
 	return ds
 }
 

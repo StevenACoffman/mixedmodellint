@@ -408,6 +408,14 @@ func TestLoadMultiColumnChecks(t *testing.T) {
 			after: "ALTER TABLE samples RENAME COLUMN generator_version TO generator;",
 			want:  []mml.Check{{Columns: []string{"is_synthetic", "generator"}}},
 		},
+		"two columns compared": {
+			after: "ALTER TABLE samples ADD COLUMN valid_from DATE, ADD COLUMN valid_to DATE," +
+				" ADD CHECK (valid_to > valid_from);",
+			want: []mml.Check{
+				{Columns: []string{"is_synthetic", "generator_version"}},
+				{Columns: []string{"valid_to", "valid_from"}},
+			},
+		},
 		"dropping a column drops the check": {
 			after: "ALTER TABLE samples DROP COLUMN generator_version;",
 			want:  []mml.Check{},

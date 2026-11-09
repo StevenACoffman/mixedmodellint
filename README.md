@@ -189,6 +189,7 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 6.4-A   | A reference with relationship attributes (`spouse_since`); a warning on a self-reference (M5)           |
 | 6.4-B   | A junction with attributes of its own, used as an entity, keyed only by its references                  |
 | 6.4-C   | A change since the lock that adds `_since`, `_role` or a second side to a reference                     |
+| 6.5-A   | A document holding a copy of a stored record: a JSON `$ref` or BSON struct field matching a table       |
 | 6.5-B   | Embedded lists named for growth (`history`, `events`) without `maxItems` of at most 100 (a note)        |
 | 6.6-A   | Line items keep the master's price or cost; a warning when the master has validity columns              |
 | 6.7-A   | Inferred-link entities record a confidence, a method and a review status with a pending state           |
@@ -224,6 +225,9 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 9.3-B   | Interval end fields declare `end=` and, when nullable, `null=open`; both ends share a type              |
 | 9.4-A   | File entities record creation and ingestion times and a dedup basis                                     |
 | 9.4-B   | File entities are not deduplicated by file name                                                         |
+| 9.5-A   | Lifespan facts have `valid_from`/`valid_to` of one type, a NOT NULL start and a CHECK; one open end     |
+| 9.6-A   | `audit=bitemporal` entities have valid and transaction periods and a key that includes `txn_from`       |
+| 9.7-A   | At most one calendar, with the fiscal columns; other tables reference it for fiscal periods             |
 | 9.8-A   | Event time stored with less precision than its source provides                                          |
 | 9.8-B   | Event time truncated on the way to storage (`date_trunc`, `::timestamp(0)`, `Truncate`, `Format`)       |
 | 10.1-A  | Audit and load columns say whether they record the business or the system, and describe it              |
@@ -231,6 +235,7 @@ The remaining designs are listed under [Not yet implemented](#not-yet-implemente
 | 10.2-B  | Required or core JSON Schema properties with a union of kinds or no type                                |
 | 10.3-A  | File content stored in a row; stored-object references without who, when, what and version              |
 | 10.4-A  | One blended sentiment score with no per-aspect scores                                                   |
+| 10.5-A  | Training sets declare `label=` and `observation_time=` (NOT NULL, in a key); features have an as-of time |
 | 10.6-A  | Agent-action entities keep the prompt, the tools available and the model, all required                  |
 | 10.7-A  | Training or agent data comes with model_version, agent_run and tool_call entities and their links       |
 | 10.9-A  | Data that may be synthetic carries `is_synthetic`, `generator_version`, `source_dataset_id` and a CHECK |
@@ -365,8 +370,14 @@ The heavy lifting is done by libraries focused on each job:
   near-synonym: `canceled` and `cancelled`, but not `shipped` and `skipped`.
 - **6.4-A** treats only a self-reference as a peer. **6.4-B** has no glossary
   exemption.
-- **6.5-A** waits for inline object shapes, which no loader keeps. **6.5-B**
-  reads growth from a list's name only, not from its items' timestamps.
+- **6.5-A** compares only the shapes the loaders keep: JSON Schema `$ref`
+  targets and Go struct types in BSON documents. Anonymous inline objects,
+  and a shape repeated under several parents that matches no stored record,
+  need the loaders to keep nested fields first. A stored record is a SQL
+  table, a keyed Go struct (`_id` counts) or a JSON Schema document's root,
+  and a record that references the parent is composition, not a copy.
+  **6.5-B** reads growth from a list's name only, not from its items'
+  timestamps.
 - **6.6-A** confirms that a price changes from validity columns only; the
   update-path signal needs the Phase 2 query check.
 - **7.6-A** checks roll-ups against time units and entity names; comparing
@@ -374,6 +385,18 @@ The heavy lifting is done by libraries focused on each job:
 - **8.8-A** shares its list of identifier and code names with 8.3-A, which
   now accepts `measure=nominal`.
 - **8.9-B** does not check that the target sits upstream at a finer grain.
+- **9.5-A** finds lifespan facts by whole name words (no
+  `time.lifespan_patterns` setting), accepts any CHECK reading both ends as
+  the ordering check, and does not ask for an `EXCLUDE` constraint, which
+  the loader does not read. **9.6-A** reads only `audit=bitemporal`, not
+  `time.bitemporal_entities`, and likewise does not ask for the no-overlap
+  constraint.
+- **9.7-A** checks SQL only, accepts a single DATE key under any name, and
+  has no `calendar.entity` setting; a model with no calendar is reported
+  only when some table stores fiscal columns.
+- **10.5-A** leaves the grain and its agreement with the keys to 7.1-A and
+  7.1-B. A declared `layer` other than `training` overrides the name, so a
+  `shipping_labels` table can opt out.
 - **`annotate`** prints stubs rather than editing files, and has no
   `--refresh` yet.
 - **`mml.lock.json`** does not record the seed rows of reference entities.

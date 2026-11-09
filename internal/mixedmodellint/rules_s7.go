@@ -467,6 +467,20 @@ func annotationHint(e *Entity, key, value string) string {
 	}
 }
 
+// flagHint writes a flag annotation such as value-object in the syntax of
+// e's source: a Go directive and a JSON boolean need no value, but a SQL
+// comment line needs one.
+func flagHint(e *Entity, key string) string {
+	switch e.Source {
+	case SourceGo:
+		return "//mml:" + key
+	case SourceJSONSchema:
+		return fmt.Sprintf(`"x-mml-%s": true`, key)
+	default:
+		return annotationHint(e, key, "true")
+	}
+}
+
 func quoteList(items []string) string {
 	q := make([]string, len(items))
 	for i, s := range items {

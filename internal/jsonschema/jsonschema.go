@@ -117,7 +117,9 @@ func entity(d *doc, id, name string, t *schemas.Type, n *node, off int) mml.Enti
 		f, ref := field(d, m, p, slices.Contains(t.Required, m.key))
 		e.Fields = append(e.Fields, f)
 		if ref != "" {
-			e.Refs = append(e.Refs, mml.Ref{Fields: []string{f.Name}, Target: ref, Pos: f.Pos})
+			e.Refs = append(e.Refs, mml.Ref{
+				Fields: []string{f.Name}, Target: ref, ByValue: true, Pos: f.Pos,
+			})
 		}
 	}
 	if key, ok := e.Annotations["key"]; ok {

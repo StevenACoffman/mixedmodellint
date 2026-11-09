@@ -125,6 +125,26 @@ func shapeMessageCases(t *testing.T) map[string]messageCase {
 	history := placed("customer.schema.json", new(table("customer", nil,
 		col("order_history", m.TypeArray))))
 	history.Source = m.SourceJSONSchema
+	contact := []m.Field{
+		col("email", m.TypeString), col("phone", m.TypeString), col("tier", m.TypeString),
+	}
+	crm := placed("crm.sql", new(table("customers", []string{"customer_id"},
+		append([]m.Field{col("customer_id", m.TypeInt)}, contact...)...)))
+	buyer := placed("invoice.schema.json", new(jsonDoc("invoice.schema.json", "Buyer", "Buyer",
+		contact...)))
+	invoiceDoc := placed("invoice.schema.json", new(holding(new(jsonDoc("invoice.schema.json",
+		"Invoice", "", col("total", m.TypeDecimal))), "buyer", "Buyer")))
+	quoteDoc := placed("invoice.schema.json", new(holding(new(jsonDoc("invoice.schema.json",
+		"Quote", "", col("total", m.TypeDecimal))), "buyer", "Buyer")))
+	quoteDoc.ID = "json:quote.schema.json#"
+	keyed := placed("docs.go", &m.Entity{
+		ID: "go:docs.Customer", Kind: m.KindStruct, Source: m.SourceGo, Name: "Customer",
+		PrimaryKey: []string{"_id"}, Fields: []m.Field{col("_id", m.TypeString)},
+	})
+	holder := placed("docs.go", new(holding(&m.Entity{
+		ID: "go:docs.Invoice", Kind: m.KindStruct, Source: m.SourceGo, Name: "Invoice",
+		PrimaryKey: []string{"_id"}, Fields: []m.Field{col("_id", m.TypeString)},
+	}, "customer", "Customer")))
 	headers := placed("orders.sql", new(table("orders", []string{"order_id"},
 		col("order_id", m.TypeInt))))
 	priced := placed("products.sql", new(table("products", []string{"product_id"},
@@ -179,6 +199,10 @@ func shapeMessageCases(t *testing.T) map[string]messageCase {
 		},
 		"6.4-C since the lock": {in: grown, designs: []string{"6.4-C"}},
 		"6.5-B unbounded":      {in: src(history), designs: []string{"6.5-B"}},
+		"6.5-A shape matches a table": {
+			in: src(crm, buyer, invoiceDoc, quoteDoc), designs: []string{"6.5-A"},
+		},
+		"6.5-A keyed document": {in: src(keyed, holder), designs: []string{"6.5-A"}},
 		"6.6-A no snapshot": {
 			in:      src(headers, priced, lineItems),
 			designs: []string{"6.6-A"},

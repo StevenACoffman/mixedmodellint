@@ -140,6 +140,14 @@ documents.sql:4: warning: [10.3-A] documents.file_uri references a stored object
 reviews.sql:3: warning: [10.4-A] reviews.sentiment_score blends every aspect into one score, so opposing opinions cancel out
     suggestion: Store one score per aspect, as columns such as sentiment_product and sentiment_shipping, or as rows of review_aspect_sentiment(review_id, aspect, score) with aspect constrained to an enum (§10.4).
 0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.5-A gaps
+churn.sql:1: error: [10.5-A] churn_training is a training set (layer=training) but its observation_time snapshot_date may be NULL; its feature table customer_features has no as_of or valid_from time
+    suggestion: Declare label=<column> and observation_time=<column> on it, make the observation time a NOT NULL timestamp in the key (one row per entity per observation), and give each feature table an as_of time so its values can be joined as they were at that time (§10.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
+== 10.5-A undeclared
+train.sql:1: error: [10.5-A] train_churn is a training set (its name says train) but it declares no label; it declares no observation_time
+    suggestion: Declare label=<column> and observation_time=<column> on it, make the observation time a NOT NULL timestamp in the key (one row per entity per observation), and give each feature table an as_of time so its values can be joined as they were at that time (§10.5).
+1 error(s), 0 warning(s), 0 note(s) in 0 entities and 0 queries
 == 10.6-A context
 agent.sql:1: error: [10.6-A] agent_actions records agent actions without the prompt (prompt, input_context, messages or prompt_ref); the tools available (tools_available or tool_manifest); a required model (it may be missing)
     suggestion: Add prompt jsonb NOT NULL (or prompt_ref text NOT NULL), tools_available jsonb NOT NULL and model_version text NOT NULL, so each action can be replayed and debugged (§10.6).
@@ -500,6 +508,16 @@ student_courses.sql:1: warning: [6.4-B] student_courses links by (student_id, co
 people.sql:4: warning: [6.4-C] this change adds spouse_since to people, data about its spouse relationship
     suggestion: Model the spouse relationship as its own entity, keyed by both sides, instead of widening people (§6.4).
 0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.5-A keyed document
+docs.go:3: warning: [6.5-A] Invoice.customer embeds a copy of Customer, so each copy goes stale when Customer changes
+    suggestion: Store customer_id and reference the shared record instead. If the copy is a snapshot taken on purpose (§6.6), waive §6.5 with reason="snapshot"; if Customer is a value with no identity, mark it //mml:value-object (§6.5).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 6.5-A shape matches a table
+invoice.schema.json:3: warning: [6.5-A] Invoice.buyer embeds a copy of customers (its shape Buyer matches at 1.00); it is also embedded in Quote, so each copy goes stale when customers changes
+    suggestion: Store customer_id and reference the shared record instead. If the copy is a snapshot taken on purpose (§6.6), waive §6.5 with reason="snapshot"; if Buyer is a value with no identity, mark it "x-mml-value-object": true (§6.5).
+invoice.schema.json:3: warning: [6.5-A] Quote.buyer embeds a copy of customers (its shape Buyer matches at 1.00); it is also embedded in Invoice, so each copy goes stale when customers changes
+    suggestion: Store customer_id and reference the shared record instead. If the copy is a snapshot taken on purpose (§6.6), waive §6.5 with reason="snapshot"; if Buyer is a value with no identity, mark it "x-mml-value-object": true (§6.5).
+0 error(s), 2 warning(s), 0 note(s) in 0 entities and 0 queries
 == 6.5-B unbounded
 customer.schema.json:2: note: [6.5-B] customer.order_history embeds a list named like one that only grows, with no bound of at most 100 items
     suggestion: Move the items to their own collection keyed by customer_id, or declare max-items (JSON Schema: maxItems) of at most 100 if the list is truly bounded (§6.5).
@@ -700,6 +718,30 @@ photos.sql:1: error: [9.4-B] photos deduplicates files by name (dedup= names a f
 photos.sql:1: note: [9.4-B] photos enforces no uniqueness, so duplicates are caught only if ingestion code checks
     suggestion: Add UNIQUE (content_sha256), or UNIQUE (<scope>, content_sha256), so the database rejects duplicate files (§9.4).
 0 error(s), 0 warning(s), 1 note(s) in 0 entities and 0 queries
+== 9.5-A gaps
+prices.sql:1: warning: [9.5-A] product_prices looks like a fact with a lifespan (its name says prices), but valid_from may be NULL; it has no CHECK (valid_to > valid_from)
+    suggestion: Give each version valid_from and valid_to of one temporal type, valid_from NOT NULL and CHECK (valid_to > valid_from), or one tstzrange column with '[)' bounds, so exactly one version holds at any instant (§9.5). If product_prices has no lifespan, declare COMMENT ON TABLE product_prices IS '@lifespan: false'.
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.5-A open ends
+tiers.sql:6: warning: [9.5-A] price_tiers.valid_to marks an open end with a sentinel date, but customer_addresses and plans use NULL
+    suggestion: Mark open ends with NULL here too, as the other lifespan facts do, so one point-in-time predicate fits them all (§9.5).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.6-A gaps
+tickets.sql:1: warning: [9.6-A] tickets is declared audit=bitemporal but has no txn_to; no key includes txn_from (it has primary key (ticket_id))
+    suggestion: Add valid_from/valid_to and txn_from/txn_to timestamptz, make the key (business key, txn_from), and close the current version (SET txn_to = now()) instead of updating it (§9.6).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.7-A calendars
+dim_date.sql:1: warning: [9.7-A] dim_date is the calendar but has no fiscal_quarter, fiscal_month, fiscal_week and is_fiscal_year_end
+    suggestion: Give dim_date calendar_date DATE PRIMARY KEY, fiscal_year, fiscal_quarter, fiscal_month, fiscal_week and is_fiscal_year_end, so every fiscal question reads one definition (§9.7).
+fiscal.sql:1: warning: [9.7-A] fiscal_calendar is a second calendar beside dim_date, so a fiscal period can be defined two ways
+    suggestion: Keep dim_date as the one calendar and reference it from every table that needs a fiscal period (§9.7).
+sales.sql:3: warning: [9.7-A] monthly_sales stores fiscal_year and fiscal_quarter independently of dim_date
+    suggestion: Drop them and JOIN dim_date USING (calendar_date), or reference dim_date if monthly_sales is a periodic snapshot keyed by the period; fiscal periods should be defined once (§9.7).
+0 error(s), 3 warning(s), 0 note(s) in 0 entities and 0 queries
+== 9.7-A no calendar
+sales.sql:3: warning: [9.7-A] monthly_sales stores fiscal_year and fiscal_quarter, but the model has no calendar to define fiscal periods once
+    suggestion: Add a calendar table (dim_date) keyed by calendar_date with the fiscal columns, then drop these and JOIN it USING (calendar_date) (§9.7).
+0 error(s), 1 warning(s), 0 note(s) in 0 entities and 0 queries
 == 9.8-A two ways
 clicks.sql:2: warning: [9.8-A] clicks.clicked_at is timestamptz(0), which keeps 0 fractional digits, but the source provides 6
     suggestion: Use timestamptz with its default precision of 6, and truncate in queries instead (§9.8).

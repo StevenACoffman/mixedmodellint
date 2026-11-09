@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/StevenACoffman/mixedmodellint/internal/gopackages"
@@ -34,8 +35,13 @@ func TestLoadEntities(t *testing.T) {
 	t.Parallel()
 	res := load(t)
 	byName := map[string]mml.Entity{}
+	var models int
 	for i := range res.Source.Entities {
-		byName[res.Source.Entities[i].Name] = res.Source.Entities[i]
+		e := res.Source.Entities[i]
+		byName[e.Name] = e
+		if strings.HasPrefix(e.ID, "go:example.com/mod/model.") {
+			models++
+		}
 	}
 	order, line := byName["Order"], byName["OrderLine"]
 	var orderFields []string
@@ -51,7 +57,7 @@ func TestLoadEntities(t *testing.T) {
 
 	cases := map[string]struct{ exp, act any }{
 		"no load problems":    {0, len(res.Source.Problems)},
-		"stored structs only": {2, len(res.Source.Entities)},
+		"stored structs only": {2, models},
 		"embedded across packages": {
 			[]string{
 				"id", "customer_id", "status", "shipping_fee", "placed_at", "created_at",
@@ -74,6 +80,38 @@ func TestLoadEntities(t *testing.T) {
 			created.Doc,
 		},
 		"undocumented field has none": {"", updated.Doc},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			equals(t, tc.exp, tc.act)
+		})
+	}
+}
+
+func TestLoadDocuments(t *testing.T) {
+	t.Parallel()
+	res := load(t)
+	byName := map[string]mml.Entity{}
+	for i := range res.Source.Entities {
+		byName[res.Source.Entities[i].Name] = res.Source.Entities[i]
+	}
+	invoice, order := byName["Invoice"], byName["Order"]
+	byValue := map[string]bool{}
+	for _, r := range invoice.Refs {
+		byValue[r.Target+"."+strings.Join(r.Fields, ",")] = r.ByValue
+	}
+	var orderByValue bool
+	for _, r := range order.Refs {
+		orderByValue = orderByValue || r.ByValue
+	}
+
+	cases := map[string]struct{ exp, act any }{
+		"_id is the key":                {[]string{"_id"}, invoice.PrimaryKey},
+		"bson struct field is by value": {true, byValue["Customer.customer"]},
+		"bson value object by value":    {true, byValue["Address.ship_to"]},
+		"bson slice of structs":         {true, byValue["Address.lines"]},
+		"db reference is not by value":  {false, orderByValue},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

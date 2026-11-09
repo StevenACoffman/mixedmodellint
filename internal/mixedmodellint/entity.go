@@ -96,11 +96,17 @@ type Field struct {
 // OnDelete is a SQL foreign key's ON DELETE action ("cascade", "restrict",
 // "set null", "set default" or "no action"), or "" for a reference no
 // database enforces.
+//
+// ByValue is true when the entity stores a copy of the target rather than
+// its key, as a document does: a JSON Schema $ref, or a struct-typed field
+// of a BSON document. A SQL foreign key and a gorm association are never by
+// value.
 type Ref struct {
 	Fields       []string
 	Target       string
 	TargetFields []string
 	Inferred     bool
+	ByValue      bool
 	OnDelete     string
 	Pos          Position
 }

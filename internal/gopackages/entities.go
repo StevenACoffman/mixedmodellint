@@ -30,6 +30,7 @@ type goField struct {
 	stored    bool
 	pk        bool
 	refTarget *types.TypeName
+	byValue   bool
 }
 
 // entities returns one entity per persisted struct in pkgs. A struct is
@@ -180,7 +181,8 @@ func toEntity(
 		}
 		if gf.refTarget != nil && gf.refTarget != d.obj && byObj[gf.refTarget] != nil {
 			e.Refs = append(e.Refs, mml.Ref{
-				Fields: []string{gf.field.Name}, Target: gf.refTarget.Name(), Pos: gf.field.Pos,
+				Fields: []string{gf.field.Name}, Target: gf.refTarget.Name(),
+				ByValue: gf.byValue, Pos: gf.field.Pos,
 			})
 		}
 	}
@@ -192,9 +194,10 @@ func toEntity(
 }
 
 // conventionalKey returns the primary key the naming convention implies: an
-// ID field, or one named after the struct (CustomerID on Customer); or nil.
+// ID field, MongoDB's _id, or one named after the struct (CustomerID on
+// Customer); or nil.
 func conventionalKey(e *mml.Entity, structName string) []string {
-	for _, name := range []string{"id", snake(structName) + "_id"} {
+	for _, name := range []string{"id", "_id", snake(structName) + "_id"} {
 		if f, ok := e.Field(name); ok {
 			return []string{f.Name}
 		}
@@ -246,6 +249,10 @@ func makeField(v *types.Var, tag reflect.StructTag, pos mml.Position) (goField, 
 		stored:    stored || tag.Get("mml") != "",
 		refTarget: structRef(v.Type(), lt),
 	}
+	// A BSON document stores a struct-typed field inside itself; a gorm or
+	// sqlx struct-typed field is an association loaded by key.
+	_, bson := tag.Lookup("bson")
+	gf.byValue = gf.refTarget != nil && bson
 	if gf.refTarget != nil && lt == mml.TypeUnknown {
 		gf.field.Type = mml.TypeObject
 	}

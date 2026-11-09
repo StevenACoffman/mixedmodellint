@@ -44,6 +44,7 @@ func TestLoad(t *testing.T) {
 		"null in type is nullable":    {true, coupon.Nullable},
 		"property annotation":         {"not_applicable", null},
 		"array items ref":             {"Line", order.Refs[0].Target},
+		"a $ref is held by value":     {true, order.Refs[0].ByValue},
 		"property position":           {10, placed.Pos.Line},
 		"def position":                {16, line.Pos.Line},
 	}

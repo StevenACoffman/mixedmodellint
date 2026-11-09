@@ -209,6 +209,11 @@ func comparisonCheck(n *pg.Node) (mml.Check, bool) {
 	}
 	switch ae.GetKind() {
 	case pg.A_Expr_Kind_AEXPR_OP:
+		// valid_to > valid_from compares two columns, not one with a
+		// constant; it is kept as the columns it ties together.
+		if deparseExpr(ae.GetRexpr()) == "" {
+			return mml.Check{}, false
+		}
 		switch op := opName(ae); op {
 		case "<", "<=", ">", ">=", "<>", "!=":
 			return mml.Check{
