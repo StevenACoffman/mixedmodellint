@@ -10,7 +10,9 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,6 +23,9 @@ import (
 	"slices"
 	"strings"
 )
+
+// pgquery is the module that compiles the parser the linter runs.
+const pgquery = "github.com/wasilibs/go-pgquery"
 
 // kwlist is where go-pgquery keeps PostgreSQL's keyword table.
 const kwlist = "internal/cparser/include/postgres/parser/kwlist.h"
@@ -41,12 +46,11 @@ func run(ctx context.Context, args []string) error {
 	if *out == "" {
 		return errors.New("-o is required")
 	}
-	dir, err := exec.CommandContext(ctx, "go", "list", "-m", "-f", "{{.Dir}}",
-		"github.com/wasilibs/go-pgquery").Output()
+	dir, err := pgqueryDir(ctx)
 	if err != nil {
-		return fmt.Errorf("find go-pgquery: %w", err)
+		return err
 	}
-	src, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(dir)), kwlist))
+	src, err := os.ReadFile(filepath.Join(dir, kwlist))
 	if err != nil {
 		return fmt.Errorf("read kwlist.h: %w", err)
 	}
@@ -58,6 +62,27 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("write %s: %w", *out, err)
 	}
 	return nil
+}
+
+// pgqueryDir returns the directory of go-pgquery at the version go.mod
+// requires, downloading it first. go list -m prints an empty Dir for a
+// module not yet in the module cache, as on a fresh CI runner.
+func pgqueryDir(ctx context.Context) (string, error) {
+	out, err := exec.CommandContext(ctx, "go", "mod", "download", "-json", pgquery).Output()
+	if err != nil {
+		return "", fmt.Errorf("download %s: %w", pgquery, err)
+	}
+	var mod struct {
+		Dir   string `json:"Dir"`
+		Error string `json:"Error"`
+	}
+	if err := json.Unmarshal(out, &mod); err != nil {
+		return "", fmt.Errorf("decode go mod download output: %w", err)
+	}
+	if mod.Error != "" || mod.Dir == "" {
+		return "", fmt.Errorf("download %s: %s", pgquery, cmp.Or(mod.Error, "no directory"))
+	}
+	return mod.Dir, nil
 }
 
 // reserved returns the keywords of the two categories a column name cannot
