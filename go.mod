@@ -9,7 +9,7 @@ require (
 	github.com/owenrumney/go-sarif/v3 v3.3.2
 	github.com/peterbourgon/ff/v4 v4.0.0-beta.1
 	github.com/pganalyze/pg_query_go/v6 v6.2.5
-	github.com/wasilibs/go-pgquery v0.0.0-20261027025405-3048dd293555
+	github.com/wasilibs/go-pgquery v0.0.0-20261106060434-4301e51f8dbf
 	golang.org/x/text v0.43.0
 	golang.org/x/tools v0.52.0
 	google.golang.org/protobuf v1.36.12
